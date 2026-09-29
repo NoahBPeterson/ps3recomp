@@ -730,6 +730,12 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
         if s.endswith(":"):
             continue
         t = s.rstrip(";")
+        # A conditional branch (`if (...) goto ...`, bdnz, a conditional
+        # trampoline) falls through when not taken. Treating it as a terminator
+        # dropped the fall-through tail: zlib's build_tree chunk ending in bdnz
+        # returned mid-function with r31 unrestored.
+        if t.startswith("if ("):
+            return False
         return (t.startswith("return") or "goto " in t or
                 t.startswith("func_") or t.startswith("lv2_syscall") or
                 "{ func_" in t or t.startswith("{ g_trampoline_fn"))
