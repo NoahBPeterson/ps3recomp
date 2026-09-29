@@ -3966,6 +3966,52 @@ class PPULifter:
 # CLI
 # ---------------------------------------------------------------------------
 
+def _const_base_targets(win, rC, read_u32, text_lo, text_hi, bctr_addr):
+    """Landing sites of a table-less computed jump (see discover_jump_tables).
+
+    Walks `win` backward from the bctr: the newest definition of rC must be
+    `add rC,rC,rOff`, and every earlier one must fold to a constant
+    (`addis`/`addi` onto rC, ending at `li`/`lis`). Anything else defining rC
+    means this is not the idiom. Returns every address from the base through
+    the first unconditional terminator (at most 64), or None.
+    """
+    const, have_add = 0, False
+    for w in reversed(win):
+        ops = [x.strip() for x in w.operands.split(',')]
+        if w.mnemonic == 'mtctr' or not ops or ops[0] != rC:
+            continue
+        m = w.mnemonic
+        try:
+            if m == 'add' and not have_add and rC in ops[1:3]:
+                have_add = True
+            elif m in ('addis', 'addi') and have_add and len(ops) == 3 and ops[1] == rC:
+                const += int(ops[2], 0) << (16 if m == 'addis' else 0)
+            elif m in ('li', 'lis') and have_add and len(ops) == 2:
+                const += int(ops[1], 0) << (16 if m == 'lis' else 0)
+                break
+            else:
+                return None
+        except ValueError:
+            return None
+    else:
+        return None
+    base = const & 0xFFFFFFFF
+    # A real landing run sits right next to its dispatcher.
+    if not (text_lo <= base < text_hi) or base & 3 or abs(base - bctr_addr) > 0x1000:
+        return None
+    targets = []
+    for k in range(64):
+        a = base + 4 * k
+        v = read_u32(a)
+        if v is None:
+            return None
+        targets.append(a)
+        # blr, bctr, or `b` without link ends the run
+        if v in (0x4E800020, 0x4E800420) or (v >> 26 == 18 and not v & 1):
+            return targets
+    return None
+
+
 def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts=None):
     """Find `mtctr rX; bctr` switch dispatchers and read their jump tables.
 
@@ -4068,6 +4114,17 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                 break
         _dbg(all_insns[i].addr, f"rC={rC}")
         if rC is None:
+            continue
+        # Constant-base computed jump, no table: `li rC,lo; addis rC,rC,hi;
+        # add rC,rC,rOff; mtctr rC; bctr` enters a straight-line run at
+        # base + rOff. The SDK memset does this to land in its unrolled
+        # `stdu` tail (Resistance func_000E6B80: base 0xE6BE4, 8 entries);
+        # unhandled, every short memset became an unresolved indirect call
+        # that stored nothing. The landing sites are every instruction from
+        # the base up to and including the run's terminator.
+        cb = _const_base_targets(win, rC, read_u32, text_lo, text_hi, all_insns[i].addr)
+        if cb:
+            tables[all_insns[i].addr] = cb
             continue
         # the indexed table load
         lwzx = next((w for w in reversed(win) if w.mnemonic == 'lwzx'), None)

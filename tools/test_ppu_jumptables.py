@@ -48,6 +48,9 @@ def w_bctr():              return (19 << 26) | (20 << 21) | (528 << 1)
 def w_blr():               return (19 << 26) | (20 << 21) | (16 << 1)
 def w_ld(rt, ra, d):       return (58 << 26) | (rt << 21) | (ra << 16) | (d & 0xFFFC)
 def w_std(rs, ra, d):      return (62 << 26) | (rs << 21) | (ra << 16) | (d & 0xFFFC)
+def w_li(rt, si):          return (14 << 26) | (rt << 21) | (si & 0xFFFF)
+def w_addis(rt, ra, si):   return (15 << 26) | (rt << 21) | (ra << 16) | (si & 0xFFFF)
+def w_stdu(rs, ra, d):     return (62 << 26) | (rs << 21) | (ra << 16) | (d & 0xFFFC) | 1
 def w_bc(bo, bi, rel):     return (16 << 26) | (bo << 21) | (bi << 16) | (rel & 0xFFFC)
 
 
@@ -224,11 +227,38 @@ def main() -> int:
     test_tie_keeps_first_candidate()
     test_two_level_base_past_early_return()
     test_base_before_fallthrough_split()
+    test_const_base_no_table()
+    test_const_base_needs_constant()
     if FAILS:
         print(f"FAILED: {', '.join(FAILS)}")
         return 1
     print("all jump-table vectors passed")
     return 0
+
+
+def test_const_base_no_table():
+    """The SDK memset's jump into its unrolled tail: no table, a constant base.
+
+        li r8,0x14 ; addis r8,r8,1 ; add r8,r8,r7 ; mtctr r8 ; bctr
+        0x10014: stdu r4,8(r3) x3 ; blr
+
+    Every word of the run through its blr is a landing site. Before, nothing
+    was found and each short memset lifted to an unresolved indirect call.
+    """
+    base = TEXT_LO + 0x14
+    mem = {base + 4 * k: w_stdu(4, 3, 8) for k in range(3)}
+    mem[base + 12] = w_blr()
+    got = discover([w_li(8, 0x14), w_addis(8, 8, 1), w_add(8, 8, 7),
+                    w_mtctr(8), w_bctr()], mem)
+    check("constant-base computed jump", got, [base, base + 4, base + 8, base + 12])
+
+
+def test_const_base_needs_constant():
+    """Same shape, but the base is loaded from memory: not the idiom."""
+    base = TEXT_LO + 0x14
+    mem = {base: w_blr(), TOC + 8: base}
+    got = discover([w_lwz(8, 2, 8), w_add(8, 8, 7), w_mtctr(8), w_bctr()], mem)
+    check("non-constant base is not a constant-base jump", got, None)
 
 
 if __name__ == "__main__":
