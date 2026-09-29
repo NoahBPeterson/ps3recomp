@@ -219,6 +219,34 @@ def test_base_before_fallthrough_split():
           [0x11100, 0x11200])
 
 
+def test_multi_toc_prefers_targets_near_the_dispatcher():
+    """Multi-TOC: the wrong TOC decodes MORE valid targets, but far away.
+
+    MAG (BCUS98110) carries seven TOCs. func_00BB32A0's inline 5-entry table
+    sits right after its bctr, loaded through TOC 0x01B94D70; the main TOC's
+    slot at the same displacement pointed 12 MB away at data that decoded as 7
+    in-text "targets". Most-targets-wins took those, the real cases went
+    unlifted, and every call was an unresolved indirect call. Case blocks
+    belong to the dispatcher's own function, so targets near the bctr rank
+    first; the count only breaks ties.
+
+        lwz r11,16(r2); slwi r9,r3,2; lwzx r0,r9,r11; add r0,r0,r11; mtctr r0; bctr
+    """
+    text_hi = 0x01000000
+    wrong_toc, right_toc = 0x200000, 0x300000
+    near, far = 0x11000, 0x800000
+    mem = {wrong_toc + 16: far,
+           far + 0: 0x10, far + 4: 0x20, far + 8: 0x30, far + 12: 0xFFFFFFFF,
+           right_toc + 16: near,
+           near + 0: 0x100, near + 4: 0x200, near + 8: 0xFFFFFFFF}
+    insns = decode_all([w_cmplwi(0, 3, 2), w_lwz(11, 2, 16), w_slwi(9, 3, 2),
+                        w_lwzx(0, 9, 11), w_add(0, 0, 11), w_mtctr(0), w_bctr()])
+    tables = discover_jump_tables(insns, lambda a: mem.get(a & 0xFFFFFFFF),
+                                  [wrong_toc, right_toc], TEXT_LO, text_hi)
+    check("multi-TOC: near targets beat more targets far away",
+          tables.get(insns[-1].addr), [0x11100, 0x11200])
+
+
 def main() -> int:
     test_encodings()
     test_absolute_base_is_second_operand()
@@ -229,6 +257,7 @@ def main() -> int:
     test_base_before_fallthrough_split()
     test_const_base_no_table()
     test_const_base_needs_constant()
+    test_multi_toc_prefers_targets_near_the_dispatcher()
     if FAILS:
         print(f"FAILED: {', '.join(FAILS)}")
         return 1
