@@ -39,6 +39,52 @@ extern "C" void ps3_hle_register(uint32_t nid, const char* name, void* handler)
 
 extern "C" uint32_t ps3_hle_count(void) { return g_hle_inited ? g_hle_nids.count : 0; }
 
+/* Hashed lookup over g_hle_nids. ps3_nid_table_find is a linear scan of the
+ * whole firmware table (thousands of entries), and it ran on EVERY import
+ * call: inFamous' frame loop spent ~70% of its HLE time inside it. The index
+ * is an immutable open-addressed snapshot, rebuilt (under a lock) only when the
+ * table has grown since -- registration happens at init -- and published with
+ * an atomic pointer so readers never lock. Old snapshots are leaked on purpose
+ * (a reader may still hold one; rebuilds happen a handful of times). The first
+ * entry for a NID wins, as with the linear scan. */
+#include <atomic>
+#include <mutex>
+struct HleNidIndex { uint32_t count, mask; int32_t slot[1]; };
+static std::atomic<const HleNidIndex*> g_hle_index{nullptr};
+static std::mutex g_hle_index_lock;
+static ps3_nid_entry* hle_nid_find(uint32_t nid)
+{
+    if (!g_hle_inited) return nullptr;
+    const HleNidIndex* ix = g_hle_index.load(std::memory_order_acquire);
+    if (!ix || ix->count != g_hle_nids.count) {
+        std::lock_guard<std::mutex> lk(g_hle_index_lock);
+        ix = g_hle_index.load(std::memory_order_acquire);
+        if (!ix || ix->count != g_hle_nids.count) {
+            const uint32_t n = g_hle_nids.count;
+            uint32_t size = 16;
+            while (size < 2 * n) size <<= 1;
+            HleNidIndex* nx = (HleNidIndex*)malloc(sizeof(HleNidIndex) + (size - 1) * sizeof(int32_t));
+            if (!nx) return ps3_nid_table_find(&g_hle_nids, nid);
+            nx->count = n; nx->mask = size - 1;
+            for (uint32_t i = 0; i < size; i++) nx->slot[i] = -1;
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t h = (g_hle_nids.entries[i].nid * 2654435761u) & nx->mask;
+                for (;; h = (h + 1) & nx->mask) {
+                    if (nx->slot[h] < 0) { nx->slot[h] = (int32_t)i; break; }
+                    if (g_hle_nids.entries[nx->slot[h]].nid == g_hle_nids.entries[i].nid) break;
+                }
+            }
+            g_hle_index.store(nx, std::memory_order_release);
+            ix = nx;
+        }
+    }
+    for (uint32_t h = (nid * 2654435761u) & ix->mask;; h = (h + 1) & ix->mask) {
+        const int32_t k = ix->slot[h];
+        if (k < 0) return nullptr;
+        if (g_hle_nids.entries[k].nid == nid) return &g_hle_nids.entries[k];
+    }
+}
+
 /* Context-aware handlers: functions that need the full ppu_context (to read
  * args beyond the generic ABI, set registers like r13, touch memory, etc.).
  * Registered separately and dispatched before the generic table. */
@@ -65,7 +111,7 @@ extern "C" int ps3_hle_has(uint32_t nid)
     for (uint32_t i = 0; i < g_ctx_count; i++)
         if (g_ctx[i].nid == nid) return 1;
     if (!g_hle_inited) return 0;
-    ps3_nid_entry* e = ps3_nid_table_find(&g_hle_nids, nid);
+    ps3_nid_entry* e = hle_nid_find(nid);
     return (e && e->handler) ? 1 : 0;
 }
 
@@ -640,7 +686,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             return;
         }
 
-    ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
+    ps3_nid_entry* e = hle_nid_find(nid);
     if (!e || !e->handler) {
         /* Recorded before the diagnostic paths below, several of which return
          * early. An import moving between resolved and unresolved is exactly the
