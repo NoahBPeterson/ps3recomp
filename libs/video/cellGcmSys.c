@@ -1666,7 +1666,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   u32 mi = (method >> 2) & 2047;
                   hist[mi]++; tot[mi] += count;
                   static u64 seen = 0;
-                  if (++seen == 200000ull && !dumped) { dumped = 1;
+                  /* TCONST_FIFO=N (N > 1): dump after N thousand blocks instead of
+                   * 200k, to look at a later phase than early boot. */
+                  if (++seen == (tf > 1 ? (u64)tf * 1000ull : 200000ull) && !dumped) { dumped = 1;
                       fprintf(stderr, "[TCFIFO] method histogram (blocks, dwords):%c", 10);
                       for (u32 k = 0; k < 2048; k++) if (hist[k])
                           fprintf(stderr, "[TCFIFO]   0x%04X  %8u blocks %10u dwords%c",
