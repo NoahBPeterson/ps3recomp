@@ -218,7 +218,19 @@ int64_t sys_mutex_lock(ppu_context* ctx)
     }
 #else
     if (timeout_us == 0) {
-        pthread_mutex_lock(&m->mtx);
+        /* Infinite wait, in 5 s slices so a stall names its holder once:
+         * which thread owns the mutex is the first question for any of these
+         * hangs, and nothing else in the log answers it. */
+        for (int waited = 0;; waited++) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 5;
+            if (pthread_mutex_timedlock(&m->mtx, &ts) == 0) break;
+            if (waited == 0)
+                fprintf(stderr, "[mutex] tid=%llu blocked >5s on mutex %u held by tid=%llu (count %u)\n",
+                        (unsigned long long)caller_tid, mutex_id,
+                        (unsigned long long)m->owner_tid, (unsigned)m->lock_count);
+        }
     } else {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
