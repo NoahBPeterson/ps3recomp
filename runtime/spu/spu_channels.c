@@ -1594,7 +1594,7 @@ static void spu_ovl_dump(spu_context* ctx, uint32_t ea, uint32_t lsa, const uint
                     char* c = strchr(s_dir, ','); if (c) { *c = 0; s_lsa = (uint32_t)strtoul(c + 1, 0, 0); } } }
     if (!s_on) return;
     static uint32_t s_seen[256]; static unsigned s_n;
-    static __declspec(thread) uint32_t t_src, t_next_ea, t_next_lsa;
+    static SPU_TLS uint32_t t_src, t_next_ea, t_next_lsa;
     FILE* f = NULL; char path[512];
     if (lsa == s_lsa && size >= 256) {
         for (unsigned i = 0; i < s_n; i++) if (s_seen[i] == ea) { t_src = 0; return; }

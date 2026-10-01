@@ -1011,8 +1011,9 @@ class SPULifter:
 
     def emit_source(self,header_name: str) -> str:
         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
+        weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
         for f in self.functions:
-            lines.append(f"void {f.name}(spu_context* ctx) {{")
+            lines.append(f"void {weak}{f.name}(spu_context* ctx) {{")
             for b in f.body_lines:
                 lines.append(b if b.endswith(":") else f"    {b}")
             lines.append("}")

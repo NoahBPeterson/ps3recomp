@@ -237,6 +237,10 @@ endif()
 # ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
+set(PS3RECOMP_HOST_ARM64 OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
+    set(PS3RECOMP_HOST_ARM64 ON)
+endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ps3recomp_runtime PRIVATE
         -Wall -Wextra -Wno-unused-parameter
@@ -253,8 +257,9 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # was unoptimised without a word. Duplicating a default -O2 is harmless.
         $<$<CONFIG:Release,RelWithDebInfo>:-O2>
         # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
-        # hottest SPU op in lifted audio code.
-        -msse4.1
+        # hottest SPU op in lifted audio code. x86-64 only; arm64 has the
+        # equivalent NEON ops in the base ISA and rejects -msse4.1.
+        $<$<NOT:$<BOOL:${PS3RECOMP_HOST_ARM64}>>:-msse4.1>
     )
 elseif(MSVC)
     # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
