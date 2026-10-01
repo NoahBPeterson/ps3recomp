@@ -13,6 +13,9 @@
  * Context-aware HLE: guest pointers (path, buffers, out params) are read/written
  * through vm_base in big-endian.
  */
+#ifndef _WIN32
+#include <execinfo.h>
+#endif
 #include "ppu_recomp.h"      /* ppu_context */
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
@@ -426,6 +429,18 @@ static void cellFsRead(ppu_context* ctx)
                 (unsigned long long)tot, first_for_fd?"  <= FIRST READ ON THIS FD":"");
       if (getenv("FS_READ_PATH") && fd>=0 && fd<64 && g_fd_path[fd][0])
           fprintf(stderr, "        from %s\n", g_fd_path[fd]);
+#ifndef _WIN32
+      /* FS_READ_HOSTBT=<path substring>: host backtrace for reads of matching
+       * files. Lifted guest functions are host functions named func_<addr>, so
+       * the host stack IS the guest call chain -- no guest stack walk needed. */
+      { static const char* want = (const char*)-1;
+        if (want == (const char*)-1) want = getenv("FS_READ_HOSTBT");
+        if (want && *want && fd>=0 && fd<64 && strstr(g_fd_path[fd], want)) {
+            void* fr[48]; int k = backtrace(fr, 48);
+            fprintf(stderr, "[fs] read-bt fd=%d:\n", fd);
+            backtrace_symbols_fd(fr, k, 2);
+        } }
+#endif
       if ((_n % 2000)==0) { fprintf(stderr,"[fs] read summary after %d reads:",_n);
           for (int i=0;i<64;i++) if (cnt_fd[i]) fprintf(stderr," fd%d=%ux/%lluB",i,cnt_fd[i],(unsigned long long)per_fd[i]);
           fprintf(stderr,"\n"); } }
