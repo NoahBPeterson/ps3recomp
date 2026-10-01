@@ -437,6 +437,134 @@ def _cr_field_set(bf: int) -> str:
             f"(cr_val << {shift})")
 
 
+# ---------------------------------------------------------------------------
+# CR set-then-test fusion (idiomatic emission post-pass)
+#
+# The lifter emits every compare as a CR-field write and every conditional
+# branch as a bit test of that field. When a compare block is IMMEDIATELY
+# followed by its only consumer, fusing them into a direct C comparison is
+# provably equivalent and removes the ugliest idiom from the lifted output.
+# Refusals (conservative):
+#   - the pair is not adjacent;
+#   - anything between (there is nothing, by adjacency) — vacuous;
+#   - the branch's consequent contains a call/trampoline (the callee may read
+#     the fresh CR state we would no longer write);
+#   - the branch target is a BACKWARD label (loop re-entry may re-read the
+#     field before its next write);
+#   - a forward linear scan from the branch to the next write of the same CR
+#     field sees a READ of that field (it would now observe a stale value).
+# ---------------------------------------------------------------------------
+_CRSET_RE = re.compile(
+    r"^\{ (?P<ta>[A-Za-z0-9_]+) a = (?P<a>.*?); (?P<tb>[A-Za-z0-9_]+) b = (?P<b>.*?); "
+    r"uint32_t cr_val = (?P<val>.*?); "
+    r"ctx->cr = \(ctx->cr & ~\(0xFu << (?P<shift>\d+)\)\) \| \(cr_val << (?P<shift2>\d+)\); \}$")
+_CRBR_RE = re.compile(
+    r"^(?P<ind>\s*)if \((?P<neg>!)?\(+ctx->cr >> (?P<shift>\d+)\) & (?P<mask>0x[0-9A-Fa-f]+|\d+)\)+\) (?P<rest>.*)$")
+
+
+def _crval_to_c(val: str, mask: int, decl_a: str, a_expr: str, b_expr: str) -> str:
+    """Reconstruct a C condition from a cr_val ternary for the tested bits."""
+    m = re.match(r"^\((?P<u>.+?)\) \? 1 : \((?P<lt>.+?)\) \? 8 : \((?P<gt>.+?)\) \? 4 : 2$", val)
+    if m:
+        u, lt, gt = m.group("u"), m.group("lt"), m.group("gt")
+    else:
+        m2 = re.match(r"^\((?P<lt>.+?)\) \? 8 : \((?P<gt>.+?)\) \? 4 : 2$", val)
+        if not m2:
+            return None
+        u, lt, gt = None, m2.group("lt"), m2.group("gt")
+    is_fp = decl_a in ("float", "double")
+    if not is_fp:
+        # Integer compares have no unordered bit; the cases reduce to standard
+        # comparisons over the captured operand expressions. SO is set
+        # independently of cmp (carries/XER), so a mask touching bit 1 refuses.
+        if u is not None or (mask & 1):
+            return None
+        op = {8: "<", 4: ">", 2: "==", 0xA: "<=", 0xC: ">="}.get(mask)
+        if op is None:
+            return None
+        return f"(({a_expr}) {op} ({b_expr}))"
+    # FP: keep the explicit NaN-correct form, but substitute the operand
+    # expressions for the compare block's locals (a/b die with the block).
+    def sub(expr: str) -> str:
+        expr = re.sub(r"\ba\b", f"({a_expr})", expr)
+        expr = re.sub(r"\bb\b", f"({b_expr})", expr)
+        return expr
+    if u is not None:
+        u = sub(u)
+    lt = sub(lt)
+    gt = sub(gt)
+    eq = " && ".join(x for x in (("!(" + u + ")") if u else None, "!(" + lt + ")", "!(" + gt + ")") if x)
+    subs = {8: lt, 4: gt, 2: eq, 1: u}
+    conds = []
+    for bit, c in subs.items():
+        if not (mask & bit):
+            continue
+        if c is None:
+            return None  # mask asks for a bit this compare form doesn't define
+        conds.append("(" + c + ")")
+    if not conds:
+        return None
+    return " || ".join(conds)
+
+
+def _fuse_cr(body_lines: list[str]) -> list[str]:
+    out = []
+    i = 0
+    n = len(body_lines)
+    while i < n:
+        line = body_lines[i]
+        mset = _CRSET_RE.match(line.strip())
+        if not mset or i + 1 >= n:
+            out.append(line)
+            i += 1
+            continue
+        mbr = _CRBR_RE.match(body_lines[i + 1])
+        if not mbr or int(mbr.group("shift")) != int(mset.group("shift")):
+            out.append(line)
+            i += 1
+            continue
+        mask_raw = mbr.group("mask")
+        mask = int(mask_raw, 0)
+        cond = _crval_to_c(mset.group("val"), mask, mset.group("ta"), mset.group("a"), mset.group("b"))
+        rest = mbr.group("rest").strip()
+        # consequent must be a plain goto (internal, no calls)
+        if cond is None or not rest.startswith("goto "):
+            out.append(line)
+            i += 1
+            continue
+        target = rest[5:].rstrip(";").strip()
+        # backward target -> refuse (loop re-entry may read the field first)
+        tgt_label = f"{target}:"
+        tgt_idx = None
+        for j in range(i + 2, n):
+            if body_lines[j].strip() == tgt_label:
+                tgt_idx = j
+                break
+        if tgt_idx is None or tgt_idx < i:
+            out.append(line)
+            i += 1
+            continue
+        # forward scan (branch..next write of this field): refuse on reads/calls
+        shift = mset.group("shift")
+        safe = True
+        for j in range(i + 2, tgt_idx + 1):
+            lj = body_lines[j]
+            if re.search(r"ctx->cr", lj) and re.search(r"& ~\(0xFu", lj) is None and f">> {shift}" in lj:
+                safe = False
+                break
+            if "func_" in lj or "ps3_indirect_call" in lj or "g_trampoline_fn" in lj or "lv2_syscall" in lj:
+                safe = False
+                break
+        if not safe:
+            out.append(line)
+            i += 1
+            continue
+        cond_c = f"(!({cond}))" if mbr.group("neg") else f"({cond})"
+        out.append(f"{mbr.group(1)}if {cond_c} goto {target};  /* CR fusion: {mset.group('ta')} cmp, field shift {shift} */")
+        i += 2
+    return out
+
+
 @dataclass
 class LiftedFunction:
     """A single lifted C function."""
@@ -481,7 +609,7 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
 class PPULifter:
     """Translates PPU instructions into C source."""
 
-    def __init__(self, prefix: str = ""):
+    def __init__(self, prefix: str = "", weak_emit: bool = False):
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()  # all func_X references (b/bc trampolines)
@@ -541,6 +669,7 @@ class PPULifter:
                 f"underscore; using {prefix + chr(95)!r}"+chr(10))
             prefix += "_"
         self.prefix = prefix
+        self.weak_emit = bool(weak_emit)
         # Cache for _range_insns: (instructions, len, ordered, addrs). Keyed by
         # the instruction-list identity so the FULL list (mid-function / serial
         # lift) is sorted+indexed once, not rescanned per call.
@@ -3339,8 +3468,9 @@ class PPULifter:
         label = self.name_map.get(func.start_addr)
         if label:
             lines.append(f"/* {label} */")
-        lines.append(f"void {func.name}(ppu_context* ctx) {{")
-        for bline in func.body_lines:
+        weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
+        lines.append(f"void {weak}{func.name}(ppu_context* ctx) {{")
+        for bline in _fuse_cr(func.body_lines):
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
         # If a function doesn't end with blr/b/bctr (a return or unconditional
@@ -4048,6 +4178,10 @@ def main() -> None:
                         help="Prefix for every emitted func_*/function_table "
                              "symbol (e.g. 'libsre_') so a relocated PRX image "
                              "links alongside the main title without collisions")
+    parser.add_argument("--weak", action="store_true",
+                        help="Emit lifted function definitions as weak symbols "
+                             "so a port's idiomatic overrides (strong symbols "
+                             "of the same name) shadow them at link time")
     parser.add_argument("--hle-stubs", metavar="FILE", default=None,
                         help="EBOOT.imports.json ([{library,nid,stub}]). Each "
                              "import stub address is lifted as ps3_hle_call(nid) "
@@ -4478,7 +4612,7 @@ def main() -> None:
 
     print(f"Lifting {len(func_bounds)} functions...")
 
-    lifter = PPULifter(prefix=args.symbol_prefix)
+    lifter = PPULifter(prefix=args.symbol_prefix, weak_emit=args.weak)
     lifter.header_name = args.header_name
     # A single-module executable keeps r2 (TOC) constant, so an `ld r2, N(r1)` TOC
     # restore can be lowered to this literal instead of a stack read (the recomp has

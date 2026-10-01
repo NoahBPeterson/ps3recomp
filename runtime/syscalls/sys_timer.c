@@ -275,6 +275,30 @@ int64_t sys_timer_sleep(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
+ * sys_time_get_timezone
+ *
+ * r3 = pointer to receive timezone offset in minutes (s32*)
+ * r4 = pointer to receive daylight-saving offset in minutes (s32*)
+ *
+ * RPCS3 reports the configured region; the default is UTC with no DST,
+ * which is what we report (call sites in guest CRTs just cache the values).
+ * -----------------------------------------------------------------------*/
+int64_t sys_time_get_timezone(ppu_context* ctx)
+{
+    uint32_t tz_addr  = LV2_ARG_PTR(ctx, 0);
+    uint32_t dst_addr = LV2_ARG_PTR(ctx, 1);
+
+    if (tz_addr != 0) {
+        write_be32(tz_addr, 0);
+    }
+    if (dst_addr != 0) {
+        write_be32(dst_addr, 0);
+    }
+
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
  * sys_time_get_current_time
  *
  * r3 = pointer to receive seconds (u64*)
@@ -676,5 +700,6 @@ void sys_timer_init(lv2_syscall_table* tbl)
     /* Register these but be aware of collisions */
     lv2_syscall_register(tbl, SYS_TIMER_USLEEP,            sys_timer_usleep);
     lv2_syscall_register(tbl, SYS_TIMER_SLEEP,             sys_timer_sleep);
+    lv2_syscall_register(tbl, SYS_TIME_GET_TIMEZONE,        sys_time_get_timezone);
     lv2_syscall_register(tbl, SYS_TIME_GET_CURRENT_TIME,   sys_time_get_current_time);
 }

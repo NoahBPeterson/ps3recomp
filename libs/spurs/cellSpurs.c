@@ -1494,6 +1494,22 @@ static WklPm* spurs_resolve_pm(u32 wid)
     else
         printf("[cellSpurs] wid=%u PM NOT LIFTED (fp=0x%016llX size=%u) -- workload will not run\n",
                wid, (unsigned long long)fp, w->sizePm);
+    /* Dump the PM as laid down at runtime so the port can lift exactly these
+     * bytes and re-register by this fingerprint (SPURS_PM_DUMP_DIR, default
+     * "./spu_pm_dumps"). Runs once per unlifted workload. */
+    if (!r->fn) {
+        const char* dir = getenv("SPURS_PM_DUMP_DIR");
+        if (!dir || !*dir) dir = "./spu_pm_dumps";
+        char path[512];
+        snprintf(path, sizeof path, "%s/pm_wid%u_fp%016llX_sz%u.bin",
+                 dir, wid, (unsigned long long)fp, (unsigned)w->sizePm);
+        FILE* f = fopen(path, "wb");
+        if (f) {
+            fwrite(vm_base + (uint32_t)(uintptr_t)w->pm, 1, w->sizePm, f);
+            fclose(f);
+            printf("[cellSpurs]   dumped PM -> %s\n", path);
+        }
+    }
     return r->fn ? r : NULL;
 }
 
