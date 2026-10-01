@@ -3189,38 +3189,57 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
     return CELL_OK;
 }
 
+/* ---- SPURS LFQueue (CellSpursLFQueue == the 128-byte CellSyncLFQueue line) ----
+ *
+ * The consumer is recompiled SPU task code that works on the queue line in main
+ * memory with GETLLAR/PUTLLC, so the bytes ARE the interface. The layout and the
+ * protocol below were read out of inFamous' EDGE zlib task (SPU image 1, the
+ * libspurs task-side LFQueue code linked into it):
+ *   GetPopPointer      LS 0x9B10..0x9F98
+ *   CompletePopPointer LS 0x9FA0..0xA5A0 (wakes collected waiters via 0xA698)
+ *   data fetch         LS 0xA5A8  (slot = index mod depth, at buffer + slot*size)
+ *   waiter id          LS 0x9800  ((workload id << 8) | task id)
+ * The PPU push is that pop protocol mirrored (pop fields <-> push fields).
+ *
+ *   +0x00 u16 pop  done index      +0x08 u16 push done index
+ *   +0x02 u16 pop  done bitmap     +0x0A u16 push done bitmap
+ *   +0x04 u16 pop  waiters (dir 3) +0x0C u16 push waiters (dir 3)
+ *   +0x06 s16 pop  reserve index   +0x0E s16 push reserve index
+ *   +0x10 u32 element size   +0x14 u32 depth   +0x18 u64 buffer EA
+ *   +0x20 u8 bs[4]   +0x24 u32 direction
+ *   +0x30 u16 pop  waiters  +0x32 u16 pop  waiter ids[15]
+ *   +0x50 u16 push waiters  +0x52 u16 push waiter ids[15]
+ *   +0x70 u64 owner (taskset, or SPURS|1)
+ *
+ * Indices run modulo 2*depth. A "waiters" word packs three 5-bit counters that
+ * run modulo 30: w0 = registered (tail), w1 = woken and retried, w2 = woken
+ * (head). A waiter registers its id at ids[w0 % 15] and sleeps; it is woken in
+ * FIFO order from w2. For direction 3 (ANY2ANY) the code keeps those words at
+ * +0x04/+0x0C instead of +0x30/+0x50 (it swaps them in and out around the
+ * update; the id arrays stay put). A completion sets bit (15 - k) in the
+ * bitmap, k = index - done; done then advances over the leading run of ones,
+ * so out-of-order completions retire in order. At most 15 operations may be
+ * outstanding per side (the bitmap width). */
+enum {
+    LFQ_POP_DONE = 0x00, LFQ_POP_BITS = 0x02, LFQ_POP_W3 = 0x04, LFQ_POP_RSV = 0x06,
+    LFQ_PUSH_DONE = 0x08, LFQ_PUSH_BITS = 0x0A, LFQ_PUSH_W3 = 0x0C, LFQ_PUSH_RSV = 0x0E,
+    LFQ_SIZE = 0x10, LFQ_DEPTH = 0x14, LFQ_BUFFER = 0x18, LFQ_DIRECTION = 0x24,
+    LFQ_POP_W = 0x30, LFQ_PUSH_W = 0x50, LFQ_OWNER = 0x70,
+};
+#define LFQ_DIR_SPU2SPU 0u
+#define LFQ_DIR_SPU2PPU 1u
+#define LFQ_DIR_PPU2SPU 2u
+#define LFQ_DIR_ANY2ANY 3u
+#define LFQ_ERR_AGAIN   0x80410101u   /* CELL_SYNC_ERROR_AGAIN */
+#define LFQ_ERR_INVAL   0x80410102u
+#define LFQ_ERR_PERM    0x80410109u   /* what the SPU pop returns for a bad direction */
+#define LFQ_ERR_ALIGN   0x80410110u
+#define LFQ_ERR_NULL    0x80410111u
+
 /* _cellSpursLFQueueInitialize(void* pTasksetOrSpurs, CellSpursLFQueue* pQueue,
  *      const void* buffer, u32 size, u32 depth, u32 direction)
- *
- * This one CANNOT be a stub, because the consumer is recompiled SPU code that
- * reads the queue out of main memory itself. Disassembling image 1 around the
- * task's WAIT_SIGNAL call site (LS 0x12B80) shows the real protocol: it builds
- * a 128-byte line at LS 0x80 and commits it with
- *
- *   wrch MFC_LSA,0x80 / MFC_EAH / MFC_EAL / MFC_Size,128 / MFC_Cmd,0xB4 (PUTLLC)
- *   rdch MFC_RdAtomicStat ; brnz -> retry
- *
- * i.e. a GETLLAR/PUTLLC lock-line atomic on the queue's own cache line. So the
- * bytes in guest memory ARE the interface, and they have to be the real
- * big-endian CellSyncLFQueue: one 128-byte, 128-aligned line.
- *
- *   0x00 pop1     0x10 size     0x18 buffer(u64)  0x24 direction  0x2C init
- *   0x08 push1    0x14 depth    0x20 bs[4]        0x28 v1         0x70 eaSignal
- *
- * The title's own call corroborates the size: it passes q=0x4059FD00 with
- * buffer=0x4059FD80, exactly 128 bytes later.
- *
- * NOTE: libs/sync/cellSync.c has a CellSyncLFQueue too, but that one is a
- * HOST-native struct (atomic_uint, a 64-bit host buffer pointer). It is fine
- * for a queue both of whose ends are HLE, and completely wrong here -- writing
- * it into guest memory would hand the SPU a host pointer where a 32-bit big-
- * endian EA belongs. Hence a separate, guest-accurate initializer rather than
- * delegating to it.
- *
- * What is set here is only what the arguments determine outright: size, depth,
- * buffer, direction, and the init flag, over a zeroed line (the documented
- * empty state). The bs[]/v1 slot state machine is left zero -- see PROGRESS.md;
- * it is not guessed at. */
+ * Empty queue = all indices, bitmaps and waiter words zero. The SPU pop reads
+ * the direction at +0x24 (and takes the ANY2ANY path on 3), so it must be set. */
 s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
                                 u32 size, u32 depth, u32 direction)
 {
@@ -3229,30 +3248,17 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
 
     uint32_t q = (uint32_t)queue_ea;
     for (uint32_t o = 0; o < 128; o += 4) vm_write32(q + o, 0);
-
-    /* W3 at +0x0C is the ring modulus the consumer reduces indices by: the
-     * empty test is (W1-W0) mod 2*W3 and the buffer slot is index mod W3
-     * (derived at 0x12914..0x129B8). Leaving it zero degenerated both and made
-     * the queue look permanently empty no matter what a producer wrote. */
-    vm_write32(q + 0x0C, depth);
-    vm_write32(q + 0x10, size);
-    vm_write32(q + 0x14, depth);
-    vm_write64(q + 0x18, (u64)(uint32_t)buffer_ea);   /* bcptr<void,u64> */
-    /* NOT direction at +0x24 and NOT init at +0x2C. Both sit inside the
-     * 16-byte group at +0x20..+0x2F that the consumer owns and shifts wholesale
-     * (shlqbyi <group>,1 at 0x12A0C). The trace shows the two values we used to
-     * write there marching through it one byte per dequeue --
-     *   +0x24: 00000002 -> 00000200 -> 00020000 -> 02000000
-     *   +0x2C: 00000001 -> 00000100 -> 00010000 -> 01000000
-     * -- i.e. we were feeding garbage into the SPU's own state every cycle.
-     * Whatever holds direction/init, it is not these offsets. */                          /* init: constructed */
-    vm_write64(q + 0x70, (u64)(uint32_t)owner_ea);    /* eaSignal <- taskset/spurs */
+    vm_write32(q + LFQ_SIZE, size);
+    vm_write32(q + LFQ_DEPTH, depth);
+    vm_write64(q + LFQ_BUFFER, (u64)(uint32_t)buffer_ea);
+    vm_write32(q + LFQ_DIRECTION, direction);
+    vm_write64(q + LFQ_OWNER, (u64)(uint32_t)owner_ea);
 
     memset(vm_base + (uint32_t)buffer_ea, 0, (size_t)size * depth);
 
     static int _n = 0;
     if (_n++ < 8)
-        printf("[cellSpurs] _LFQueueInitialize(owner=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u) -> BE line written\n",
+        printf("[cellSpurs] _LFQueueInitialize(owner=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u)\n",
                (u32)owner_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
     return CELL_OK;
 }
@@ -3261,5 +3267,122 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
 {
     static int _n = 0;
     if (_n++ < 8) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
+    return CELL_OK;
+}
+
+static inline int lfq_mod(int v, int m) { v %= m; return v < 0 ? v + m : v; }
+static inline u16 lfq_wake_next(u16 w) { u16 h = (u16)((w >> 10) & 31); return (u16)((w & 0x83FFu) | ((h == 29 ? 0 : h + 1) << 10)); }
+/* id slot a waiter counter refers to: ids[c % 15], i.e. halfword (c % 15) + 1 of the line */
+static inline uint32_t lfq_id_addr(uint32_t wline, u16 c) { return wline + 2u * (uint32_t)(c % 15u + 1u); }
+
+/* A waiter id is (workload id << 8) | task id. Every taskset this HLE creates
+ * is workload 0 (see cellSpursCreateTaskset), so the owner taskset is either
+ * the queue's owner itself or the one taskset recorded for the instance. */
+static uint32_t lfq_taskset_for(uint32_t q, u16 id)
+{
+    uint32_t owner = (uint32_t)vm_read64(q + LFQ_OWNER);
+    if (owner && !(owner & 1u)) return owner;
+    if ((id >> 8) == 0) return g_ydkj_real_taskset_ea;
+    return 0;
+}
+
+/* _cellSpursLFQueuePushBody(CellSpursLFQueue* q, const void* data, u32 flags)
+ * PPU-side push: reserve a slot, copy the element in, complete it, and wake
+ * the SPU tasks whose pops the new element satisfies. Each step is one
+ * read-modify-write of the line under the lock-line lock, which is what makes
+ * it atomic against the task's GETLLAR/PUTLLC. A blocked PPU pusher polls
+ * instead of registering a waiter (it never appears in the push id array).
+ * Bit 0 of flags = blocking (inFamous' EDGE zlib passes 3; bit 1 is unknown
+ * and ignored). */
+s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 flags)
+{
+    const uint32_t q = (uint32_t)queue_ea;
+    if (!q || !(uint32_t)data_ea) return (s32)LFQ_ERR_NULL;
+    if (q & 127u)                 return (s32)LFQ_ERR_ALIGN;
+
+    const u32 dir = vm_read32(q + LFQ_DIRECTION);
+    if (dir != LFQ_DIR_PPU2SPU && dir != LFQ_DIR_ANY2ANY) return (s32)LFQ_ERR_PERM;
+    const uint32_t popw  = dir == LFQ_DIR_ANY2ANY ? q + LFQ_POP_W3  : q + LFQ_POP_W;
+    const uint32_t pushw = dir == LFQ_DIR_ANY2ANY ? q + LFQ_PUSH_W3 : q + LFQ_PUSH_W;
+    const int depth = (int)vm_read32(q + LFQ_DEPTH);
+    const u32 size  = vm_read32(q + LFQ_SIZE);
+    if (depth <= 0 || depth > 0x7FFF) return (s32)LFQ_ERR_INVAL;
+    const int ring = 2 * depth;
+
+    /* 1. reserve */
+    int idx;
+    for (unsigned spins = 0;; spins++) {
+        spu_lockline_lock();
+        const int z  = ef_r16(q + LFQ_POP_DONE);
+        const int y  = ef_r16(q + LFQ_PUSH_DONE);
+        const int xp = (int16_t)ef_r16(q + LFQ_PUSH_RSV);
+        const u16 w  = ef_r16(pushw);
+        const int w0 = w & 31, w1 = (w >> 5) & 31, w2 = (w >> 10) & 31;
+        const int woken = lfq_mod(w2 - w1, 30);
+        const int space = depth - lfq_mod(xp - z, ring);
+        const int busy  = lfq_mod(xp - y, ring);
+        if (space - woken > 0 && busy + woken <= 15 && w0 == w2) {
+            idx = xp;
+            ef_w16(q + LFQ_PUSH_RSV, (u16)(xp + 1 == ring ? 0 : xp + 1));
+            ef_line_end(q);
+            break;
+        }
+        ef_line_end(q);
+        if (!(flags & 1u)) return (s32)LFQ_ERR_AGAIN;
+        if (spins == 2000) {
+            static int _n = 0;
+            if (_n++ < 8) fprintf(stderr, "[cellSpurs] LFQueuePush q=0x%08X full for ~2s (space=%d woken=%d busy=%d)\n",
+                                  q, space, woken, busy);
+        }
+        Sleep(1);
+    }
+
+    /* 2. copy the element into its slot */
+    const uint32_t buf = (uint32_t)vm_read64(q + LFQ_BUFFER);
+    memcpy(vm_base + buf + (uint32_t)(idx % depth) * size, vm_base + (uint32_t)data_ea, size);
+
+    /* 3. complete, then wake pop waiters (at most one per newly completed element) */
+    u16 wake_ids[15];
+    int nwake = 0;
+    spu_lockline_lock();
+    {
+        const int y = ef_r16(q + LFQ_PUSH_DONE);
+        u32 bits = ef_r16(q + LFQ_PUSH_BITS) | (1u << (15 - lfq_mod(idx - y, ring)));
+        int done = 0;
+        while (done < 16 && (bits & (0x8000u >> done))) done++;
+        ef_w16(q + LFQ_PUSH_DONE, (u16)lfq_mod(y + done, ring));
+        ef_w16(q + LFQ_PUSH_BITS, (u16)(bits << done));
+
+        const int z = ef_r16(q + LFQ_POP_DONE);
+        const int x = (int16_t)ef_r16(q + LFQ_POP_RSV);
+        int pop_busy = lfq_mod(x - z, ring);
+        u16 pw = ef_r16(popw);
+        int pop_woken = lfq_mod(((pw >> 10) & 31) - ((pw >> 5) & 31), 30);
+        int pop_waiting = lfq_mod((pw & 31) - ((pw >> 10) & 31), 30);
+        if (pop_busy + pop_woken > 15) pop_waiting = 0;
+        for (int i = 0; i < done && pop_waiting > 0 && pop_busy + pop_woken <= 15; i++) {
+            const u16 head = (u16)((pw >> 10) & 31);
+            wake_ids[nwake++] = ef_r16(lfq_id_addr(q + LFQ_POP_W, head));
+            pw = lfq_wake_next(pw);
+            pop_woken++; pop_waiting--;
+        }
+        ef_w16(popw, pw);
+    }
+    ef_line_end(q);
+
+    for (int i = 0; i < nwake; i++) {
+        const u16 id = wake_ids[i];
+        const uint32_t ts = id == 0xFFFFu ? 0 : lfq_taskset_for(q, id);
+        if (!ts) {
+            static int _n = 0;
+            if (_n++ < 8) fprintf(stderr, "[cellSpurs] LFQueuePush q=0x%08X: cannot wake waiter id 0x%04X\n", q, id);
+            continue;
+        }
+        spu_taskset_signal_task(ts, id & 0xFFu);
+    }
+
+    static int _n = 0;
+    if (_n++ < 8)
+        printf("[cellSpurs] LFQueuePush q=0x%08X slot=%d flags=%u woke=%d\n", q, idx, flags, nwake);
     return CELL_OK;
 }
