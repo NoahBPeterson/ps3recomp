@@ -578,6 +578,12 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         { static FILE* _wf = (FILE*)-1;
           if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
           if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
+        /* PS3_AUDIO_MUTE=1: silence the HOST output only. The title still sees a
+         * working audio device and every mix/pacing path runs as normal (unlike
+         * PS3_NO_AUDIO, which changes what the guest does). AUDIO_WAV above still
+         * records the real mix. */
+        { static int mute = -1; if (mute < 0) mute = getenv("PS3_AUDIO_MUTE") ? 1 : 0;
+          if (mute) memset(s_mix_buffer, 0, sizeof(float) * CELL_AUDIO_BLOCK_SAMPLES * 2); }
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
