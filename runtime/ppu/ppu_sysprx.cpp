@@ -107,7 +107,13 @@ static void sys_process_is_stack(ppu_context* ctx)
  * unregistered context (bug); stamp a sentinel that matches no real thread. */
 #define LWM_SELF(ctx) ((uint32_t)(ctx)->thread_id ? (uint32_t)(ctx)->thread_id : 0x7FFFFFFEu)
 
-#ifdef _WIN32
+/* Real lwmutex/lwcond on every host. They were _WIN32-only: on POSIX lock and
+ * unlock merely stamped the owner word, so there was no mutual exclusion at
+ * all, and lwcond_wait returned at once. The semaphores come from the
+ * win32_compat shim (pthread-backed) off Windows. */
+#define PS3_LWM_REAL 1
+
+#if PS3_LWM_REAL
 static HANDLE lwm_sem(uint32_t addr);   /* fwd (defined below) */
 #endif
 static void sys_lwmutex_create(ppu_context* ctx)
@@ -124,7 +130,7 @@ static void sys_lwmutex_create(ppu_context* ctx)
     vm_write32(lwm + LWM_RECUR, 0);     /* recursive_count */
     vm_write32(lwm + 0x10, 0);          /* sleep_queue */
     vm_write32(lwm + 0x14, 0);
-#ifdef _WIN32
+#if PS3_LWM_REAL
     /* A recreate at a reused address must not inherit a locked slot (e.g. the
      * previous holder exited while holding). Force the semaphore signaled;
      * over-release of an already-free sem fails harmlessly at max count 1. */
@@ -145,7 +151,7 @@ static void sys_lwmutex_create(ppu_context* ctx)
  * thread. Recursion is handled explicitly via the guest owner/recur fields
  * we stamp (only the holder ever writes owner=self, so the re-lock check is
  * race-free). Keyed by guest address in an open-addressed table. */
-#ifdef _WIN32
+#if PS3_LWM_REAL
 #define LWM_HASH 65536u
 static struct LwmSlot { volatile long addr; HANDLE sem;
     volatile long holder; volatile long long acq_us; volatile long long acq_fences;
@@ -221,7 +227,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
      * contended lock yields to other threads instead of hard-blocking). We had
      * been ignoring r4 and always waiting INFINITE, which defeats that pattern. */
     uint64_t timeout_us = ctx->gpr[4];
-#ifdef _WIN32
+#if PS3_LWM_REAL
     HANDLE s = lwm_sem(lwm);
     if (s) {
         /* Recursive re-lock by the current holder: bump the count, no wait.
@@ -268,7 +274,7 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
     uint32_t self = LWM_SELF(ctx);
-#ifdef _WIN32
+#if PS3_LWM_REAL
     HANDLE s = lwm_sem(lwm);
     if (s) {
         if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
@@ -295,7 +301,7 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
     }
     vm_write32(lwm + LWM_RECUR, 0);
     vm_write32(lwm + LWM_OWNER, 0);
-#ifdef _WIN32
+#if PS3_LWM_REAL
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm);
         if (sl && sl->holder) { long long held = lwm_now_us() - sl->acq_us;
             if (held > 100000) {
@@ -364,7 +370,7 @@ static void sys_lwcond_wait(ppu_context* ctx)
 {
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex = vm_read32(lwcond + 0x00);
-#ifdef _WIN32
+#if PS3_LWM_REAL
     HANDLE s = lwm_sem(lwmutex);
     if (s) {
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
