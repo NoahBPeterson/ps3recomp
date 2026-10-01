@@ -371,15 +371,27 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
  * the ELF EA at +0x14 and the context save EA at +0x1C. */
 #define TS_TRACK 8
 static struct { uint32_t ea; uint8_t running[16]; } s_ts_run[TS_TRACK];
+#if defined(_WIN32)
 static volatile LONG s_ts_lock;
+#else
+/* Portable spinlock: C11 atomics (the Win32 path is the original). */
+#include <stdatomic.h>
+#include <sched.h>
+static atomic_uint s_ts_lock;
+#endif
 static uint8_t* ts_running(uint32_t taskset_ea)
 {
     for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == taskset_ea) return s_ts_run[i].running;
     for (int i = 0; i < TS_TRACK; i++) if (!s_ts_run[i].ea) { s_ts_run[i].ea = taskset_ea; return s_ts_run[i].running; }
     return NULL;
 }
+#if defined(_WIN32)
 static void ts_lock(void)   { while (InterlockedExchange(&s_ts_lock, 1)) Sleep(0); }
 static void ts_unlock(void) { InterlockedExchange(&s_ts_lock, 0); }
+#else
+static void ts_lock(void)   { while (atomic_exchange_explicit(&s_ts_lock, 1u, memory_order_acquire)) sched_yield(); }
+static void ts_unlock(void) { atomic_store_explicit(&s_ts_lock, 0u, memory_order_release); }
+#endif
 
 static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
 {
