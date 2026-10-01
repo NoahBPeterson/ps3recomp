@@ -456,6 +456,11 @@ def compute_link_returns(insns, bounds) -> set:
     return returns
 
 
+
+# lv2 stop-and-signal syscalls that resume at the next instruction (the same
+# set as find_spu_functions.LV2_RESUMING_STOPS, which decides function extents).
+LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
+
 class SPULifter:
     def __init__(self, trace: bool = False, prefix: str = ""):
         self.functions: list[LiftedFunction] = []
@@ -524,7 +529,10 @@ class SPULifter:
         # into the next sequential function. Emit a tail-call so the chain isn't
         # truncated (this was silently dropping execution mid-job).
         _TERMINATORS = {"br", "bra", "bi", "iret", "stop", "stopd"}
-        if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
+        if (last_insn is not None
+                and (last_insn.mnemonic not in _TERMINATORS
+                     or (last_insn.mnemonic == "stop"
+                         and (last_insn.raw & 0x3FFF) in LV2_RESUMING_STOPS))
                 and end in getattr(self, "func_starts", set())):
             func.body_lines.append(
                 f"    {{ ctx->pc = 0x{end:X}; "
@@ -610,7 +618,15 @@ class SPULifter:
         if mn == "stop":
             # Preserve the 14-bit stop-and-signal code: SPURS leaf tasks use
             # `stop <code>` to invoke kernel syscalls (EXIT/YIELD/WAIT_SIGNAL/...).
-            return (f"ctx->stop_code = 0x{insn.raw & 0x3FFF:X}u; "
+            code = insn.raw & 0x3FFF
+            if code in LV2_RESUMING_STOPS:
+                # lv2 services these and resumes at the next instruction (the
+                # reply is read from the inbound mailbox right after the stop).
+                # spu_stop puts the context back to RUNNING when it serviced it.
+                return (f"ctx->stop_code = 0x{code:X}u; "
+                        f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); "
+                        f"if (ctx->status != SPU_STATUS_RUNNING) return;")
+            return (f"ctx->stop_code = 0x{code:X}u; "
                     f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
 
         # ---- immediate loaders ----

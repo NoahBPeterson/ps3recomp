@@ -902,6 +902,45 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
     return event_queue_push(q, &evt);
 }
 
+/* Pop one event for an SPU-side sys_spu_thread_receive_event (stop 0x110,
+ * blocking) or tryreceive (stop 0x111). The queue is a guest lv2 event queue
+ * the PPU bound with sys_spu_thread_bind_queue; PPU code feeds it with
+ * sys_event_port_send. Returns CELL_OK and fills *out, CELL_EBUSY when a try
+ * finds it empty, CELL_ECANCELED once its producer is gone, CELL_EINVAL for a
+ * queue that does not exist. */
+int32_t sys_event_queue_pop_internal(uint32_t queue_id, int blocking, sys_event_t* out)
+{
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return (int32_t)CELL_EINVAL;
+    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    if (!q->active) return (int32_t)CELL_EINVAL;
+#ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+    while (blocking && q->count == 0 && q->active && !q->cancelled)
+        SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
+#else
+    pthread_mutex_lock(&q->lock);
+    while (blocking && q->count == 0 && q->active && !q->cancelled)
+        pthread_cond_wait(&q->not_empty, &q->lock);
+#endif
+    int32_t rc;
+    if (q->count > 0) {
+        *out = q->buffer[q->head];
+        q->head = (q->head + 1) % q->capacity;
+        q->count--;
+        rc = CELL_OK;
+    } else {
+        rc = q->cancelled ? (int32_t)CELL_ECANCELED
+           : !q->active   ? (int32_t)CELL_EINVAL
+           :                (int32_t)CELL_EBUSY;
+    }
+#ifdef _WIN32
+    LeaveCriticalSection(&q->lock);
+#else
+    pthread_mutex_unlock(&q->lock);
+#endif
+    return rc;
+}
+
 /* Public helper: resolve an event queue by its ipc_key (as registered at
  * sys_event_queue_create). Returns the queue_id (1-based) or 0 if none. Used by
  * cellAudio to route the audio-period notify event to the game's queue. */

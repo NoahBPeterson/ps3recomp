@@ -184,6 +184,8 @@ void spu_dbg_e60(spu_context* ctx)
  * host SPU thread (longjmp to spu_run_with_halt) so the job stops AT the stop,
  * with ctx->status + the outbound mailbox value available for the dispatcher to
  * service. Env YDKJ_STOP_NOHALT restores the old (looping) behavior for A/B. */
+int (*g_spu_lv2_stop_hook)(spu_context*) = 0;
+
 void spu_stop(spu_context* ctx)
 {
     /* A lifted `stop` sets status and RETURNS to its caller -- for a SPURS
@@ -197,6 +199,12 @@ void spu_stop(spu_context* ctx)
     static int s_halt = -1;
     if (s_halt < 0) s_halt = getenv("YDKJ_STOP_HALT") ? 1 : 0;
     ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+    /* lv2 syscalls made by stop-and-signal (receive_event & co.): serviced by
+     * the lv2 layer, after which the SPU resumes at the next instruction. */
+    if (g_spu_lv2_stop_hook && g_spu_lv2_stop_hook(ctx)) {
+        ctx->status = SPU_STATUS_RUNNING;
+        return;
+    }
     if (s_halt) spu_halt(ctx);
 }
 
