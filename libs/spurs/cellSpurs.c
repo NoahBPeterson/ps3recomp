@@ -471,7 +471,18 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
 
     if (!si->kernel_live) {
         si->kernel_live = 1;
-        CreateThread(NULL, 1u << 20, spurs_kernel_thread, si, 0, NULL);
+        /* One kernel thread per SPU of the instance (SPURS_KERN_THREADS=N
+         * overrides, at most nSpus), standing in for the SPUs that each run
+         * the SPURS kernel. Each claims
+         * a workload before running it, so different workloads run at once
+         * while each still runs on one thread at a time (maxContention 1). */
+        u32 nk = si->nspus;                     /* one per SPU, as on hardware */
+        { const char* e = getenv("SPURS_KERN_THREADS");
+          if (e && atoi(e) > 0) nk = (u32)atoi(e); }
+        if (nk > si->nspus) nk = si->nspus;
+        if (nk < 1) nk = 1;
+        for (u32 k = 0; k < nk; k++)
+            CreateThread(NULL, 1u << 20, spurs_kernel_thread, si, 0, NULL);
     }
     printf("[cellSpurs] Initialize \"%s\" ea=0x%08X nSpus=%u (real BE instance + kernel poll)\n",
            si->prefix, spurs_ea, si->nspus);
@@ -1629,6 +1640,11 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             if (!(enabled & (0x80000000u >> wid))) continue;
             if (*(vm_base + ea + SPURS_WKL_STATE1 + wid) != 2) continue;
             if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea) continue;
+            /* Claim the workload for this kernel thread (see SPURS_KERN_THREADS). */
+            static volatile int s_claim[MAX_SPURS_INST][16];
+            volatile int* claim = &s_claim[(int)(si - s_inst)][wid];
+            if (__atomic_exchange_n(claim, 1, __ATOMIC_ACQUIRE)) continue;
+            do {   /* `continue` below leaves this block, releasing the claim */
 
             /* A SPURS policy module is a PERSISTENT SPU program. The real kernel
              * schedules an ENABLED, runnable workload onto an SPU and the module
@@ -1753,6 +1769,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             if (g_spurs_pm_polls == 0) { if (s_idle[wid] < 8) s_idle[wid]++; }
             else { s_idle[wid] = 0; busy = 1; }
             }
+            } while (0);
+            __atomic_store_n(claim, 0, __ATOMIC_RELEASE);
         }
     }
 }
