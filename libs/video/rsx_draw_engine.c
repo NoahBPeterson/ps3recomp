@@ -1,3 +1,7 @@
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 #include <time.h>
 /*
  * ps3recomp - platform-neutral RSX draw engine (see rsx_draw_engine.h)
@@ -1783,6 +1787,45 @@ static void eng_constlog_frame_end(void)
     if (!f) return;
     if (s_cl_n > 5000 && dumped < 3 && (big++ % 50) == 0) {
         fprintf(f, "---- frame %u draws=%u ----\n", g.frames, s_cl_n);
+        /* Where does the camera live? Find a constant row's xyz (default c268,
+         * PS3RECOMP_ENG_CONSTLOG_FIND=<n>) as the guest stored it (big-endian
+         * floats) in guest memory. */
+        { extern uint8_t* vm_base;
+          uint8_t pat[12];
+          for (int k = 0; k < 3; k++) {
+              static int s_row = -1;
+              if (s_row < 0) { const char* e = getenv("PS3RECOMP_ENG_CONSTLOG_FIND"); s_row = e ? atoi(e) : 268; }
+              u32 w = g.rsx.constants[s_row][k];
+              pat[k*4] = (uint8_t)(w >> 24); pat[k*4+1] = (uint8_t)(w >> 16);
+              pat[k*4+2] = (uint8_t)(w >> 8); pat[k*4+3] = (uint8_t)w;
+          }
+          int hits = 0;
+#if defined(__APPLE__)
+          /* Only readable host regions: most of the 4 GB window is PROT_NONE. */
+          if (vm_base && (pat[0] | pat[1] | pat[4] | pat[5])) {
+              mach_vm_address_t addr = (mach_vm_address_t)(uintptr_t)vm_base;
+              const mach_vm_address_t end = addr + 0x100000000ull;
+              while (addr < end && hits < 24) {
+                  mach_vm_size_t size = 0; vm_region_basic_info_data_64_t info;
+                  mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
+                  if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                                     (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS) break;
+                  if (addr >= end) break;
+                  if (info.protection & VM_PROT_READ) {
+                      const uint8_t* p0 = (const uint8_t*)(uintptr_t)addr;
+                      mach_vm_size_t lim = (addr + size > end ? end - addr : size);
+                      for (mach_vm_size_t o = 0; o + 12 <= lim && hits < 24; o += 4)
+                          if (p0[o] == pat[0] && !memcmp(p0 + o, pat, 12)) {
+                              fprintf(f, "  find-row xyz found at EA 0x%08X\n",
+                                      (u32)((uintptr_t)(p0 + o) - (uintptr_t)vm_base));
+                              hits++;
+                          }
+                  }
+                  addr += size;
+              }
+          }
+#endif
+        }
         fwrite(s_cl_buf, 1, s_cl_len, f);
         fflush(f);
         dumped++;
