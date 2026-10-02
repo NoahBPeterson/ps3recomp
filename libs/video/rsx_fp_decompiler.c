@@ -376,7 +376,14 @@ static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
     if (s->type == FP_REG_TYPE_TEMP) {
         snprintf(base, sizeof(base), "%s[%u]", s->half ? "h" : "r", s->index);
     } else if (s->type == FP_REG_TYPE_INPUT) {
-        snprintf(base, sizeof(base), "%s", input_expr(input_src));
+        /* WPOS in a buffered shader: SV_POSITION is top-left origin, the RSX
+         * window origin may be bottom (SHADER_WINDOW bit 12), where
+         * WPOS.y = height - row. fp_alpha.y/.z carry the scale and bias. */
+        if (buffered && input_src == 0x0)
+            snprintf(base, sizeof(base),
+                     "float4(input.position.x, input.position.y * fp_alpha.y + fp_alpha.z, input.position.zw)");
+        else
+            snprintf(base, sizeof(base), "%s", input_expr(input_src));
     } else { /* CONST */
         if (buffered && has_k)
             snprintf(

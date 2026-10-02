@@ -864,7 +864,7 @@ static int guest_programs_for(const rsx_state* st, MtlDraw* d)
         memcpy(fp, s_fp_consts.values, s_fp_consts.count * 16u);
     float* alpha = (float*)(fp + nslots * 16u);
     alpha[0] = rsx_fp_alpha_ref(st->alpha_ref, st->surface_format & 0x1Fu);
-    alpha[1] = alpha[2] = alpha[3] = 0.0f;
+    alpha[1] = 1.0f; alpha[2] = alpha[3] = 0.0f;   /* WPOS scale/bias: top origin */
 
     d->vs_idx = vs; d->fs_idx = fs;
     d->vp_cb_off = vp_off;

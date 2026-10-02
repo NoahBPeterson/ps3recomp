@@ -1304,9 +1304,30 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 
 /* ---- sink ---------------------------------------------------------------- */
 
+/* PS3RECOMP_ENG_VPLOG=1: print each distinct (viewport y scale sign, y
+ * offset, SHADER_WINDOW 0x1D88, color offset 0x0210, surface clip 0x0200)
+ * combination the first time a draw uses it -- which way each pass maps
+ * NDC +y to rows. */
+static void eng_vplog(const rsx_dispatch* r)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("PS3RECOMP_ENG_VPLOG") ? 1 : 0;
+    if (!on) return;
+    rsx_dsp_viewport vp; rsx_dsp_get_viewport(r, &vp);
+    const u32 win = rsx_dsp_reg(r, 0x1D88), coff = rsx_dsp_reg(r, 0x0210), clip = rsx_dsp_reg(r, 0x0200);
+    static u32 seen[64][4]; static int n;
+    const u32 key[4] = { vp.scale[1] < 0.0f, win, coff, (u32)vp.translate[1] };
+    for (int i = 0; i < n; i++) if (!memcmp(seen[i], key, sizeof key)) return;
+    if (n >= 64) return;
+    memcpy(seen[n++], key, sizeof key);
+    fprintf(stderr, "[eng-vp] scale=(%.1f,%.1f) trans=(%.1f,%.1f) vp=%ux%u@%u,%u win=0x%08X color_off=0x%08X clip=0x%08X\n",
+            vp.scale[0], vp.scale[1], vp.translate[0], vp.translate[1], vp.w, vp.h, vp.x, vp.y, win, coff, clip);
+}
+
 static void sink_begin(void* user, const rsx_dispatch* r, u32 prim)
 {
-    (void)user; (void)r; (void)prim;
+    (void)user; (void)prim;
+    eng_vplog(r);
     dc_reset();
 }
 
@@ -1648,7 +1669,14 @@ static void sink_end(void* user, const rsx_dispatch* r)
         memcpy(g.fp_cb, g.fp_constants.values, g.fp_constants.count * 16u);
     { float* alpha = (float*)(g.fp_cb + nslots * 16u);
       alpha[0] = rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format);
-      alpha[1] = alpha[2] = alpha[3] = 0.0f; }
+      /* WPOS y = pos.y * alpha[1] + alpha[2]: SHADER_WINDOW (0x1D88) bits
+       * 0..11 height, bit 12 origin (1 = bottom: y counts up from the
+       * bottom row). */
+      const u32 win = rsx_dsp_reg(&g.rsx, 0x1D88);
+      const int bottom = (win >> 12) & 1;
+      alpha[1] = bottom ? -1.0f : 1.0f;
+      alpha[2] = bottom ? (float)(win & 0xFFFu) : 0.0f;
+      alpha[3] = 0.0f; }
 
     /* The depth attachment is cleared the first time it is bound, so a title
      * that never clears its shadow zeta still tests against something. */
