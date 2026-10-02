@@ -1,3 +1,4 @@
+#include <stdlib.h>
 /*
  * ps3recomp - Memory management syscalls (implementation)
  */
@@ -66,6 +67,20 @@ int64_t sys_memory_allocate(ppu_context* ctx)
 
     fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X)\n",
             size, flags);
+    /* PS3_ALLOC_BT=1: the guest's saved-LR chain (frame+16 of each back-chain link),
+     * same walk as the RPCS3 oracle's "[oracle] sys_memory_allocate backchain". */
+    if (getenv("PS3_ALLOC_BT")) {
+        extern uint64_t vm_read64(uint64_t a);
+        char buf[512]; int p = snprintf(buf, sizeof buf, "lr=0x%x", (uint32_t)ctx->lr);
+        uint32_t sp = (uint32_t)ctx->gpr[1];
+        for (int i = 0; i < 16 && sp && sp < 0xF0000000u && p < (int)sizeof buf - 12; i++) {
+            uint32_t next = (uint32_t)vm_read64(sp);
+            if (!next || next < 0x10000u) break;
+            p += snprintf(buf + p, sizeof buf - p, " 0x%x", (uint32_t)vm_read64(next + 16));
+            sp = next;
+        }
+        fprintf(stderr, "[sys_memory] allocate backchain: %s\n", buf);
+    }
 
     /* Determine alignment based on page size flags */
     uint32_t alignment;

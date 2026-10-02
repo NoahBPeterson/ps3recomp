@@ -2604,8 +2604,24 @@ void spu_indirect_branch(spu_context* ctx)
      * WWS jobmanager writes a save/restore stub above its static
      * image and calls it). Interpret the live LS bytes; on success the next
      * branch re-enters lifted code via the trampoline. */
-    if (spu_smc_microstep(ctx))
+    if (spu_smc_microstep(ctx)) {
+        /* The interpreter stops where lifted code takes over again: a lifted entry
+         * or the drain's return point. The drain return is picked up by the
+         * waiting spu_drain_call. A lifted entry must be DISPATCHED here: nothing
+         * else is queued, so returning would unwind the whole run with pc parked
+         * at the entry. inFamous's WWS job manager died exactly so -- a job body
+         * (interpreted, DMA'd in at runtime) calls the PM service at LS 0x2F30,
+         * the lane ended there ([pm-end] pc=0x02F30), its claimed job never
+         * completed and the main thread spun forever in the job-done poll. */
+        if (g_spu_trampoline_fn || (ctx->drain_ret_pc && ctx->pc == ctx->drain_ret_pc))
+            return;
+#if defined(__clang__)
+        __attribute__((musttail)) return spu_indirect_branch(ctx);
+#else
+        spu_indirect_branch(ctx);
         return;
+#endif
+    }
     /* Cap the unresolved-branch log PER IMAGE: a global cap let one noisy
      * image (the FMOD mixer's overlay calls) exhaust it and silently hide
      * every other image's misses -- LBP's loading jobs skipped their command
