@@ -1,3 +1,5 @@
+#include <stdlib.h>
+#include <stdio.h>
 /*
  * ps3recomp - NV4097 method dispatcher (Track B / LAYER 2)
  *
@@ -250,10 +252,153 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
     memcpy(rsx->constants, words, count * sizeof(u32));
 }
 
+
+/* ---- immediate mode ----------------------------------------------------
+ * SET_VERTEX_DATA*_M: per-attribute register writes. Outside BEGIN/END they
+ * set the value a disabled attribute reads; inside, they also build vertices
+ * (RPCS3 rsx::util::push_vertex_data). The value is stored converted to a
+ * float4 in the VTX_ATTR_4F block too, so rsx_dsp_vertex_default sees writes
+ * of every width. Packing follows libgcm's cellGcmSetVertexData* helpers:
+ * 4UB is x | y<<8 | z<<16 | w<<24, 2S/4S are x | y<<16 per dword. */
+static float imm_bits_f(u32 v) { float f; memcpy(&f, &v, 4); return f; }
+
+static void imm_store(rsx_dispatch* rsx, u32 attr, u32 dword, u32 dwords_per_vertex,
+                      const float* v, u32 first, u32 n, u32 size)
+{
+    float* cur = rsx->imm_val[attr];
+    if (dword == 0) {   /* a new value starts: missing components default (0,0,0,1) */
+        for (u32 i = size; i < 4; i++) cur[i] = (i == 3) ? 1.0f : 0.0f;
+    }
+    for (u32 i = 0; i < n; i++) cur[first + i] = v[i];
+    for (u32 i = 0; i < 4; i++) {
+        u32 b; memcpy(&b, &cur[i], 4);
+        rsx->regs[(M_VTX_ATTR_4F + attr * 0x10 + i * 4) >> 2] = b;
+    }
+    if (!rsx->in_begin_end) return;
+    rsx->imm_mask |= 1u << attr;
+    if (attr != 0) return;
+    if (++rsx->imm_a0_dw < dwords_per_vertex) return;
+    rsx->imm_a0_dw = 0;
+    if (rsx->imm_n >= RSX_DSP_IMM_MAX) { rsx->imm_dropped++; return; }
+    memcpy(rsx->imm_vert[rsx->imm_n++], rsx->imm_val, sizeof rsx->imm_val);
+}
+
+/* Returns 1 when method is an immediate vertex-data write (handled). */
+static int imm_method(rsx_dispatch* rsx, u32 m, u32 arg)
+{
+    float v[4];
+    if (m >= 0x1C00 && m < 0x1D00) {            /* DATA4F_M   */
+        const u32 a = (m - 0x1C00) >> 4, c = ((m - 0x1C00) >> 2) & 3;
+        v[0] = imm_bits_f(arg);
+        imm_store(rsx, a, c, 4, v, c, 1, 4);
+        return 1;
+    }
+    if (m >= 0x1880 && m < 0x1900) {            /* DATA2F_M   */
+        const u32 a = (m - 0x1880) >> 3, c = ((m - 0x1880) >> 2) & 1;
+        v[0] = imm_bits_f(arg);
+        imm_store(rsx, a, c, 2, v, c, 1, 2);
+        return 1;
+    }
+    if (m >= 0x1500 && m < 0x15C0) {            /* DATA3F_M   */
+        const u32 a = (m - 0x1500) / 12, c = ((m - 0x1500) >> 2) % 3;
+        v[0] = imm_bits_f(arg);
+        imm_store(rsx, a, c, 3, v, c, 1, 3);
+        return 1;
+    }
+    if (m >= 0x1E40 && m < 0x1E80) {            /* DATA1F_M   */
+        v[0] = imm_bits_f(arg);
+        imm_store(rsx, (m - 0x1E40) >> 2, 0, 1, v, 0, 1, 1);
+        return 1;
+    }
+    if (m >= 0x1940 && m < 0x1980) {            /* DATA4UB_M (normalized) */
+        for (u32 i = 0; i < 4; i++) v[i] = (float)((arg >> (8 * i)) & 0xFF) / 255.0f;
+        imm_store(rsx, (m - 0x1940) >> 2, 0, 1, v, 0, 4, 4);
+        return 1;
+    }
+    if (m >= 0x1900 && m < 0x1940) {            /* DATA2S_M   */
+        v[0] = (float)(int16_t)(arg & 0xFFFF);
+        v[1] = (float)(int16_t)(arg >> 16);
+        imm_store(rsx, (m - 0x1900) >> 2, 0, 1, v, 0, 2, 2);
+        return 1;
+    }
+    if (m >= 0x1980 && m < 0x1A00) {            /* DATA4S_M   */
+        const u32 a = (m - 0x1980) >> 3, d = ((m - 0x1980) >> 2) & 1;
+        v[0] = (float)(int16_t)(arg & 0xFFFF);
+        v[1] = (float)(int16_t)(arg >> 16);
+        imm_store(rsx, a, d, 2, v, 2 * d, 2, 4);
+        return 1;
+    }
+    if (m >= 0x0A80 && m < 0x0B00) {            /* DATA_SCALED4S_M (normalized) */
+        const u32 a = (m - 0x0A80) >> 3, d = ((m - 0x0A80) >> 2) & 1;
+        v[0] = (float)(int16_t)(arg & 0xFFFF) / 32767.0f;
+        v[1] = (float)(int16_t)(arg >> 16) / 32767.0f;
+        imm_store(rsx, a, d, 2, v, 2 * d, 2, 4);
+        return 1;
+    }
+    return 0;
+}
+
+/* BEGIN_END(0) of a pair that carried immediate vertices and no array,
+ * index or inline packet: replay them as an INLINE_ARRAY of float4s, with
+ * VTXFMT rewritten for the duration so every consumer's inline layout reads
+ * exactly the written attributes and the rest fall back to their register
+ * value. */
+static void imm_flush_as_inline(rsx_dispatch* rsx)
+{
+    u32 k = 0;
+    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) if (rsx->imm_mask & (1u << a)) k++;
+    const u32 stride = 16u * k;
+    u32 n = rsx->imm_n;
+    if (n * stride > RSX_DSP_INLINE_MAX_BYTES) n = RSX_DSP_INLINE_MAX_BYTES / stride;
+    u32 saved[RSX_DSP_NUM_VERTEX_ATTR];
+    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
+        saved[a] = rsx->regs[(M_VTXFMT >> 2) + a];
+        rsx->regs[(M_VTXFMT >> 2) + a] =
+            (rsx->imm_mask & (1u << a)) ? (2u | (4u << 4) | (stride << 8)) : 0u;
+    }
+    u8* o = rsx->inline_data;
+    for (u32 i = 0; i < n; i++)
+        for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
+            if (!(rsx->imm_mask & (1u << a))) continue;
+            for (u32 c = 0; c < 4; c++) {
+                u32 b; memcpy(&b, &rsx->imm_vert[i][a][c], 4);
+                *o++ = (u8)(b >> 24); *o++ = (u8)(b >> 16); *o++ = (u8)(b >> 8); *o++ = (u8)b;
+            }
+        }
+    if (rsx->sink.inline_array)
+        rsx->sink.inline_array(rsx->sink.user, rsx, rsx->inline_data, n * stride);
+    if (rsx->sink.end)
+        rsx->sink.end(rsx->sink.user, rsx);
+    for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++)
+        rsx->regs[(M_VTXFMT >> 2) + a] = saved[a];
+}
+
+/* RSX_EMPTY_DRAW_LOG=<flip>: from that flip on, name the methods written
+ * inside a BEGIN_END pair that carried no vertex packet (first 12 pairs). */
+static u32 s_ed_flips, s_ed_n, s_ed_packets, s_ed_printed;
+static u32 s_ed_m[24], s_ed_a[24];
+static int s_ed_on = -1; static u32 s_ed_from;
+
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 {
     method &= 0xFFFFC;
     const u32 idx = method >> 2;
+    if (s_ed_on < 0) { const char* e = getenv("RSX_EMPTY_DRAW_LOG"); s_ed_on = e ? 1 : 0; s_ed_from = e ? (u32)atoi(e) : 0; }
+    if (s_ed_on) {
+        if (method == M_GCM_FLIP_HEAD_0 || method == M_GCM_FLIP_HEAD_1 || method == M_GCM_DRIVER_FLIP) s_ed_flips++;
+        if (method == M_VERTEX_BEGIN_END && arg) { s_ed_n = 0; s_ed_packets = 0; }
+        else if (method == M_VERTEX_BEGIN_END) {
+            if (!s_ed_packets && s_ed_flips >= s_ed_from && s_ed_printed < 12) {
+                s_ed_printed++;
+                fprintf(stderr, "[rsx empty-draw] flip=%u prim=%u methods(%u):", s_ed_flips, rsx->current_primitive, s_ed_n);
+                for (u32 i = 0; i < s_ed_n && i < 24; i++) fprintf(stderr, " %04X=%08X", s_ed_m[i], s_ed_a[i]);
+                fputc('\n', stderr);
+            }
+        } else if (rsx->in_begin_end) {
+            if (method == M_INLINE_ARRAY || method == M_VB_VERTEX_BATCH || method == M_VB_INDEX_BATCH) s_ed_packets++;
+            if (s_ed_n < 24) { s_ed_m[s_ed_n] = method; s_ed_a[s_ed_n] = arg; } s_ed_n++;
+        }
+    }
     rsx->seen[idx]++;
     rsx->regs[idx] = arg;
 
@@ -282,6 +427,9 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         return;
     }
 
+    if (imm_method(rsx, method, arg))
+        return;
+
     switch (method) {
     case M_CLEAR_BUFFERS:
         if (rsx->sink.clear)
@@ -293,10 +441,19 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
             rsx->in_begin_end = 1;
             rsx->current_primitive = arg;
             rsx->inline_len = 0;
+            rsx->imm_mask = 0; rsx->imm_a0_dw = 0; rsx->imm_n = 0;
+            rsx->pair_packets = 0;
             if (rsx->sink.begin)
                 rsx->sink.begin(rsx->sink.user, rsx, arg);
         } else {
             rsx->in_begin_end = 0;
+            static int imm_on = -1;   /* RSX_IMM=0 disables immediate-mode draws */
+            if (imm_on < 0) { const char* e = getenv("RSX_IMM"); imm_on = !(e && *e == '0'); }
+            if (imm_on && !rsx->pair_packets && rsx->imm_n && rsx->imm_mask) {
+                imm_flush_as_inline(rsx);
+                rsx->imm_n = 0;
+                break;
+            }
             /* Hand an inline stream over BEFORE end: the sink reads end as
              * "draw what you have", so a batch delivered after it would be
              * drawn one primitive late, or not at all. */
@@ -323,6 +480,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
      * carrying no vertices at all: the backend saw BEGIN/END with nothing
      * between them and counted an empty group. */
     case M_INLINE_ARRAY:
+        rsx->pair_packets++;
         if (rsx->inline_len + 4u <= RSX_DSP_INLINE_MAX_BYTES) {
             rsx->inline_data[rsx->inline_len + 0] = (u8)(arg >> 24);
             rsx->inline_data[rsx->inline_len + 1] = (u8)(arg >> 16);
@@ -338,12 +496,14 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         break;
 
     case M_VB_VERTEX_BATCH:
+        rsx->pair_packets++;
         if (rsx->sink.draw_arrays)
             rsx->sink.draw_arrays(rsx->sink.user, rsx,
                                   arg & 0xFFFFFF, (arg >> 24) + 1);
         break;
 
     case M_VB_INDEX_BATCH:
+        rsx->pair_packets++;
         if (rsx->sink.draw_index_array)
             rsx->sink.draw_index_array(rsx->sink.user, rsx,
                                        arg & 0xFFFFFF, (arg >> 24) + 1);

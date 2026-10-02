@@ -2757,13 +2757,29 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
           if(_nv && ((tgt & 3u)!=0u || tgt < 0x10000u || tgt >= 0x40000000u)) _invalid = true; }
         if (_invalid) {
             static int _gn = 0;
-            if (_gn++ < 12) fprintf(stderr, "[ppu] garbage vcall -> 0x%08X this=0x%08X (uninit/stale object) -- no-op, r3=0\n", tgt, (uint32_t)ctx->gpr[3]);
+            if (_gn++ < 12) { fprintf(stderr, "[ppu] garbage vcall -> 0x%08X this=0x%08X lr=0x%08X r2=0x%08X r11=0x%08X r12=0x%08X (uninit/stale object) -- no-op, r3=0; chain:", tgt, (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr, (uint32_t)ctx->gpr[2], (uint32_t)ctx->gpr[11], (uint32_t)ctx->gpr[12]);
+              uint32_t sp = (uint32_t)ctx->gpr[1];
+              for (int d = 0; d < 12 && sp; d++) {
+                  const uint32_t next = vm_read32(sp + 4);
+                  if (!next || next <= sp) break;
+                  fprintf(stderr, " 0x%x", vm_read32(next + 20));
+                  sp = next;
+              }
+              fputc('\n', stderr);
+              if (getenv("PPU_VCALL_DUMP")) { const uint32_t a0 = (uint32_t)strtoul(getenv("PPU_VCALL_DUMP"), 0, 16);
+                  fprintf(stderr, "[ppu]   mem@%08X:", a0);
+                  for (int i = 0; i < 24; i++) fprintf(stderr, " %08X", vm_read32(a0 + 4 * i));
+                  fputc('\n', stderr); } }
 #ifdef _WIN32
             if (getenv("PPU_VCALL_BT")) { static int _b=0; if(_b++<4){
                 char* mb=(char*)GetModuleHandleA(0); void* bt[26]; unsigned short fr=RtlCaptureStackBackTrace(0,26,bt,0);
                 char ln[820]; int p=snprintf(ln,sizeof ln,"      GVBT this=0x%08X r2=0x%08X lr=0x%08X rva:",(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[2],(uint32_t)ctx->lr);
                 for(int i=0;i<fr;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
                 fprintf(stderr,"%s\n",ln); } }
+#else
+            if (getenv("PPU_VCALL_BT")) { static int _b = 0; if (_b++ < 2) {
+                void* bt[24]; const int fr = backtrace(bt, 24);
+                backtrace_symbols_fd(bt, fr, 2); } }
 #endif
             ctx->gpr[3] = 0;
             return;
