@@ -3637,7 +3637,23 @@ static int pump_messages_impl(void)
                                                 inMode:NSDefaultRunLoopMode
                                                dequeue:YES];
             if (!ev) break;
+            /* Keys drive the keyboard pad (cellPad.c): record and swallow
+             * them -- unhandled, AppKit beeps on every press. */
+            if ([ev type] == NSEventTypeKeyDown || [ev type] == NSEventTypeKeyUp) {
+                extern volatile uint32_t g_pad_host_keys[4];
+                const unsigned vk = [ev keyCode] & 127u;
+                if ([ev type] == NSEventTypeKeyDown)
+                    __atomic_or_fetch(&g_pad_host_keys[vk >> 5], 1u << (vk & 31), __ATOMIC_RELAXED);
+                else
+                    __atomic_and_fetch(&g_pad_host_keys[vk >> 5], ~(1u << (vk & 31)), __ATOMIC_RELAXED);
+                continue;
+            }
             [NSApp sendEvent:ev];
+        }
+        /* No key-ups arrive while another app has focus: release everything. */
+        if (![NSApp isActive]) {
+            extern volatile uint32_t g_pad_host_keys[4];
+            for (int i = 0; i < 4; i++) g_pad_host_keys[i] = 0;
         }
         if (s_window && ![s_window isVisible]) s_closed = 1;
     }

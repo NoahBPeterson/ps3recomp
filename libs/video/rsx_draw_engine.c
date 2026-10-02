@@ -1643,6 +1643,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const float H = sf.clip_h ? (float)sf.clip_h : (float)g.height;
     float xf[8] = { 1, 1, 1, 0, 0, 0, 0, 0 };
     if (vp.scale[0] != 0.0f || vp.translate[0] != 0.0f) {
+        /* As RPCS3's Vulkan backend (fill_scale_offset_data, flip_y=false):
+         * the window origin does not enter the position transform -- only
+         * WPOS (see fp_alpha) -- and FRONT_FACE maps directly. */
         xf[0] = vp.scale[0] / (W * 0.5f);
         xf[1] = -(vp.scale[1] / (H * 0.5f));
         xf[2] = vp.scale[2];
@@ -1909,7 +1912,16 @@ static void eng_present(u32 buffer_id)
                     g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
     }
     g.last_present_surface = target;
+    /* PS3RECOMP_ENG_PRESENT_OFFSET=<hex>: present the registered surface at
+     * that offset instead (as it stands at the end of the frame), to look
+     * at an intermediate render target. */
+    { static int on = -1; static u32 off;
+      if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_PRESENT_OFFSET");
+                    on = e ? 1 : 0; if (e) off = (u32)strtoul(e, NULL, 16); }
+      if (on) for (u32 i = 0; i < g.n_surfaces; ++i)
+          if (g.surfaces[i].offset == off) { g.be->present(g.be->user, g.surfaces[i].handle); goto presented; } }
     g.be->present(g.be->user, g.surfaces[target].handle);
+presented:;
     /* PS3RECOMP_ENG_FPSLOG=1: world frames (>1000 draws) per 10 s. */
     { static int on = -1; static u32 wf; static time_t t0;
       if (on < 0) on = getenv("PS3RECOMP_ENG_FPSLOG") ? 1 : 0;
