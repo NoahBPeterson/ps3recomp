@@ -3310,6 +3310,11 @@ s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 flags)
 
     /* 2. copy the element into its slot */
     const uint32_t buf = (uint32_t)vm_read64(q + LFQ_BUFFER);
+    /* SPURS_LFQ_LOG=1: every pushed element, as words. */
+    { static int s_l = -1; if (s_l < 0) s_l = getenv("SPURS_LFQ_LOG") ? 1 : 0;
+      if (s_l) { fprintf(stderr, "[lfq-push] q=0x%08X idx=%d:", q, idx);
+                 for (u32 o = 0; o < size && o < 64; o += 4) fprintf(stderr, " %08X", vm_read32((uint32_t)data_ea + o));
+                 fputc('\n', stderr); } }
     memcpy(vm_base + buf + (uint32_t)(idx % depth) * size, vm_base + (uint32_t)data_ea, size);
 
     /* 3. complete, then wake pop waiters (at most one per newly completed element) */
