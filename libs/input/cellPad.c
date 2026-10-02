@@ -421,6 +421,63 @@ static unsigned long long pad_now_ms(void)
 #endif
 }
 
+/* PS3_PAD_FILE=<path>: a scripted pad on port 0, for driving a title from a
+ * shell or test script. The file holds whitespace-separated button names that
+ * are held while they are in the file: UP DOWN LEFT RIGHT CROSS CIRCLE SQUARE
+ * TRIANGLE L1 R1 L2 R2 L3 R3 START SELECT, plus LX=n LY=n RX=n RY=n (0-255,
+ * centre 128). Empty or missing file = nothing held. Re-read on every poll
+ * (a few hundred bytes at most). Only used when no real pad is on port 0. */
+static void pad_poll_file(void)
+{
+    static const char* path = (const char*)-1;
+    if (path == (const char*)-1) path = getenv("PS3_PAD_FILE");
+    if (!path) return;
+    PadHostState* hs = &s_host_state[0];
+    char buf[512]; size_t n = 0;
+    FILE* f = fopen(path, "r");
+    if (f) { n = fread(buf, 1, sizeof buf - 1, f); fclose(f); }
+    buf[n] = 0;
+    static const struct { const char* name; u16 btn; } map[] = {
+        {"UP", CELL_PAD_CTRL_UP}, {"DOWN", CELL_PAD_CTRL_DOWN},
+        {"LEFT", CELL_PAD_CTRL_LEFT}, {"RIGHT", CELL_PAD_CTRL_RIGHT},
+        {"CROSS", CELL_PAD_CTRL_CROSS}, {"CIRCLE", CELL_PAD_CTRL_CIRCLE},
+        {"SQUARE", CELL_PAD_CTRL_SQUARE}, {"TRIANGLE", CELL_PAD_CTRL_TRIANGLE},
+        {"L1", CELL_PAD_CTRL_L1}, {"R1", CELL_PAD_CTRL_R1},
+        {"L2", CELL_PAD_CTRL_L2}, {"R2", CELL_PAD_CTRL_R2},
+        {"L3", CELL_PAD_CTRL_L3}, {"R3", CELL_PAD_CTRL_R3},
+        {"START", CELL_PAD_CTRL_START}, {"SELECT", CELL_PAD_CTRL_SELECT},
+    };
+    u16 btns = 0; int lx = 128, ly = 128, rx = 128, ry = 128;
+    for (char* tok = strtok(buf, " \t\r\n,"); tok; tok = strtok(NULL, " \t\r\n,")) {
+        if (!strncmp(tok, "LX=", 3)) { lx = atoi(tok + 3); continue; }
+        if (!strncmp(tok, "LY=", 3)) { ly = atoi(tok + 3); continue; }
+        if (!strncmp(tok, "RX=", 3)) { rx = atoi(tok + 3); continue; }
+        if (!strncmp(tok, "RY=", 3)) { ry = atoi(tok + 3); continue; }
+        for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+            if (!strcmp(tok, map[i].name)) btns |= map[i].btn;
+    }
+    if (btns != hs->buttons) {
+        printf("[cellPad] file pad: buttons 0x%04X\n", btns); fflush(stdout);
+    }
+    hs->buttons = btns;
+    hs->connected = 1;
+    hs->analog_lx = (u8)lx; hs->analog_ly = (u8)ly;
+    hs->analog_rx = (u8)rx; hs->analog_ry = (u8)ry;
+    hs->trigger_l2 = (btns & CELL_PAD_CTRL_L2) ? 255 : 0;
+    hs->trigger_r2 = (btns & CELL_PAD_CTRL_R2) ? 255 : 0;
+    const u8 full = 255;
+    hs->press_up = (btns & CELL_PAD_CTRL_UP) ? full : 0;
+    hs->press_down = (btns & CELL_PAD_CTRL_DOWN) ? full : 0;
+    hs->press_left = (btns & CELL_PAD_CTRL_LEFT) ? full : 0;
+    hs->press_right = (btns & CELL_PAD_CTRL_RIGHT) ? full : 0;
+    hs->press_cross = (btns & CELL_PAD_CTRL_CROSS) ? full : 0;
+    hs->press_circle = (btns & CELL_PAD_CTRL_CIRCLE) ? full : 0;
+    hs->press_square = (btns & CELL_PAD_CTRL_SQUARE) ? full : 0;
+    hs->press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? full : 0;
+    hs->press_l1 = (btns & CELL_PAD_CTRL_L1) ? full : 0;
+    hs->press_r1 = (btns & CELL_PAD_CTRL_R1) ? full : 0;
+}
+
 static void pad_poll_backend(void)
 {
     /* Benign race: two threads may poll in the same tick. That costs one extra
@@ -442,6 +499,9 @@ static void pad_poll_backend(void)
 #ifdef _WIN32
     if (!s_host_state[0].connected) pad_poll_keyboard();
 #endif
+    { static int real0 = 0;
+      if (s_host_state[0].connected && !getenv("PS3_PAD_FILE")) real0 = 1;
+      if (!real0) pad_poll_file(); }
 }
 
 /* ---------------------------------------------------------------------------

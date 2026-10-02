@@ -41,7 +41,8 @@
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #ifndef _WIN32
-#include <sys/mman.h>   /* the guest-pointer trap reserves the low 4 GB */
+#include <sys/mman.h>
+#include <sched.h>   /* the guest-pointer trap reserves the low 4 GB */
 #include <signal.h>
 #include <unistd.h>
 #endif
@@ -1183,7 +1184,79 @@ extern "C" void ppu_guard_page(uint32_t guest_ea)
     fflush(stderr);
 }
 #else
-extern "C" void ppu_guard_page(uint32_t guest_ea) { (void)guest_ea; }
+/* POSIX page guard: the same idea as the Windows VEH, for stores the vm_write*
+ * watch cannot see (lifted stvx is a raw memcpy). The host page (16 KB on
+ * arm64 macOS) is made read-only; the fault handler logs the writer, unlocks
+ * the page and returns so the store re-runs. arm64 has no single-step trap, so
+ * a helper thread spins re-locking the page instead: writes in the brief gap
+ * are missed, which is fine for "who writes this" (the writers repeat). */
+extern "C" void ppu_guest_callstack(const char* tag);
+static volatile uintptr_t s_guard_page = 0;
+static size_t             s_guard_pgsz = 0;
+static volatile uint32_t  s_guard_ea   = 0;
+static struct sigaction   s_guard_prev[2];
+static void ppu_guard_fault(int sig, siginfo_t* si, void* uctx)
+{
+    const uintptr_t tgt = (uintptr_t)si->si_addr;
+    if (s_guard_page && tgt >= s_guard_page && tgt < s_guard_page + s_guard_pgsz) {
+        const uint32_t guest = (uint32_t)(tgt - (uintptr_t)vm_base);
+        { static int any = 0; if (any++ < 3) fprintf(stderr, "[GUARD] fault in page at guest 0x%08X\n", guest); }
+        if ((guest & ~31u) == (s_guard_ea & ~31u)) {
+            static int n = 0;
+            if (n++ < 40) {
+                void* pc = 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+                pc = (void*)((ucontext_t*)uctx)->uc_mcontext->__ss.__pc;
+#endif
+                fprintf(stderr, "[GUARD] WRITE guest=0x%08X guest-fn=0x%08X", guest,
+                        ppu_prof_resolve_host(pc));
+                if (g_active_ctx)
+                    fprintf(stderr, " lr=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r31=0x%08X",
+                            (uint32_t)g_active_ctx->lr, (uint32_t)g_active_ctx->gpr[3],
+                            (uint32_t)g_active_ctx->gpr[4], (uint32_t)g_active_ctx->gpr[5],
+                            (uint32_t)g_active_ctx->gpr[31]);
+                fprintf(stderr, "\n");
+                if (n <= 6 && g_active_ctx) ppu_guest_callstack("guard-write");
+            }
+        }
+        mprotect((void*)s_guard_page, s_guard_pgsz, PROT_READ | PROT_WRITE);
+        return;
+    }
+    const struct sigaction& prev = s_guard_prev[sig == SIGBUS];
+    if ((prev.sa_flags & SA_SIGINFO) && prev.sa_sigaction) { prev.sa_sigaction(sig, si, uctx); return; }
+    if (prev.sa_handler && prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN) { prev.sa_handler(sig); return; }
+    signal(sig, SIG_DFL);
+}
+static void* ppu_guard_rearm(void*)
+{
+    for (;;) {
+        /* Re-lock almost at once: a busy page (heap) unlocks constantly and a
+         * 2 ms window misses most writes to the watched line. */
+        sched_yield();
+        if (mprotect((void*)s_guard_page, s_guard_pgsz, PROT_READ) != 0) {
+            static int w = 0; if (w++ < 3) perror("[GUARD] re-arm mprotect");
+        }
+    }
+    return NULL;
+}
+extern "C" void ppu_guard_page(uint32_t guest_ea)
+{
+    if (!vm_base || s_guard_page) return;
+    s_guard_pgsz = (size_t)getpagesize();
+    s_guard_ea   = guest_ea;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = ppu_guard_fault;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &s_guard_prev[0]);
+    sigaction(SIGBUS, &sa, &s_guard_prev[1]);
+    s_guard_page = ((uintptr_t)vm_base + guest_ea) & ~(uintptr_t)(s_guard_pgsz - 1);
+    mprotect((void*)s_guard_page, s_guard_pgsz, PROT_READ);
+    pthread_t t; pthread_create(&t, NULL, ppu_guard_rearm, NULL); pthread_detach(t);
+    fprintf(stderr, "[GUARD] armed on guest 0x%08X (host page %p, %zu bytes)\n",
+            guest_ea, (void*)s_guard_page, s_guard_pgsz);
+}
 #endif
 
 /* Guest address-space size (host sets this); 0 = unchecked. Bounds-checking
