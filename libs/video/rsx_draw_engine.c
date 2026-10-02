@@ -1855,6 +1855,29 @@ static void eng_present(u32 buffer_id)
       if (on) { if (g.guest_draws > 1000) wf++;
           time_t now = time(NULL); if (!t0) t0 = now;
           if (now - t0 >= 10) { fprintf(stderr, "[rsx fps] %u world frames in %lds (%.2f fps)\n", wf, (long)(now - t0), wf / (double)(now - t0)); wf = 0; t0 = now; } } }
+    /* PS3RECOMP_ENG_MEMDUMP=<hexEA>:<hexLen>:<worldframe>[:file]: at that world
+     * frame, write the guest range as hex words, 16 bytes per line -- the same
+     * format as the RPCS3 oracle's RPCS3_LP_DUMP, so the two diff directly. */
+    { static const char* md = (const char*)-1; static u32 dea, dlen, dat, dn; static char dpath[512];
+      if (md == (const char*)-1) { md = getenv("PS3RECOMP_ENG_MEMDUMP");
+          if (md) { char* d; dea = (u32)strtoul(md, &d, 16); dlen = (u32)strtoul(d + 1, &d, 16);
+                    dat = (u32)strtoul(d + 1, &d, 10);
+                    snprintf(dpath, sizeof dpath, "%s", *d == ':' ? d + 1 : "/tmp/our_memdump.txt"); } }
+      if (md && g.guest_draws > 1000 && ++dn == dat) {
+          extern uint8_t* vm_base;
+          FILE* f = fopen(dpath, "w");
+          if (f && vm_base) {
+              for (u32 o = 0; o < dlen; o += 16) {
+                  fprintf(f, "%08x:", dea + o);
+                  for (u32 k = 0; k < 16; k += 4) {
+                      const uint8_t* q = vm_base + dea + o + k;
+                      fprintf(f, " %02x%02x%02x%02x", q[0], q[1], q[2], q[3]);
+                  }
+                  fprintf(f, "\n");
+              }
+          }
+          if (f) fclose(f);
+      } }
     /* PS3RECOMP_ENG_MEMPROBE=<loc>:<hex offset>:<bytes>: on world frames, how
      * much of that guest range is nonzero (is a texture's source populated?). */
     { static const char* me = (const char*)-1; static u32 mloc, moff, mlen;
