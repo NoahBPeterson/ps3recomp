@@ -750,14 +750,21 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
 {
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
-    u64 hash = 1469598103934665603ull;
+    /* Four independent FNV-style lanes: one serial multiply chain capped the
+     * hash at ~2 bytes/cycle, and every texture in use is hashed each frame.
+     * The value is only ever compared with another hash from this run. */
+    u64 h0 = 1469598103934665603ull, h1 = h0 ^ 0x9E3779B97F4A7C15ull,
+        h2 = h0 ^ 0xC2B2AE3D27D4EB4Full, h3 = h0 ^ 0x165667B19E3779F9ull;
     u32 i = 0;
-    for (; i + 8 <= span; i += 8) {
-        u64 word;
-        memcpy(&word, src + i, sizeof(word));
-        hash ^= word;
-        hash *= 1099511628211ull;
+    for (; i + 32 <= span; i += 32) {
+        u64 w[4];
+        memcpy(w, src + i, sizeof w);
+        h0 = (h0 ^ w[0]) * 1099511628211ull;
+        h1 = (h1 ^ w[1]) * 1099511628211ull;
+        h2 = (h2 ^ w[2]) * 1099511628211ull;
+        h3 = (h3 ^ w[3]) * 1099511628211ull;
     }
+    u64 hash = h0 ^ (h1 * 31u) ^ (h2 * 1009u) ^ (h3 * 65599u);
     for (; i < span; i++) { hash ^= src[i]; hash *= 1099511628211ull; }
     *readable = 1;
     return hash;
@@ -817,6 +824,31 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
  * cache full evicts the least recently used entry rather than returning
  * nothing: returning white "made the recovered orphanage render as flat
  * green/black geometry" (rsx_live_draw.c:2326-2334). */
+/* Open-addressed index over g.textures (value = entry index + 1): a bind
+ * used to scan the whole cache, per draw and per unit. Rebuilt whenever an
+ * entry is added or replaced, which is rare once the cache is warm. */
+#define ENG_TIDX_SIZE (ENG_MAX_TEXTURES * 4u)
+static u32 s_tidx[ENG_TIDX_SIZE];
+static inline u32 eng_tkey(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                           u32 pitch, u32 remap, u32 cube)
+{
+    u64 k = ((u64)offset << 3) ^ location ^ ((u64)fmt << 40) ^ ((u64)w << 20)
+          ^ ((u64)h << 52) ^ ((u64)pitch << 28) ^ ((u64)remap * 0x9E3779B97F4A7C15ull) ^ cube;
+    k ^= k >> 33; k *= 0xFF51AFD7ED558CCDull; k ^= k >> 33;
+    return (u32)k & (ENG_TIDX_SIZE - 1u);
+}
+static void eng_tidx_rebuild(void)
+{
+    memset(s_tidx, 0, sizeof s_tidx);
+    for (u32 i = 0; i < g.n_textures; i++) {
+        const eng_texture* e = &g.textures[i];
+        u32 p = eng_tkey(e->location, e->offset, e->format, e->width, e->height,
+                         e->pitch, e->remap, e->cubemap);
+        while (s_tidx[p]) p = (p + 1) & (ENG_TIDX_SIZE - 1u);
+        s_tidx[p] = i + 1;
+    }
+}
+
 static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                             u32 levels, u32 pitch, int cube, u32 remap)
 {
@@ -824,8 +856,9 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
     if (!span) return 0;
 
-    for (u32 i = 0; i < g.n_textures; i++) {
-        eng_texture* e = &g.textures[i];
+    for (u32 p = eng_tkey(location, offset, fmt, w, h, pitch, remap, (u32)(cube != 0));
+         s_tidx[p]; p = (p + 1) & (ENG_TIDX_SIZE - 1u)) {
+        eng_texture* e = &g.textures[s_tidx[p] - 1];
         if (e->location != location || e->offset != offset ||
             e->format != fmt || e->width != w || e->height != h ||
             e->pitch != pitch || e->remap != remap ||
@@ -874,7 +907,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                   cube, remap);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
-    if (e.handle || !evicted) g.textures[index] = e;
+    if (e.handle || !evicted) { g.textures[index] = e; eng_tidx_rebuild(); }
     return e.handle;
 }
 
@@ -2011,6 +2044,7 @@ void rsx_draw_engine_shutdown(void)
     const rsx_draw_backend* be = g.be;
     memset(&g, 0, sizeof g);
     g.be = be;
+    eng_tidx_rebuild();
 }
 
 void rsx_draw_engine_method(u32 method, u32 arg)
