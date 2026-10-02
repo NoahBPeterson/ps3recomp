@@ -1569,8 +1569,16 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
     int watch = getenv("SPURS_KERN_WATCH") ? 1 : 0;
     int changes_logged = 0;
 
+    /* Sleep only after a pass in which no workload found work. Sleeping every
+     * pass put a 1 ms gap between consecutive job batches: the main thread
+     * spins on the job counters through it, and in inFamous the kernel thread
+     * spent half its time in this sleep while the frame waited on it.
+     * SPURS_KERN_ALWAYS_SLEEP=1 restores the old pacing. */
+    int busy = 0;
+    const int always_sleep = getenv("SPURS_KERN_ALWAYS_SLEEP") ? 1 : 0;
     for (;;) {
-        Sleep(1);
+        if (!busy || always_sleep) Sleep(1);
+        busy = 0;
         u32 ea = si->ea;
         if (!ea || s_pm_off) continue;
 
@@ -1743,7 +1751,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              * an idle module exits immediately with polls==0. Grow the idle
              * streak on the latter, reset on the former. */
             if (g_spurs_pm_polls == 0) { if (s_idle[wid] < 8) s_idle[wid]++; }
-            else s_idle[wid] = 0;
+            else { s_idle[wid] = 0; busy = 1; }
             }
         }
     }
