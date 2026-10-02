@@ -469,6 +469,9 @@ static void sys_lwcond_wait(ppu_context* ctx)
                 if (!s_lwc_cv.wait_for(lk, std::chrono::microseconds(timeout), ready)) {
                     lwc_unlink(&me);
                     rc_out = (int32_t)0x8001000B;   /* CELL_ETIMEDOUT */
+                    if (getenv("PS3_LWCOND_TOLOG")) { static std::atomic<int> n{0}; if (n++ < 400)
+                        fprintf(stderr, "[lwcond] TIMEOUT ea=0x%08X tid=%u after %lluus lr=0x%08X\n", lwcond,
+                                (unsigned)ctx->thread_id, (unsigned long long)timeout, (uint32_t)ctx->lr); }
                 }
             } else {
                 s_lwc_cv.wait(lk, ready);
