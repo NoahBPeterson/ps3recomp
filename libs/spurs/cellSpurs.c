@@ -19,6 +19,8 @@
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include <stdint.h>
+#include <sched.h>
+#include <unistd.h>
 
 /* Bridge the real (BE) taskset EA + selected taskId from CreateTask to the image-22
  * SPU dispatch (spu_workload.c), so spurs_pm_build_context can build the leaf's
@@ -1587,8 +1589,16 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
      * SPURS_KERN_ALWAYS_SLEEP=1 restores the old pacing. */
     int busy = 0;
     const int always_sleep = getenv("SPURS_KERN_ALWAYS_SLEEP") ? 1 : 0;
+    /* SPURS_KERN_IDLE_US=<n>: idle wait in microseconds instead of Sleep(1)
+     * (0 = just yield). Bounds how long a newly kicked job waits for pickup. */
+    const char* idle_e = getenv("SPURS_KERN_IDLE_US");
+    const int idle_us = idle_e ? atoi(idle_e) : -1;
     for (;;) {
-        if (!busy || always_sleep) Sleep(1);
+        if (!busy || always_sleep) {
+            if (idle_us < 0) Sleep(1);
+            else if (idle_us == 0) sched_yield();
+            else usleep((useconds_t)idle_us);
+        }
         busy = 0;
         u32 ea = si->ea;
         if (!ea || s_pm_off) continue;
@@ -1735,6 +1745,10 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 s_fs = e ? atoi(e) : -1; }
               if (s_fs > 0) maxcont = (u8)(s_fs > 6 ? 6 : s_fs); }
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = maxcont;
+            { static volatile int s_mc_logged[16];
+              if (wid < 16 && !__atomic_exchange_n(&s_mc_logged[wid], 1, __ATOMIC_RELAXED))
+                  fprintf(stderr, "[spurs-kern] \"%s\" wid=%u image=%d maxContention=%u (lanes %u)\n",
+                          si->prefix, wid, r->image_id, *(vm_base + ea + SPURS_WKL_MAXCONT + wid), maxcont); }
             {
                 const uint8_t* pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm;
                 uint32_t sz = s_workloads[wid].sizePm;
