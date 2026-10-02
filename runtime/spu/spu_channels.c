@@ -1966,7 +1966,7 @@ static int spu_smc_microstep(spu_context* ctx)
             pc += 4; continue;
         }
         if (op9 == 0x041 || op9 == 0x061) {                   /* stqa / lqa (abs) */
-            uint32_t a = (((w >> 7) & 0xFFFF) << 4) & SPU_LS_MASK & ~15u;
+            uint32_t a = (((w >> 7) & 0xFFFF) << 2) & SPU_LS_MASK & ~15u;   /* I16 is a word address */
             if (op9 == 0x041) spu_ls_write128(ctx, a, ctx->gpr[rt]);
             else              ctx->gpr[rt] = spu_ls_read128(ctx, a);
             pc += 4; continue;
