@@ -89,7 +89,9 @@ typedef struct {
     u32 w, h;
     rsx_be_format fmt;
     u32 handle;
+    u32 stamp;           /* last time it was bound as a target (LRU, newest-wins) */
 } eng_surface;
+static u32 s_surf_clock;
 
 typedef struct {
     u32 location, offset;
@@ -518,29 +520,40 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     if (!want_w) want_w = g.width;
     if (!want_h) want_h = g.height;
 
-    u32 slot = ENG_MAX_SURFACES;
+    /* One target per (address, size, format). Reallocating the address's
+     * target whenever a pass declared a different clip (a 1280x180 strip, a
+     * 256x256 tile over a 1280x720 G-buffer) threw away contents a later pass
+     * samples; inFamous lit an empty G-buffer and presented black. */
     for (u32 i = 0; i < g.n_surfaces; i++)
-        if (g.surfaces[i].location == location && g.surfaces[i].offset == offset) {
-            if (g.surfaces[i].w == want_w && g.surfaces[i].h == want_h &&
-                g.surfaces[i].fmt == want_fmt)
-                return i;
-            slot = i;
-            break;
+        if (g.surfaces[i].handle && g.surfaces[i].location == location &&
+            g.surfaces[i].offset == offset && g.surfaces[i].w == want_w &&
+            g.surfaces[i].h == want_h && g.surfaces[i].fmt == want_fmt) {
+            g.surfaces[i].stamp = ++s_surf_clock;
+            return i;
         }
 
-    /* Never destroy a usable render target because one malformed command
-     * decoded a guest pointer as clip dimensions. */
+    /* Never create a target because one malformed command decoded a guest
+     * pointer as clip dimensions: fall back to the newest at this address. */
     if (want_w > ENG_MAX_SURFACE_DIM || want_h > ENG_MAX_SURFACE_DIM) {
+        u32 best = ENG_INVALID;
+        for (u32 i = 0; i < g.n_surfaces; i++)
+            if (g.surfaces[i].handle && g.surfaces[i].location == location &&
+                g.surfaces[i].offset == offset &&
+                (best == ENG_INVALID || g.surfaces[i].stamp > g.surfaces[best].stamp)) best = i;
         static u32 logs = 0;
         if (logs++ < 8)
             fprintf(stderr, "[rsx engine] rejected implausible surface 0x%X %ux%u;"
                             " keeping the %s target\n", offset, want_w, want_h,
-                    slot < ENG_MAX_SURFACES ? "existing" : "absent");
-        return slot < ENG_MAX_SURFACES ? slot : ENG_INVALID;
+                    best != ENG_INVALID ? "existing" : "absent");
+        return best;
     }
-    if (slot == ENG_MAX_SURFACES) {
-        if (g.n_surfaces >= ENG_MAX_SURFACES) return ENG_INVALID;
-        slot = g.n_surfaces;
+    /* A free slot, else the least recently bound target. */
+    u32 slot = g.n_surfaces;
+    for (u32 i = 0; i < g.n_surfaces; i++) if (!g.surfaces[i].handle) { slot = i; break; }
+    if (slot >= ENG_MAX_SURFACES) {
+        slot = 0;
+        for (u32 i = 1; i < g.n_surfaces; i++)
+            if (g.surfaces[i].stamp < g.surfaces[slot].stamp) slot = i;
     }
 
     u32 seed_row = 0;
@@ -548,14 +561,14 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
                                         want_fmt, &seed_row);
     const u32 handle = g.be->color_target_create(g.be->user, want_fmt,
                                                  want_w, want_h, seed, seed_row);
-    if (!handle)
-        return (slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
+    if (!handle) return ENG_INVALID;
 
     eng_surface* s = &g.surfaces[slot];
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
     s->location = location; s->offset = offset;
     s->w = want_w; s->h = want_h; s->fmt = want_fmt;
     s->handle = handle;
+    s->stamp = ++s_surf_clock;
     if (slot == g.n_surfaces) g.n_surfaces++;
     { static u32 logs = 0; if (logs++ < 16)
         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
@@ -1291,20 +1304,26 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         mask |= 1u << u;
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
 
-        int sampled = -1;
+        /* Several targets can share an address (one per size/format). Take
+         * the one whose size matches the texture, else the newest; never one
+         * this draw writes -- reading a target a pass is writing is undefined
+         * on every API, and an MRT set writes more than one of them. */
+        int sampled = -1, own_hit = 0;
         for (u32 i = 0; i < g.n_surfaces; i++) {
             if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
                 g.surfaces[i].offset != t.offset)
                 continue;
-            /* Not one this draw writes: reading a target a pass is writing
-             * is undefined on every API, and an MRT set writes more than
-             * one of them. */
             int own = 0;
             for (u32 k = 0; k < n_targets; k++) if (target_slots[k] == i) own = 1;
-            if (own) break;
-            sampled = (int)i;
-            break;
+            if (own) { own_hit = 1; continue; }
+            const int fits = g.surfaces[i].w == t.width && g.surfaces[i].h == t.height;
+            if (sampled < 0) { sampled = (int)i; continue; }
+            const int best_fits = g.surfaces[sampled].w == t.width && g.surfaces[sampled].h == t.height;
+            if (fits > best_fits || (fits == best_fits && g.surfaces[i].stamp > g.surfaces[sampled].stamp))
+                sampled = (int)i;
         }
+        if (own_hit && sampled >= 0 && !(g.surfaces[sampled].w == t.width && g.surfaces[sampled].h == t.height))
+            sampled = -1;   /* only a stale alias of the target being written */
         if (sampled >= 0) {
             const u32 view = g.be->surface_view
                 ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
@@ -1587,10 +1606,13 @@ static u32 eng_present_surface(u32 buffer_id)
 {
     if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
         const eng_display_buffer* d = &g.display_buffers[buffer_id];
+        u32 best = ENG_INVALID;
         for (u32 i = 0; i < g.n_surfaces; i++)
             if (g.surfaces[i].handle && g.surfaces[i].location == d->location &&
-                g.surfaces[i].offset == d->offset)
-                return i;
+                g.surfaces[i].offset == d->offset &&
+                (best == ENG_INVALID || g.surfaces[i].stamp > g.surfaces[best].stamp))
+                best = i;
+        if (best != ENG_INVALID) return best;
     }
     return eng_current_surface();
 }
