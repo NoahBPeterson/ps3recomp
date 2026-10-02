@@ -422,7 +422,11 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
          * another image's functions that happen to share an LS address. */
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
-        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) {
+            { static int s_rj = -1; if (s_rj < 0) { const char* e = getenv("SPU_REJOIN_DBG"); s_rj = e ? atoi(e) : 0; }
+              if (s_rj > 0 && steps > 1000) { s_rj--; fprintf(stderr, "[rejoin] img=%d pc=0x%05X after %llu steps (from 0x%05X)\n",
+                  ctx->image_id, ctx->pc, (unsigned long long)steps, start_lsa & 0x3FFFC); } }
+            g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);

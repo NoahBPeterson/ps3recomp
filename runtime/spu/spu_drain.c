@@ -449,8 +449,15 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
         }
         {
             uint32_t pc = ctx->pc & SPU_LS_MASK;
-            spu_drain_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
-            if (!fn) fn = spu_lookup(pc, ctx->image_id);
+            spu_drain_fn fn = 0;
+            int owned = 0;
+            for (unsigned slot = 0; slot < 4; ++slot)
+                if (ctx->resident_code[slot].image_id &&
+                    pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
+                    fn = spu_lookup(pc, ctx->resident_code[slot].image_id); owned = 1; break;
+                }
+            if (!owned && ctx->resident_ovl) fn = spu_lookup(pc, ctx->resident_ovl);
+            if (!owned && !fn) fn = spu_lookup(pc, ctx->image_id);
             if (fn) {
                 { static int _n = 0; if (_n++ < 8)
                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
