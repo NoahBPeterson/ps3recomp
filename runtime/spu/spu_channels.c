@@ -1459,6 +1459,16 @@ int spu_have_function(uint32_t addr)
  * spu_fn_registry.c before the registry was consolidated into this TU. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
+    /* Streamed code that is resident at this address owns it (same rule as
+     * spu_indirect_branch): the interpreter hands back to its lift as soon as
+     * it reaches a lifted entry, instead of interpreting the whole job. */
+    if (ctx) {
+        for (unsigned slot = 0; slot < 4; ++slot) {
+            int img = ctx->resident_code[slot].image_id;
+            if (img && lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
+                return (spu_lifted_fn)spu_lookup(lsa, img);
+        }
+    }
     return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
 }
 
@@ -1649,8 +1659,12 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         uint32_t base = ctx->resident_code[slot].lsa;
         uint32_t end = base + ctx->resident_code[slot].size;
         if (lsa < end && lsa + size > base &&
-            (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)))
+            (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base))) {
+            { static int _n = 0; if (_n++ < 12)
+                fprintf(stderr, "[spu-ovl] img=%d code span image %d evicted by GET ea=0x%08X -> LS 0x%05X size=%u\n",
+                        ctx->image_id, ctx->resident_code[slot].image_id, ea, lsa, size); }
             ctx->resident_code[slot].image_id = 0;
+        }
     }
     for (int i = 0; i < s_ovl_src_count; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
@@ -1666,6 +1680,9 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].size = o->span;
                     ctx->resident_code[slot].source_ea = ea;
                     ctx->resident_code[slot].image_id = o->image_id;
+                    { static int _n = 0; if (_n++ < 4)
+                        fprintf(stderr, "[spu-ovl] img=%d code span src=0x%08X -> LS 0x%05X+0x%X resident as image %d (slot %u)\n",
+                                ctx->image_id, ea, lsa, o->span, o->image_id, slot); }
                     return;
                 }
                 fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
@@ -1889,6 +1906,15 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
 static int spu_smc_microstep(spu_context* ctx)
 {
     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
+    { static int s_dbg = -1; if (s_dbg < 0) { const char* e = getenv("SPU_MICRO_DBG"); s_dbg = e ? atoi(e) : 0; }
+      if (s_dbg > 0 && pc >= 0x4000 && pc < 0x3F000) { s_dbg--;
+        fprintf(stderr, "[micro-dbg] img=%d pc=0x%05X lr=0x%05X slots", ctx->image_id, pc,
+                ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+        for (unsigned k = 0; k < 4; ++k)
+            fprintf(stderr, " {%d 0x%05X+0x%X}", ctx->resident_code[k].image_id,
+                    ctx->resident_code[k].lsa, ctx->resident_code[k].size);
+        fprintf(stderr, " ovl=%d lookup10=%p lookup11=%p\n", ctx->resident_ovl,
+                (void*)spu_lookup(pc, 10), (void*)spu_lookup(pc, 11)); } }
     for (int steps = 0; steps < 4096; steps++) {
         uint32_t w = ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
                      ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];

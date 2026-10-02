@@ -58,8 +58,15 @@ void spu_indirect_branch_mt(spu_context* ctx)
         /* Resident overlay first (mirrors the full resolver): streamed plugin
          * code owns its LS range; base-image entries at the same address are
          * stale bytes and must lose. */
-        spu_dispatch_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
-        if (!fn) fn = spu_lookup(pc, ctx->image_id);
+        spu_dispatch_fn fn = 0;
+        int owned = 0;
+        for (unsigned slot = 0; slot < 4; ++slot)
+            if (ctx->resident_code[slot].image_id &&
+                pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
+                fn = spu_lookup(pc, ctx->resident_code[slot].image_id); owned = 1; break;
+            }
+        if (!owned && ctx->resident_ovl) fn = spu_lookup(pc, ctx->resident_ovl);
+        if (!owned && !fn) fn = spu_lookup(pc, ctx->image_id);
         if (fn) {
             ctx->pc = pc;
             __attribute__((musttail)) return fn(ctx);
