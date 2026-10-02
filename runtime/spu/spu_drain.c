@@ -194,8 +194,6 @@ void spu_img_restore(spu_context* ctx, int32_t saved_img)
  * brhz cond1,Exit` to LS 0x2D30, skipping the Load setup.) Default OFF; kept
  * env-gated for experiments: SPU_SN_DEFER=<n> ticks (0 = immediate, faithful
  * to the current synchronous list execution). */
-void* volatile   g_sn_defer_ctx = 0;
-volatile unsigned g_sn_defer     = 0;
 
 unsigned spu_sn_defer_ticks(void)
 {
@@ -284,8 +282,8 @@ void (*spu_take_interrupt(spu_context* ctx,
                           void (*tf)(spu_context*)))(spu_context*)
 {
     /* Stall-and-notify still settling: let the SPU run on (see above). */
-    if (g_sn_defer && g_sn_defer_ctx == (void*)ctx) {
-        if (--g_sn_defer == 0) g_sn_defer_ctx = 0;
+    if (ctx->sn_defer) {
+        ctx->sn_defer--;
         return tf;
     }
     const uint8_t* v = ctx->ls;      /* vector word at LS 0, big-endian */
