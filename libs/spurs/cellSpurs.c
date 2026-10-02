@@ -3384,5 +3384,12 @@ s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 flags)
     static int _n = 0;
     if (_n++ < 8)
         printf("[cellSpurs] LFQueuePush q=0x%08X slot=%d flags=%u woke=%d\n", q, idx, flags, nwake);
+    /* Throughput: a push per decompression request, so the rate is the
+     * streaming rate of everything that goes through the EDGE zlib task. */
+    { static unsigned long tot = 0; static LARGE_INTEGER t0, fq;
+      if (!tot) { QueryPerformanceCounter(&t0); QueryPerformanceFrequency(&fq); }
+      if ((++tot & 255) == 0) { LARGE_INTEGER t; QueryPerformanceCounter(&t);
+          fprintf(stderr, "[cellSpurs] LFQueuePush total=%lu after %.1fs\n", tot,
+                  (double)(t.QuadPart - t0.QuadPart) / (double)fq.QuadPart); } }
     return CELL_OK;
 }
