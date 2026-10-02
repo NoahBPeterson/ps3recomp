@@ -188,9 +188,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     /* SPU_IMG_DMA=<image id>: that image's first 80 transfers; a GET's first
      * 16 source bytes are printed so a job's parameter block can be read. */
     { static int s_img = -2; if (s_img == -2) { const char* e = getenv("SPU_IMG_DMA"); s_img = e ? atoi(e) : -1; }
-      if (s_img >= 0 && spu->image_id == s_img) {
+      if (s_img >= 0 && spu->image_id == s_img && (!getenv("SPU_IMG_DMA_CODE") || ((cmd & 0x40) && lsa >= 0x5000u && size >= 0x400u))) {
           static int _n = 0;
-          if (_n++ < 80) {
+          if (_n++ < 400) {
               fprintf(stderr, "[img-dma] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u",
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
               if ((cmd & 0x40) && vm_base && (uint32_t)ea >= 0x10000u) {

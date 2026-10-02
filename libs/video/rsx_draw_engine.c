@@ -1,3 +1,4 @@
+#include <time.h>
 /*
  * ps3recomp - platform-neutral RSX draw engine (see rsx_draw_engine.h)
  *
@@ -1753,6 +1754,12 @@ static void eng_present(u32 buffer_id)
     }
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
+    /* PS3RECOMP_ENG_FPSLOG=1: world frames (>1000 draws) per 10 s. */
+    { static int on = -1; static u32 wf; static time_t t0;
+      if (on < 0) on = getenv("PS3RECOMP_ENG_FPSLOG") ? 1 : 0;
+      if (on) { if (g.guest_draws > 1000) wf++;
+          time_t now = time(NULL); if (!t0) t0 = now;
+          if (now - t0 >= 10) { fprintf(stderr, "[rsx fps] %u world frames in %lds (%.2f fps)\n", wf, (long)(now - t0), wf / (double)(now - t0)); wf = 0; t0 = now; } } }
     /* PS3RECOMP_ENG_MEMPROBE=<loc>:<hex offset>:<bytes>: on world frames, how
      * much of that guest range is nonzero (is a texture's source populated?). */
     { static const char* me = (const char*)-1; static u32 mloc, moff, mlen;
