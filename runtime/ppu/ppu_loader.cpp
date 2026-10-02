@@ -20,6 +20,9 @@
 
 /* Hoisted: code below was added above the original include block, so these
  * have to be visible from here rather than 160 lines further down. */
+#ifndef _WIN32
+#include <execinfo.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1514,6 +1517,12 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
     fprintf(stderr, "[null-read] guest read%d from 0x%08X (NULL+0x%X) by guest-fn=0x%08X%s" "\n",
             width * 8, a, a, ppu_prof_resolve_host(ra),
             s_n == 16 ? "  [further NULL reads not reported]" : "");
+#ifndef _WIN32
+    /* PS3_NULL_READ_BT=1: also print the host stack -- on POSIX that is the guest call
+     * chain, since lifted functions are named func_<addr>. */
+    { static int s_bt = -1; if (s_bt < 0) s_bt = getenv("PS3_NULL_READ_BT") ? 1 : 0;
+      if (s_bt) { void* fr[24]; int n = backtrace(fr, 24); backtrace_symbols_fd(fr, n, 2); } }
+#endif
     fflush(stderr);
 }
 
