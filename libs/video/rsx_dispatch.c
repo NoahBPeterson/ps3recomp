@@ -449,6 +449,15 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
             rsx->in_begin_end = 0;
             static int imm_on = -1;   /* RSX_IMM=0 disables immediate-mode draws */
             if (imm_on < 0) { const char* e = getenv("RSX_IMM"); imm_on = !(e && *e == '0'); }
+            /* RSX_IMM_SKIP_RT=<hex offset>: drop immediate pairs drawing into
+             * colour target A at that offset (bisecting a post chain). */
+            static long imm_skip = -2;
+            if (imm_skip == -2) { const char* e = getenv("RSX_IMM_SKIP_RT"); imm_skip = e ? (long)strtoul(e, 0, 16) : -1; }
+            if (imm_on && imm_skip >= 0 && rsx->regs[0x0210 >> 2] == (u32)imm_skip) {
+                rsx->imm_n = 0;
+                if (rsx->sink.end) rsx->sink.end(rsx->sink.user, rsx);
+                break;
+            }
             if (imm_on && !rsx->pair_packets && rsx->imm_n && rsx->imm_mask) {
                 imm_flush_as_inline(rsx);
                 rsx->imm_n = 0;
