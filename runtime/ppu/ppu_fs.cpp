@@ -560,14 +560,18 @@ static void cellFsLseek(ppu_context* ctx)
  * DLFileDeviceStream, stat@obj+0xD8) then have the trailing blksize clobber the
  * field right after the stat (the fd at obj+0x10c), which later fails lseek.
  * Layout: mode@0 uid@4 gid@8 atime@0x0C mtime@0x14 ctime@0x1C size@0x24 blksize@0x2C. */
-static void write_stat(uint32_t sb, uint32_t mode, uint64_t size)
+/* Times are the host file's (Unix seconds, as CellFsStat's time_t). They used to be 0, and
+ * inFamous's menu catalog loader (func_002C5A30) skips a file whose mtime equals its cached
+ * value -- which starts at 0 -- so it never parsed cache/load_menu_catalog.log, the "empire"
+ * lookup failed, and the boot never pushed the task that starts the save autoload. */
+static void write_stat(uint32_t sb, uint32_t mode, uint64_t size, const struct stat* st)
 {
     vm_write32(sb + 0x00, mode);
     vm_write32(sb + 0x04, 0);            /* uid */
     vm_write32(sb + 0x08, 0);            /* gid */
-    vm_write64(sb + 0x0C, 0);            /* atime */
-    vm_write64(sb + 0x14, 0);            /* mtime */
-    vm_write64(sb + 0x1C, 0);            /* ctime */
+    vm_write64(sb + 0x0C, st ? (uint64_t)st->st_atime : 0);   /* atime */
+    vm_write64(sb + 0x14, st ? (uint64_t)st->st_mtime : 0);   /* mtime */
+    vm_write64(sb + 0x1C, st ? (uint64_t)st->st_ctime : 0);   /* ctime */
     vm_write64(sb + 0x24, size);         /* size */
     vm_write64(sb + 0x2C, 0x200);        /* blksize */
 }
@@ -586,7 +590,7 @@ static void cellFsStat(ppu_context* ctx)
     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
     uint32_t mode = (st.st_mode & S_IFDIR) ? (CELL_FS_S_IFDIR | 0x1FF)
                                            : (CELL_FS_S_IFREG | 0x1B6);
-    if (sb) write_stat(sb, mode, (uint64_t)st.st_size);
+    if (sb) write_stat(sb, mode, (uint64_t)st.st_size, &st);
     if (getenv("PS3_FSLOG") && strstr(gpath,".toc")) fprintf(stderr,"[FSDBG] cellFsStat('%s') -> size=0x%llX\n",gpath,(unsigned long long)st.st_size);
     ctx->gpr[3] = CELL_OK;
 }
@@ -614,7 +618,8 @@ static void cellFsFstat(ppu_context* ctx)
           if (c > 0 && sz > c) {
               fprintf(stderr, "[fs] fstat fd=%d size %ld -> capped %ld (FS_FSTAT_CAP)\n", fd, sz, c);
               sz = c; } } }
-    if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
+    struct stat hst; const int have_st = fstat(fileno(g_files[fd]), &hst) == 0;
+    if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz, have_st ? &hst : nullptr);
     if (getenv("PS3_FSLOG")) { static int _n=0; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
     ctx->gpr[3] = CELL_OK;
 }
