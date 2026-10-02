@@ -338,6 +338,43 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
     return jumps
 
 
+def merge_chunk_groups(insns, bounds, max_insns, entry_points=()) -> dict:
+    """Group contiguous chunks into function-sized runs for --merge-chunks.
+
+    find_spu_functions starts a new "function" at every branch target, so a real
+    function arrives as basic-block-sized chunks, and every branch between them
+    is a trampoline: return to the drain loop, look up, call. A group runs from
+    a chunk that starts a real function -- a brsl/brasl call target, an entry
+    point, or the first chunk after a gap -- across every chunk contiguous with
+    it, up to the next such start or the size cap. Returns {group_start: end}.
+    Chunks inside a group are still lifted on their own as well (callers keep
+    lifting every bound), so an indirect branch or a cross-function branch into
+    the middle of a group still has a registered function to land on."""
+    call_targets = set(entry_points)
+    for ins in insns:
+        if ins.mnemonic in ("brsl", "brasl"):
+            tgt = SPULifter._branch_target(ins)
+            if tgt is not None:
+                call_targets.add(tgt)
+    groups = {}
+    ordered = sorted(bounds)
+    i = 0
+    while i < len(ordered):
+        start, end = ordered[i]
+        n = (end - start) // 4
+        j = i + 1
+        while (j < len(ordered) and ordered[j][0] == end
+               and ordered[j][0] not in call_targets
+               and n + (ordered[j][1] - ordered[j][0]) // 4 <= max_insns):
+            end = ordered[j][1]
+            n += (ordered[j][1] - ordered[j][0]) // 4
+            j += 1
+        if j > i + 1:
+            groups[start] = end
+        i = j
+    return groups
+
+
 def compute_link_returns(insns, bounds) -> set:
     """A `bi $rN` / conditional `bi{z,nz,hz,hnz} $rC,$rN` with N != 0 is emitted
     as a generic indirect branch, but Sony's SPU compiler also uses a NON-r0
@@ -1119,6 +1156,15 @@ def main() -> None:
                         "garbage `functions` (e.g. the LBP WWS physics jobmods, "
                         "which append a zlib inflate string table + float tables "
                         "after the code at 0xAE68 / 0xAE48).")
+    p.add_argument("--merge-chunks", action="store_true",
+                   help="Emit each run of contiguous chunks from one call target "
+                        "to the next as ONE C function (branches between them "
+                        "become gotos) instead of one function per chunk linked "
+                        "by trampolines. Every chunk is still emitted and "
+                        "registered on its own for indirect entry, so this only "
+                        "changes speed, not which code can be reached.")
+    p.add_argument("--max-group-insns", type=int, default=4000,
+                   help="Cap on instructions per merged group (keeps clang fast).")
     p.add_argument("--force-indirect", default="",
                    help="Comma-separated `bi $rN` addresses to emit as GENERIC "
                         "indirect dispatch, overriding the link-register-return "
@@ -1241,8 +1287,17 @@ def main() -> None:
               f"(`bi $rN` where rN is a brsl/bisl link reg): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
+    groups = {}
+    if args.merge_chunks:
+        seeds = {base}
+        if args.extra_funcs:
+            seeds |= {int(x, 0) for x in args.extra_funcs.split(",") if x.strip()}
+        groups = merge_chunk_groups(insns, bounds, args.max_group_insns,
+                                    entry_points=seeds)
+        print(f"  {len(groups)} merged function group(s) "
+              f"(--merge-chunks, max {args.max_group_insns} insns)")
     for s, e in bounds:
-        lifter.lift_function(insns, s, e)
+        lifter.lift_function(insns, s, groups.get(s, e))
 
     os.makedirs(args.output, exist_ok=True)
     hp = os.path.join(args.output, args.header_name)
