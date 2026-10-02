@@ -2043,7 +2043,7 @@ static void release_surfaces(void)
 
 #define ENG_MAX_OBJECTS  4096
 #define ENG_MAX_PIPES    4096
-#define ENG_MAX_RECORDS  8192
+#define ENG_MAX_RECORDS  65536   /* inFamous world frames issue >9k records */
 #define ENG_MAX_VIEWS    256
 #define ENG_MAX_FUNCS    4096
 #define ENG_MAX_SAMPLERS 256
