@@ -1306,6 +1306,8 @@ static void sink_inline_array(void* user, const rsx_dispatch* r,
     dc.n_arr++;
 }
 
+static void eng_constlog_draw(u32 rt, u32 cw, u32 ch, u32 n, int indexed);
+
 static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 count)
 {
     (void)user; (void)r;
@@ -1592,6 +1594,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     }
     memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
     memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+    eng_constlog_draw(sf.color_offset[0], sf.clip_w, sf.clip_h, n_draw, indexed);
 
     /* The buffered fragment constants, then fp_alpha: the layout
      * rsx_fp_decompile_buffered_ex compiled the shader against. */
@@ -1738,6 +1741,55 @@ static u32 eng_present_surface(u32 buffer_id)
     return eng_current_surface();
 }
 
+/* PS3RECOMP_ENG_CONSTLOG=<file>: one line per draw (colour target, clip,
+ * count; every non-zero transform constant for the first 4 draws) for world
+ * frames (>5000 draws), every 50th such frame, at most 3. Same shape as
+ * RPCS3's RPCS3_DRAWLOG with RPCS3_DRAWLOG_CONSTS=4, so the camera matrices
+ * can be compared. */
+static char*  s_cl_buf;
+static size_t s_cl_len, s_cl_cap;
+static u32    s_cl_n;
+static FILE* eng_constlog_file(void)
+{
+    static FILE* f = (FILE*)-1;
+    if (f == (FILE*)-1) { const char* e = getenv("PS3RECOMP_ENG_CONSTLOG"); f = e ? fopen(e, "w") : NULL; }
+    return f;
+}
+static void eng_constlog_draw(u32 rt, u32 cw, u32 ch, u32 n, int indexed)
+{
+    if (!eng_constlog_file()) return;
+    if (s_cl_cap - s_cl_len < 65536) {
+        size_t nc = s_cl_cap ? s_cl_cap * 2 : (1u << 20);
+        char* nb = (char*)realloc(s_cl_buf, nc);
+        if (!nb) return;
+        s_cl_buf = nb; s_cl_cap = nc;
+    }
+    int k = snprintf(s_cl_buf + s_cl_len, s_cl_cap - s_cl_len, "D%u rt=%x clip=%ux%u n=%u idx=%d",
+                     s_cl_n++, rt, cw, ch, n, indexed);
+    s_cl_len += (size_t)k;
+    for (u32 c = 0; c < RSX_DSP_NUM_CONSTANTS && s_cl_n <= 4; c++) {
+        if (!(g.rsx.constants[c][0] | g.rsx.constants[c][1] | g.rsx.constants[c][2] | g.rsx.constants[c][3])) continue;
+        if (s_cl_cap - s_cl_len < 128) break;
+        float v[4]; memcpy(v, g.rsx.constants[c], 16);
+        k = snprintf(s_cl_buf + s_cl_len, s_cl_cap - s_cl_len, " c%u=%g,%g,%g,%g", c, v[0], v[1], v[2], v[3]);
+        s_cl_len += (size_t)k;
+    }
+    s_cl_buf[s_cl_len++] = '\n';
+}
+static void eng_constlog_frame_end(void)
+{
+    static u32 big, dumped;
+    FILE* f = eng_constlog_file();
+    if (!f) return;
+    if (s_cl_n > 5000 && dumped < 3 && (big++ % 50) == 0) {
+        fprintf(f, "---- frame %u draws=%u ----\n", g.frames, s_cl_n);
+        fwrite(s_cl_buf, 1, s_cl_len, f);
+        fflush(f);
+        dumped++;
+    }
+    s_cl_len = 0; s_cl_n = 0;
+}
+
 static void eng_present(u32 buffer_id)
 {
     if (!g.ready) return;
@@ -1799,6 +1851,7 @@ static void eng_present(u32 buffer_id)
                   }
               }
           } } }
+    eng_constlog_frame_end();
     g.frames++;
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
