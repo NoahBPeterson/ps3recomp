@@ -286,6 +286,11 @@ typedef struct spu_context {
      * several SPU host threads one SPU's deferral overwrote another's and an
      * interrupt was lost. */
     unsigned sn_defer;
+    /* Pending cross-function transfer target (g_spu_trampoline_fn); NULL when
+     * none. Was a thread-local variable: every lifted block that leaves its
+     * function writes it and the drain loop reads it, and on macOS each
+     * thread-local access is a call (_tlv_get_addr) -- ~7% of SPU time. */
+    void (*tramp_fn)(struct spu_context*);
     /* Independently streamed code buffers can coexist with the policy overlay.
      * Each mapping records which translated image owns that local-store span. */
     struct {
@@ -728,13 +733,24 @@ static inline int spu_channel_has_data(const spu_channel* ch)
 #  define SPU_THREAD_LOCAL __thread
 #endif
 
+/* Non-local exits in the SPU runtime are plain control flow (halt, interrupt
+ * return), never out of a signal handler, so skip the signal-mask save that
+ * setjmp does on Darwin/BSD -- a sigprocmask system call on every SPU entry. */
+#if defined(_WIN32)
+#  define SPU_SETJMP(env)     setjmp(env)
+#  define SPU_LONGJMP(env, v) longjmp(env, v)
+#else
+#  define SPU_SETJMP(env)     _setjmp(env)
+#  define SPU_LONGJMP(env, v) _longjmp(env, v)
+#endif
+
 /* Indirect-branch dispatcher (spu_channels.c): resolves ctx->pc to a lifted
  * function in the active image and runs it. Referenced by SPU_RET/SPU_DRAIN. */
 void spu_indirect_branch(spu_context* ctx);
 
-/* Pending cross-function transfer target; NULL when none. Thread-local: each
- * spu_context is pinned to one host thread for its lifetime. */
-extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+/* Pending cross-function transfer target; NULL when none. Lives in the
+ * context (see spu_context.tramp_fn); every use site has `ctx` in scope. */
+#define g_spu_trampoline_fn ((ctx)->tramp_fn)
 
 /* Ring of the last PCs this SPU thread executed, for the unlifted-branch
  * report. The dispatcher records indirect branches; SPU_DRAIN records every

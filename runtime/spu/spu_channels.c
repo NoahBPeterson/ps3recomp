@@ -119,7 +119,7 @@ static SPU_TLS int     s_spu_halt_armed = 0;
 void spu_restart_dispatch(spu_context* ctx)
 {
     g_spu_trampoline_fn = 0;
-    if (s_spu_halt_armed) longjmp(s_spu_halt_env, 2);
+    if (s_spu_halt_armed) SPU_LONGJMP(s_spu_halt_env, 2);
     fprintf(stderr, "[spu] non-local return outside execution driver at 0x%05X\n", ctx->pc);
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
 }
@@ -157,7 +157,7 @@ void spu_halt(spu_context* ctx)
                 ctx->gpr[80]._u32[0], ctx->gpr[85]._u32[0]);
         fflush(stderr);
       } }
-    if (s_spu_halt_armed) { s_spu_halt_armed = 0; longjmp(s_spu_halt_env, 1); }
+    if (s_spu_halt_armed) { s_spu_halt_armed = 0; SPU_LONGJMP(s_spu_halt_env, 1); }
 }
 
 /* Diagnostic: dump the taskset-policy scheduler's working tables (LS 0x2700..)
@@ -252,7 +252,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * executes at a time. No-op when unarmed. The thread-local halt env above
      * makes a token pause/resume mid-run safe. */
     yz_lockstep_register(ctx);
-    switch (setjmp(s_spu_halt_env)) {
+    switch (SPU_SETJMP(s_spu_halt_env)) {
     case 1:
         halted = 1;
         g_spu_trampoline_fn = 0;
@@ -1530,7 +1530,7 @@ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
         if (ctx->pc == s_stack_reset[i].entry &&
             fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
             g_spu_trampoline_fn = 0;
-            longjmp(s_spu_halt_env, 2);
+            SPU_LONGJMP(s_spu_halt_env, 2);
         }
 }
 
@@ -2230,7 +2230,7 @@ void spu_indirect_branch(spu_context* ctx)
              * Resume at depth zero so SPU_RET follows the restored guest link. */
             ctx->resident_task = ti;
             g_spu_trampoline_fn = 0;
-            longjmp(s_spu_halt_env, 2);
+            SPU_LONGJMP(s_spu_halt_env, 2);
         }
         if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);
         if (ti) ctx->resident_task = ti;
