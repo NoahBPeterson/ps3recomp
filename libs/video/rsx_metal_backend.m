@@ -3307,8 +3307,21 @@ static void eng_dump_frame(id<MTLTexture> src)
         [fence commit];
         [fence waitUntilCompleted];
     }
-    [src getBytes:rgba bytesPerRow:w * 4
-      fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    if ([src storageMode] == MTLStorageModePrivate) {
+        id<MTLBuffer> buf = [s_dev newBufferWithLength:w * h * 4 options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+        [bl copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                 sourceSize:MTLSizeMake(w, h, 1) toBuffer:buf destinationOffset:0
+        destinationBytesPerRow:w * 4 destinationBytesPerImage:w * h * 4];
+        [bl endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        memcpy(rgba, [buf contents], w * h * 4);
+    } else {
+        [src getBytes:rgba bytesPerRow:w * 4
+          fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    }
     FILE* f = fopen(path, "wb");
     if (f) {
         fprintf(f, "P6\n%zu %zu\n255\n", w, h);
