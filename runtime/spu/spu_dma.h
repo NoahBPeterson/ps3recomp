@@ -1391,6 +1391,17 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                     "list\n0x%05X size=0x%X (%u elems) tag=%u\n",
                     spu->image_id, cmd, lsa, (uint32_t)ea & SPU_LS_MASK,
                     size, size / 8, tag); }
+        /* SPU_LS_DUMP_LIST=<hex list LSA> [SPU_LS_DUMP_FILE=path]: dump LS + gpr[128] once at the
+         * first list command whose list lives there (pairs with the RPCS3 oracle's RPCS3_LS_DUMP_*). */
+        { static int s_dl = -2; static uint32_t s_want;
+          if (s_dl == -2) { const char* e = getenv("SPU_LS_DUMP_LIST"); s_dl = e ? 1 : 0; s_want = e ? (uint32_t)strtoul(e, 0, 16) : 0; }
+          if (s_dl == 1 && ((uint32_t)ea & SPU_LS_MASK) == s_want) {
+              s_dl = 0;
+              const char* path = getenv("SPU_LS_DUMP_FILE");
+              FILE* f = fopen(path ? path : "/tmp/ours_ls.bin", "wb");
+              if (f) { fwrite(spu->ls, 1, SPU_LS_SIZE, f); fwrite(&spu->gpr[0], 16, 128, f); fclose(f); }
+              fprintf(stderr, "[mfc-list] LS dumped (list 0x%05X cmd 0x%02X lsa 0x%08X)\n", s_want, cmd, lsa);
+          } }
         rc = mfc_do_list_transfer(spu, (uint32_t)ea & SPU_LS_MASK,
                                   ea & 0xFFFFFFFF00000000ull, size, cmd);
     } else {

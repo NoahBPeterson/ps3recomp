@@ -25,8 +25,21 @@ uint32_t g_sys_mem_bump_ptr = 0;
  * 0x40000000+ matches where the real lv2 places these allocations (verified
  * against an RPCS3 boot log of Yakuza: Dead Souls); the window is outside
  * the pre-committed main region, so pages are committed on demand. */
-#define SYS_MEM_ALLOC_BASE  0x40000000u
-#define SYS_MEM_ALLOC_END   0x50000000u
+/* PS3_MEM_ALLOC_BASE=<hex> overrides the window base (the window stays 256 MB). RPCS3
+ * places 1 MB-page user allocations at 0x30000000 for inFamous; matching it makes guest
+ * pointers line up with the oracle, so LS/RAM dumps diff without a constant offset. */
+static uint32_t sys_mem_alloc_base(void)
+{
+    static uint32_t s_base = 0;
+    if (!s_base) {
+        const char* e = getenv("PS3_MEM_ALLOC_BASE");
+        uint32_t b = e ? (uint32_t)strtoul(e, 0, 16) : 0;
+        s_base = (b && !(b & 0xFFFFF)) ? b : 0x40000000u;
+    }
+    return s_base;
+}
+#define SYS_MEM_ALLOC_BASE  (sys_mem_alloc_base())
+#define SYS_MEM_ALLOC_END   (sys_mem_alloc_base() + 0x10000000u)
 
 static uint32_t s_total_allocated = 0;
 
