@@ -74,6 +74,17 @@ void (*g_spu_line_commit_hook)(uint32_t line) = 0;
 #define SPU_WATCH_MAX 4
 int g_spu_ls_watch_n = -1;
 static unsigned s_spu_ls_watch[SPU_WATCH_MAX];
+/* One gate for every LS-access debug hook (spu_ls_read128/write128): nonzero
+ * when any of SPU_LS_WATCH, SPU_LS_LOWREAD, SPU_SMC_WATCH or SPU_WWS_PROBES is
+ * set. Resolved before main, so the disabled path is one load and a branch. */
+int g_spu_ls_dbg = 1;
+__attribute__((constructor)) static void spu_ls_dbg_init(void)
+{
+    int n; spu_ls_watch_list(&n);
+    g_spu_ls_probe  = getenv("SPU_LS_LOWREAD") ? 1 : 0;
+    g_spu_smc_watch = getenv("SPU_SMC_WATCH") ? 1 : 0;
+    g_spu_ls_dbg = n || g_spu_ls_probe || g_spu_smc_watch || getenv("SPU_WWS_PROBES");
+}
 unsigned* spu_ls_watch_list(int* out_n)
 {
     if (g_spu_ls_watch_n < 0) {

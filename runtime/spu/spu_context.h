@@ -502,9 +502,9 @@ SPU_GATE int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)      
 SPU_GATE int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
 SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
 SPU_GATE int g_wws_read_probe = 0;
+extern int g_spu_ls_dbg;     /* any LS debug hook armed (spu_channels.c) */
 static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
 {
-    if (g_spu_ls_probe < 0) g_spu_ls_probe = getenv("SPU_LS_LOWREAD") ? 1 : 0;
     /* SPU_LS_LOWREAD=1: a job that reads its OWN first bytes as data is
      * dereferencing a null base -- the job binary loads at LS 0, so [NULL+off]
      * returns its own instruction words. Report each distinct low address once,
@@ -543,12 +543,13 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
-    if (__builtin_expect(g_spu_ls_probe != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
+    if (__builtin_expect(g_spu_ls_dbg != 0, 0)) {
         spu_ls_read_probe(ctx, lsa);
+        spu_ls_watch_hit2(lsa & (SPU_LS_MASK & ~0xFu), 0, &ctx->ls[lsa & (SPU_LS_MASK & ~0xFu)],
+                          (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+    }
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
-    spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
 #if SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
@@ -629,7 +630,7 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
      * why it resolves to an empty buffer: the resolved address, the whole
      * bufferSetArray (0xDF0), and the live loadCommands (0xC00) whose RunJob
      * command (commandNum==5) names the code buffer set. */
-    if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
+    if (__builtin_expect(g_spu_ls_dbg != 0, 0) && lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
         spu_ls_write_probe_pre(ctx, lsa, val);
 #if SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
@@ -645,10 +646,11 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
-    spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
-    if (__builtin_expect(g_spu_smc_watch != 0, 0))
-        spu_ls_write_probe_smc(ctx, lsa, p);
+    if (__builtin_expect(g_spu_ls_dbg != 0, 0)) {
+        spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
+                          ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+        if (g_spu_smc_watch) spu_ls_write_probe_smc(ctx, lsa, p);
+    }
 }
 
 /* ---------------------------------------------------------------------------
