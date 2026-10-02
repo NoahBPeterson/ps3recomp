@@ -2485,6 +2485,15 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
                                u32 rt_count)
 {
     (void)user;
+    if (s_dev && !s_guest_shaders) {
+        static int warned;
+        if (!warned++)
+            fprintf(stderr, "[rsx engine/metal] pipeline_create: guest shaders are off (%s); "
+                    "every guest draw will be dropped. Build with glslang+HLSL "
+                    "(cmake -Dglslang_DIR=...) to enable the HLSL->MSL translator.\n",
+                    rsx_hlsl_to_msl_available() ? "PS3RECOMP_METAL_FIXED_FUNCTION set"
+                                                : "translator not built");
+    }
     if (!s_dev || !s_guest_shaders || !vertex_stride) return 0;
     if (!rt_count) rt_count = 1;
     if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
