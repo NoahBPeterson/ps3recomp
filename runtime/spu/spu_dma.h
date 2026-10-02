@@ -251,7 +251,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
            * nothing useful and buries the real destinations in the histogram.
            * GETs from low EAs stay allowed: they only read garbage, and
            * LBP_SKIP_NULL_DMA already exists to test zeroing them instead. */
-          int malformed = (size == 0) || (size > 0x4000)
+          /* Size 0 is a legal no-op on the MFC (Bink's SPU decoder issues
+           * them every frame); the tag still completes in the caller. */
+          if (size == 0) return 0;
+          int malformed = (size > 0x4000)
                        || (size >= 16 && (size & 15))
                        || (((lsa ^ (uint32_t)ea) & 15) != 0)
                        || (mfc_is_put(cmd) && (uint32_t)ea < 0x10000u);
