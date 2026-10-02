@@ -64,6 +64,19 @@ int main(void)
     if (bad) { printf("test_spu_float_neon: %ld mismatches in %ld cases\n", bad, N); return 1; }
     printf("test_spu_float_neon: ok (%ld random cases)\n", N);
 
+    /* The NEON paths leave the thread in round-toward-zero; double precision
+     * must still round to nearest: 1 + (2^-53 + 2^-60) -> 1 + 2^-52. */
+    {
+        u128 x, y; memset(&x, 0, 16); memset(&y, 0, 16);
+        x._u32[0] = 0x3FF00000u; y._u32[0] = 0x3CA02000u;          /* 1.0, 2^-53 + 2^-60 */
+        (void)spu_fa(x, y);                                          /* sets RZ */
+        u128 d = spu_dfa(x, y);
+        if (d._u32[0] != 0x3FF00000u || d._u32[1] != 1u) {
+            printf("test_spu_float_neon: dfa under RZ gave %08X%08X, want 3FF0000000000001\n", d._u32[0], d._u32[1]);
+            return 1;
+        }
+    }
+
     /* speed on ordinary operands that stay ordinary */
     static u128 in[256][3];
     for (int k = 0; k < 256; k++)
