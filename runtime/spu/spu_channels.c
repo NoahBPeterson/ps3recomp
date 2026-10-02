@@ -2118,7 +2118,8 @@ void spu_indirect_branch(spu_context* ctx)
             /* cellSpursModulePoll: report "no contention — keep running".
              * (One virtual SPU per workload here, so nothing ever preempts.) */
             unsigned n = ++g_spurs_pm_polls;
-            if (n <= 4 || (n % 4096) == 0)
+            static unsigned s_logged;   /* the counter restarts every PM run */
+            if ((n <= 4 || (n % 4096) == 0) && s_logged++ < 64)
                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
                         n, ctx->gpr[3]._u32[0]);
             ctx->gpr[3] = spu_make_preferred_u32(0);
