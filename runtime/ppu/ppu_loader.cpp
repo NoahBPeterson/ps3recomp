@@ -1373,6 +1373,32 @@ static inline int vm_null_store(uint32_t a, uint32_t v, int width, void* ra)
  * Big-endian guest memory accessors (PPU is big-endian; vm_base holds the
  * guest image in its native byte order).
  * -----------------------------------------------------------------------*/
+/* Diagnostics gate for the guest memory accessors.
+ *
+ * Every vm_read and vm_write carries a dozen env-armed probes (watches, value
+ * hunts, hot-poll detectors). Each one is cheap alone, but together -- with
+ * the per-thread "last address" trackers, which cost a TLS lookup per access
+ * on macOS -- they were about half of the main thread's CPU in a loading
+ * screen. None of them does anything unless its variable is set, so decide
+ * once and give the accessors a fast path that skips the lot. PPU_HOTREAD=1
+ * re-enables the spin detectors on their own. */
+static int g_vm_diag = -1;
+static int vm_diag_init(void)
+{
+    static const char* const vars[] = {
+        "PPU_RWATCH", "PPU_FORCE_READ_ADDR", "YDKJ_RWATCH", "PPU_RVAL", "PPU_RVAL64",
+        "PPU_HOTMAP", "PPU_HOTREAD", "PPU_SPINBT", "PPU_WVAL", "PPU_WWATCH", "PT", 0 };
+    int d = 0;
+    for (int i = 0; vars[i]; i++) if (getenv(vars[i])) d = 1;
+    g_vm_diag = d;
+    return d;
+}
+static inline int vm_diag(void)
+{
+    const int d = g_vm_diag;
+    return __builtin_expect(d >= 0, 1) ? d : vm_diag_init();
+}
+
 /* Shared read-frequency histogram (PPU_HOTMAP): finds busy-loop polled
  * addresses across all read widths even when the loop touches several addresses
  * per iteration (so the consecutive HOTREAD detectors reset). */
@@ -1519,8 +1545,10 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
     fflush(stderr);
 }
 
-uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
+uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0;
     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 1, __builtin_return_address(0));
+    if (__builtin_expect(!vm_diag(), 1)) return vm_base[(uint32_t)a];
+    vm_hotmap((uint32_t)a,1);
 #ifdef VM_SAMPLE_READS
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read8  0x%08X ra0=%p ra1=%p\n", (uint32_t)a, __builtin_return_address(0), __builtin_return_address(1)); }
 #endif
@@ -1555,11 +1583,28 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
           n=0; } }
       else { last=(uint32_t)a; n=0; } }
     return vm_base[(uint32_t)a]; }
-uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0)); vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
+uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0;
+    if (__builtin_expect(!vm_diag(), 1)) { uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2); return __builtin_bswap16(v); }
+    ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0)); vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
     { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
-uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
+static inline void vm_gcm_refpoll(uint32_t a)
+{
+    if (a == (VM_HLE_INJECT_BASE + 0x2008u)) { static int _rp=-1;
+        if(_rp<0){ const char* e=getenv("GCM_REFPOLL"); _rp=(e&&*e=='0')?0:1; }
+        if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
+}
+uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
+    if (__builtin_expect(!vm_diag(), 1)) {
+        if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 4, __builtin_return_address(0));
+        if (spu_raw_is_reg((uint32_t)a)) { uint32_t _rv;
+            if (spu_raw_reg_load((uint32_t)a, &_rv)) return _rv; }
+        vm_gcm_refpoll((uint32_t)a);
+        uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
+        return __builtin_bswap32(v);
+    }
+    ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 4, __builtin_return_address(0));
     /* Raw SPU problem state: reading the outbound mailbox POPS it, so that one
      * cannot be served out of memory. Everything else in the window the SPU
@@ -1582,9 +1627,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
      * publishing, LBP's asset loading -- thousands of fence-waits -- crawled
      * at ~28 fences/s (minutes-to-hours of [finspin]); read-driven pacing
      * publishes at up to 1/ms and the loading progresses ~35x faster. */
-    if ((uint32_t)a == (VM_HLE_INJECT_BASE + 0x2008u)) { static int _rp=-1;
-        if(_rp<0){ const char* e=getenv("GCM_REFPOLL"); _rp=(e&&*e=='0')?0:1; }
-        if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
+    vm_gcm_refpoll((uint32_t)a);
     uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
     g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
 #ifdef _WIN32
@@ -1672,8 +1715,10 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
       } }
       else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap32(v); }
-uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap((uint32_t)a,8);
+uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0;
     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 8, __builtin_return_address(0)); uint64_t v; memcpy(&v, vm_base + (uint32_t)a, 8);
+    if (__builtin_expect(!vm_diag(), 1)) return __builtin_bswap64(v);
+    vm_hotmap((uint32_t)a,8);
 #ifdef VM_SAMPLE_READS
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read64 0x%08X\n", (uint32_t)a); }
 #endif
@@ -1735,6 +1780,7 @@ static void ww_arm_inline_window(uint32_t ww)
 }
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
+    if (__builtin_expect(!vm_diag() && !g_barrier_sync_watch, 1)) return;
     /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
      * it lands. PPU_WWATCH answers "who writes this address"; when a bad value is
      * copied from node to node down a list, that only ever catches the copy.

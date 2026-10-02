@@ -1268,6 +1268,48 @@ int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx)
 /* ---------------------------------------------------------------------------
  * Registration
  * -----------------------------------------------------------------------*/
+/* PS3_THREAD_DUMP=<seconds>: every N seconds print each live guest thread's
+ * last call site (ctx->lr, written at every lifted call) and the saved-LR
+ * back chain of its guest stack. "Where is every thread right now" is the
+ * first question of any hang, and none of the per-primitive WAIT logs answer
+ * it for a thread spinning in guest code or parked in an HLE wait. */
+#ifndef _WIN32
+#include <pthread.h>
+#include <unistd.h>
+static uint32_t td_rd32(uint32_t a)
+{
+    extern uint8_t* vm_base;
+    if (a < 0x10000u || a > 0xEFFFFFF0u) return 0;
+    const uint8_t* p = vm_base + a;
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+static void* thread_dump_main(void* arg)
+{
+    const unsigned sec = (unsigned)(uintptr_t)arg;
+    for (;;) {
+        sleep(sec);
+        fprintf(stderr, "[tdump] ---- guest threads ----\n");
+        for (int i = 0; i < PPU_THREAD_MAX; i++) {
+            ppu_thread_info* t = &g_ppu_threads[i];
+            if (t->state != PPU_THREAD_STATE_RUNNING && t->state != PPU_THREAD_STATE_DETACHED) continue;
+            const ppu_context* c = &t->ctx;
+            fprintf(stderr, "[tdump] tid=%-3d %-28s lr=0x%08X sp=0x%08X prof=0x%08X chain:",
+                    i + 1, t->name, (uint32_t)c->lr, (uint32_t)c->gpr[1], t->prof_pc);
+            uint32_t sp = (uint32_t)c->gpr[1];
+            for (int d = 0; d < 14 && sp; d++) {
+                const uint32_t next = td_rd32(sp + 4);      /* low word of the 64-bit back chain */
+                if (!next || next <= sp) break;
+                fprintf(stderr, " 0x%x", td_rd32(next + 20)); /* low word of saved LR at +16 */
+                sp = next;
+            }
+            fputc('\n', stderr);
+        }
+        fflush(stderr);
+    }
+    return NULL;
+}
+#endif
+
 void sys_ppu_thread_init(lv2_syscall_table* tbl)
 {
     /* Initialize stack allocator */
@@ -1275,6 +1317,12 @@ void sys_ppu_thread_init(lv2_syscall_table* tbl)
 
     /* Clear thread table */
     memset(g_ppu_threads, 0, sizeof(g_ppu_threads));
+#ifndef _WIN32
+    { const char* e = getenv("PS3_THREAD_DUMP");
+      if (e && atoi(e) > 0) { pthread_t th;
+          pthread_create(&th, NULL, thread_dump_main, (void*)(uintptr_t)atoi(e));
+          pthread_detach(th); } }
+#endif
 
 #ifdef _WIN32
     if (!s_table_lock_init) {
