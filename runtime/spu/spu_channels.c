@@ -307,7 +307,12 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
  *     stored both took the same slot and then shared one engine's queue and tag
  *     state -- one SPU's tag wait satisfied by the other SPU's transfer.
  * ===========================================================================*/
-#define SPU_MAX_CONTEXTS 8
+/* Not "one per physical SPU": SPURS keeps one cached context per workload
+ * (and lane), and those hold their slot for the life of the process. inFamous
+ * has 14+ workloads, so with 8 slots the rest shared the fallback engine --
+ * harmless while workloads ran one at a time, a corrupt DMA queue/tag state
+ * once two ran concurrently. */
+#define SPU_MAX_CONTEXTS 128
 
 typedef struct {
     spu_context* volatile ctx;
