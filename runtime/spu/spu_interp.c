@@ -364,6 +364,9 @@ void spu_trace_dump(uint32_t at) {
     }
 }
 
+spu_context* volatile g_spu_oracle_trace_ctx = 0;
+long g_spu_oracle_trace_left = 0;
+
 uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     return spu_interp_run_until(ctx, start_lsa, 0);
 }
@@ -438,7 +441,20 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
             #undef LB
             fflush(stderr); _tr--; g_spu_interp_steps=steps; return 0x2000u;
         }
-        if (spu_step(ctx)) {
+        /* Oracle trace (armed by SPU_LS_DUMP_LIST + SPU_TRACE_N, see spu_dma.h): pc, opcode and
+         * the register named by the rt field after the step -- same format as the RPCS3 oracle's
+         * "[oracle] T" lines, so the two traces diff directly. */
+        extern spu_context* volatile g_spu_oracle_trace_ctx; extern long g_spu_oracle_trace_left;
+        const uint32_t _tpc = ctx->pc;
+        const uint32_t _top = ((uint32_t)ctx->ls[_tpc] << 24) | ((uint32_t)ctx->ls[_tpc+1] << 16) |
+                              ((uint32_t)ctx->ls[_tpc+2] << 8) | ctx->ls[_tpc+3];
+        const int _st = spu_step(ctx);
+        if (g_spu_oracle_trace_ctx == ctx && _tpc >= 0x3780 && g_spu_oracle_trace_left-- > 0) {
+            const u128* r = &ctx->gpr[_top & 0x7F];
+            fprintf(stderr, "[oracle] T %05x %08x r%u=%08x %08x %08x %08x\n", _tpc, _top, _top & 0x7F,
+                    r->_u32[0], r->_u32[1], r->_u32[2], r->_u32[3]);
+        }
+        if (_st) {
             /* stop 0x110 = SYS_SPU_THREAD_STOP_RECEIVE_EVENT. The worker writes
              * the SPU queue number to its out-mailbox, stops, and lv2 replies
              * with {CELL_OK, data1, data2, data3} in the in-mailbox -- which is

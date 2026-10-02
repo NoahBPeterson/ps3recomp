@@ -1401,6 +1401,9 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               FILE* f = fopen(path ? path : "/tmp/ours_ls.bin", "wb");
               if (f) { fwrite(spu->ls, 1, SPU_LS_SIZE, f); fwrite(&spu->gpr[0], 16, 128, f); fclose(f); }
               fprintf(stderr, "[mfc-list] LS dumped (list 0x%05X cmd 0x%02X lsa 0x%08X)\n", s_want, cmd, lsa);
+              { extern spu_context* volatile g_spu_oracle_trace_ctx; extern long g_spu_oracle_trace_left;
+                const char* n = getenv("SPU_TRACE_N");
+                if (n) { g_spu_oracle_trace_left = strtol(n, 0, 0); g_spu_oracle_trace_ctx = spu; } }
           } }
         rc = mfc_do_list_transfer(spu, (uint32_t)ea & SPU_LS_MASK,
                                   ea & 0xFFFFFFFF00000000ull, size, cmd);
