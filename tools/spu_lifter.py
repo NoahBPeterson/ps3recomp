@@ -950,7 +950,7 @@ class SPULifter:
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link; ra (last) = target
             tgt_reg = _reg(ops[-1])
-            return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
+            return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
                     f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
