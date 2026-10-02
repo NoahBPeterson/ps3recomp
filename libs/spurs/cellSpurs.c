@@ -1664,7 +1664,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 if (kicked) s_idle[wid] = 0;
                 u32 cad = 1u << (s_idle[wid] > 4 ? 4 : s_idle[wid]);
                 if (!kicked && (s_pass_no & (cad - 1)) != 0) continue;
-                extern volatile unsigned g_spurs_pm_polls;
+                extern SPU_THREAD_LOCAL unsigned g_spurs_pm_polls;
                 u32 polls_before = g_spurs_pm_polls;   /* heuristic only */
                 (void)polls_before;
 

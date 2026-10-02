@@ -805,11 +805,10 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
              * handler sees g_WwsJob_loadJobState still kNone and (correctly)
              * declines the Load->Run advance, and clear-on-read ch25 eats the
              * only stall. See spu_drain.c: g_sn_defer / SPU_SN_DEFER. */
-            { extern void* volatile g_sn_defer_ctx;
-              extern volatile unsigned g_sn_defer;
+            {
               extern unsigned spu_sn_defer_ticks(void);
               unsigned d = spu_sn_defer_ticks();
-              if (d) { g_sn_defer_ctx = (void*)spu; g_sn_defer = d; } }
+              if (d) spu->sn_defer = d; }
             spu_ch_wake(spu);
             { static int _n = 0; if (_n++ < 16)
                 fprintf(stderr, "[mfc-list] STALL img=%d tag=%u elem@0x%05X "

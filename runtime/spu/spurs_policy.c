@@ -32,8 +32,9 @@ extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 
 /* Counters the intercepts in spu_channels.c maintain for the CURRENT run
  * (single writer per run; reads are diagnostic). */
-volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
-volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
+/* Per host thread: each SPURS lane runs its own policy-module invocation. */
+SPU_THREAD_LOCAL unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
+SPU_THREAD_LOCAL unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
 volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
 
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
