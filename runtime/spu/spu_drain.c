@@ -17,7 +17,6 @@ typedef struct spu_irq_frame {
 } spu_irq_frame;
 
 /* Pending cross-function transfer target for this host thread's SPU context. */
-SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
 SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
 SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 
@@ -256,7 +255,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                       if (s_it && _n++ < 200)
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to taking frame depth %u (srr0=0x%05X)\n",
                                   ctx->host_depth, f->depth, ctx->pc & SPU_LS_MASK); }
-                    longjmp(f->env, 1);
+                    SPU_LONGJMP(f->env, 1);
                 }
                 if (!f && ctx->host_depth > 0) {
                     /* Taken by the top-level driver loop (depth 0), which
@@ -427,7 +426,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                         f.image_id = ctx->image_id;
                         ctx->irq_frame = &f;
                     }
-                    if (setjmp(f.env) == 0) {
+                    if (SPU_SETJMP(f.env) == 0) {
                         vf(ctx);
                     } else {
                         /* iret fired deeper: registers restored, pc = srr0 */
