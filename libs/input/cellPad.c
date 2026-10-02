@@ -421,6 +421,28 @@ static unsigned long long pad_now_ms(void)
 #endif
 }
 
+/* Port-0 state from a button mask and stick positions (0-255, centre 128). */
+static void pad_apply(PadHostState* hs, u16 btns, int lx, int ly, int rx, int ry)
+{
+    hs->buttons = btns;
+    hs->connected = 1;
+    hs->analog_lx = (u8)lx; hs->analog_ly = (u8)ly;
+    hs->analog_rx = (u8)rx; hs->analog_ry = (u8)ry;
+    hs->trigger_l2 = (btns & CELL_PAD_CTRL_L2) ? 255 : 0;
+    hs->trigger_r2 = (btns & CELL_PAD_CTRL_R2) ? 255 : 0;
+    const u8 full = 255;
+    hs->press_up = (btns & CELL_PAD_CTRL_UP) ? full : 0;
+    hs->press_down = (btns & CELL_PAD_CTRL_DOWN) ? full : 0;
+    hs->press_left = (btns & CELL_PAD_CTRL_LEFT) ? full : 0;
+    hs->press_right = (btns & CELL_PAD_CTRL_RIGHT) ? full : 0;
+    hs->press_cross = (btns & CELL_PAD_CTRL_CROSS) ? full : 0;
+    hs->press_circle = (btns & CELL_PAD_CTRL_CIRCLE) ? full : 0;
+    hs->press_square = (btns & CELL_PAD_CTRL_SQUARE) ? full : 0;
+    hs->press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? full : 0;
+    hs->press_l1 = (btns & CELL_PAD_CTRL_L1) ? full : 0;
+    hs->press_r1 = (btns & CELL_PAD_CTRL_R1) ? full : 0;
+}
+
 /* PS3_PAD_FILE=<path>: a scripted pad on port 0, for driving a title from a
  * shell or test script. The file holds whitespace-separated button names that
  * are held while they are in the file: UP DOWN LEFT RIGHT CROSS CIRCLE SQUARE
@@ -459,23 +481,40 @@ static void pad_poll_file(void)
     if (btns != hs->buttons) {
         printf("[cellPad] file pad: buttons 0x%04X\n", btns); fflush(stdout);
     }
-    hs->buttons = btns;
-    hs->connected = 1;
-    hs->analog_lx = (u8)lx; hs->analog_ly = (u8)ly;
-    hs->analog_rx = (u8)rx; hs->analog_ry = (u8)ry;
-    hs->trigger_l2 = (btns & CELL_PAD_CTRL_L2) ? 255 : 0;
-    hs->trigger_r2 = (btns & CELL_PAD_CTRL_R2) ? 255 : 0;
-    const u8 full = 255;
-    hs->press_up = (btns & CELL_PAD_CTRL_UP) ? full : 0;
-    hs->press_down = (btns & CELL_PAD_CTRL_DOWN) ? full : 0;
-    hs->press_left = (btns & CELL_PAD_CTRL_LEFT) ? full : 0;
-    hs->press_right = (btns & CELL_PAD_CTRL_RIGHT) ? full : 0;
-    hs->press_cross = (btns & CELL_PAD_CTRL_CROSS) ? full : 0;
-    hs->press_circle = (btns & CELL_PAD_CTRL_CIRCLE) ? full : 0;
-    hs->press_square = (btns & CELL_PAD_CTRL_SQUARE) ? full : 0;
-    hs->press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? full : 0;
-    hs->press_l1 = (btns & CELL_PAD_CTRL_L1) ? full : 0;
-    hs->press_r1 = (btns & CELL_PAD_CTRL_R1) ? full : 0;
+    pad_apply(hs, btns, lx, ly, rx, ry);
+}
+
+/* Keyboard pad (macOS window): the Metal window records key state by
+ * virtual keycode in g_pad_host_keys and swallows the events. One key, one
+ * control, no overlaps, and only keys every Mac keyboard has:
+ *   left stick W/A/S/D      right stick I/J/K/L     d-pad: arrow keys
+ *   CROSS Space  CIRCLE Q   SQUARE E   TRIANGLE R
+ *   L1 U  R1 O  L2 Y  R2 P  L3 G  R3 H              START Return  SELECT Tab */
+volatile uint32_t g_pad_host_keys[4];
+static int pad_key(unsigned vk) { return (g_pad_host_keys[(vk >> 5) & 3] >> (vk & 31)) & 1; }
+static void pad_poll_keys(void)
+{
+    static const struct { unsigned vk; u16 btn; } map[] = {
+        {0x7E, CELL_PAD_CTRL_UP}, {0x7D, CELL_PAD_CTRL_DOWN},
+        {0x7B, CELL_PAD_CTRL_LEFT}, {0x7C, CELL_PAD_CTRL_RIGHT},
+        {0x31, CELL_PAD_CTRL_CROSS}, {0x0C, CELL_PAD_CTRL_CIRCLE},
+        {0x0E, CELL_PAD_CTRL_SQUARE}, {0x0F, CELL_PAD_CTRL_TRIANGLE},
+        {0x20, CELL_PAD_CTRL_L1}, {0x1F, CELL_PAD_CTRL_R1},
+        {0x10, CELL_PAD_CTRL_L2}, {0x23, CELL_PAD_CTRL_R2},
+        {0x05, CELL_PAD_CTRL_L3}, {0x04, CELL_PAD_CTRL_R3},
+        {0x24, CELL_PAD_CTRL_START}, {0x30, CELL_PAD_CTRL_SELECT},
+    };
+    u16 btns = 0;
+    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+        if (pad_key(map[i].vk)) btns |= map[i].btn;
+    /* Stick axes: 0 = left/up, 255 = right/down. */
+    const int lx = 128 + (pad_key(0x02) ? 127 : 0) - (pad_key(0x00) ? 128 : 0);   /* D, A */
+    const int ly = 128 + (pad_key(0x01) ? 127 : 0) - (pad_key(0x0D) ? 128 : 0);   /* S, W */
+    const int rx = 128 + (pad_key(0x25) ? 127 : 0) - (pad_key(0x26) ? 128 : 0);   /* L, J */
+    const int ry = 128 + (pad_key(0x28) ? 127 : 0) - (pad_key(0x22) ? 128 : 0);   /* K, I */
+    PadHostState* hs = &s_host_state[0];
+    if (btns != hs->buttons) { printf("[cellPad] keyboard: buttons 0x%04X\n", btns); fflush(stdout); }
+    pad_apply(hs, btns, lx, ly, rx, ry);
 }
 
 static void pad_poll_backend(void)
@@ -501,7 +540,7 @@ static void pad_poll_backend(void)
 #endif
     { static int real0 = 0;
       if (s_host_state[0].connected && !getenv("PS3_PAD_FILE")) real0 = 1;
-      if (!real0) pad_poll_file(); }
+      if (!real0) { if (getenv("PS3_PAD_FILE")) pad_poll_file(); else pad_poll_keys(); } }
 }
 
 /* ---------------------------------------------------------------------------
