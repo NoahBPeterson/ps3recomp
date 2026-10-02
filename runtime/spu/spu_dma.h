@@ -188,9 +188,18 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     /* SPU_IMG_DMA=<image id>: that image's first 80 transfers; a GET's first
      * 16 source bytes are printed so a job's parameter block can be read. */
     { static int s_img = -2; if (s_img == -2) { const char* e = getenv("SPU_IMG_DMA"); s_img = e ? atoi(e) : -1; }
-      if (s_img >= 0 && spu->image_id == s_img && (!getenv("SPU_IMG_DMA_CODE") || ((cmd & 0x40) && lsa >= 0x5000u && size >= 0x400u))) {
+      if (s_img >= 0 && spu->image_id == s_img && (!getenv("SPU_IMG_DMA_CODE") || ((cmd & 0x40) && (!getenv("SPU_IMG_DMA_HEAP") || ea >= 0x1000000u) && lsa >= 0x4000u && lsa < 0x30000u && size >= 0x80u))) {
           static int _n = 0;
-          if (_n++ < 400) {
+          /* In code mode, log each distinct (lsa, ea) once: a job reloaded
+           * every frame would otherwise spend the whole budget on itself. */
+          static uint64_t s_seen[1024]; static unsigned s_ns;
+          int dup = 0;
+          if (getenv("SPU_IMG_DMA_CODE")) {
+              uint64_t key = ((uint64_t)lsa << 32) | (uint32_t)ea;
+              for (unsigned i = 0; i < s_ns; i++) if (s_seen[i] == key) { dup = 1; break; }
+              if (!dup && s_ns < 1024) s_seen[s_ns++] = key;
+          }
+          if (!dup && _n++ < 20000) {
               fprintf(stderr, "[img-dma] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u",
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
               if ((cmd & 0x40) && vm_base && (uint32_t)ea >= 0x10000u) {
