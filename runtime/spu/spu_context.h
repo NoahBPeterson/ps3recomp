@@ -281,6 +281,11 @@ typedef struct spu_context {
      * path recognizes a registered overlay's source EA and records which
      * overlay is now resident; dispatch retries a missed lookup against it. */
     int resident_ovl;
+    /* Drain ticks left before a stall-and-notify interrupt may be taken (see
+     * spu_take_interrupt). Per context: it was one global slot, so with
+     * several SPU host threads one SPU's deferral overwrote another's and an
+     * interrupt was lost. */
+    unsigned sn_defer;
     /* Independently streamed code buffers can coexist with the policy overlay.
      * Each mapping records which translated image owns that local-store span. */
     struct {
