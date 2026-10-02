@@ -555,11 +555,38 @@ def _fuse_cr(body_lines: list[str]) -> list[str]:
             if "func_" in lj or "ps3_indirect_call" in lj or "g_trampoline_fn" in lj or "lv2_syscall" in lj:
                 safe = False
                 break
+        # Past the target: both the taken and the fall-through paths continue from the
+        # target label, so the field must also be dead there. Scan linearly to the end
+        # of the body: a write of the field kills it (until the next label, a merge
+        # point); a read while it is live refuses. For the non-volatile fields CR2-CR4
+        # (shift 20/16/12), a return or trampoline hand-off while live also refuses:
+        # the field is part of the exit/continuation contract. (func_0004F054 fused a
+        # cmp on CR4 and then branched on CR4 again right after the target, taking the
+        # non-NULL path with r28 == 0.)
+        if safe:
+            nonvolatile = shift in ("20", "16", "12")
+            killed = False
+            for j in range(tgt_idx + 1, n):
+                lj = body_lines[j].strip()
+                if lj.endswith(":"):
+                    killed = False
+                    continue
+                writes = f"& ~(0xFu << {shift})" in lj
+                reads = "ctx->cr" in lj and f">> {shift})" in lj
+                if reads and not killed:
+                    safe = False
+                    break
+                if writes:
+                    killed = True
+                    continue
+                if nonvolatile and not killed and ("return" in lj or "g_trampoline_fn" in lj):
+                    safe = False
+                    break
         if not safe:
             out.append(line)
             i += 1
             continue
-        cond_c = f"(!({cond}))" if mbr.group("neg") else f"({cond})"
+        cond_c =f"(!({cond}))" if mbr.group("neg") else f"({cond})"
         out.append(f"{mbr.group(1)}if {cond_c} goto {target};  /* CR fusion: {mset.group('ta')} cmp, field shift {shift} */")
         i += 2
     return out
