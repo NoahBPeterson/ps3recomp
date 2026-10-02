@@ -185,6 +185,21 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               " size=%u covers 0x%08X\n",
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
                       (uint32_t)s_w); } }
+    /* SPU_IMG_DMA=<image id>: that image's first 80 transfers; a GET's first
+     * 16 source bytes are printed so a job's parameter block can be read. */
+    { static int s_img = -2; if (s_img == -2) { const char* e = getenv("SPU_IMG_DMA"); s_img = e ? atoi(e) : -1; }
+      if (s_img >= 0 && spu->image_id == s_img) {
+          static int _n = 0;
+          if (_n++ < 80) {
+              fprintf(stderr, "[img-dma] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u",
+                      (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+              if ((cmd & 0x40) && vm_base && (uint32_t)ea >= 0x10000u) {
+                  const uint8_t* q = vm_base + (uint32_t)ea;
+                  fprintf(stderr, " src=");
+                  for (uint32_t i = 0; i < (size == 128 ? 128u : 16u) && i < size; i++) fprintf(stderr, "%02X%s", q[i], (i & 3) == 3 ? " " : "");
+              }
+              fputc('\n', stderr);
+          } } }
     /* SPU_DMA_RANGE=<lo>-<hi> (hex EAs): log transfers touching [lo,hi), first
      * 64 -- who reads or writes a buffer the RSX shares with the SPUs. */
     { static uint32_t s_lo = 1, s_hi;
@@ -673,6 +688,17 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * find the pushbuffer; NULL for every title that does not. */
         { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
           if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }
+        /* SPU_PUT_RANGE=lo,hi (hex): log PUTs overlapping [lo,hi) -- which job,
+         * where in its LS, and the first words -- to name a stray writer. */
+        { static int s_pr = -1; static uint32_t s_lo, s_hi; static int s_n;
+          if (s_pr < 0) { const char* e = getenv("SPU_PUT_RANGE"); s_pr = 0;
+              if (e) { s_lo = (uint32_t)strtoul(e, (char**)&e, 16); if (*e == ',') { s_hi = (uint32_t)strtoul(e + 1, 0, 16); s_pr = 1; } } }
+          if (s_pr && (uint32_t)ea < s_hi && (uint32_t)ea + size > s_lo && s_n++ < 24) {
+              const uint8_t* lp = (const uint8_t*)ls_ptr;
+              fprintf(stderr, "[put-range] img=%d pc=0x%05X ea=0x%08X lsa=0x%05X size=%u cmd=0x%X data=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, (uint32_t)ea, lsa, size, cmd,
+                      lp[0], lp[1], lp[2], lp[3], lp[4], lp[5], lp[6], lp[7]);
+          } }
         /* Bink sync-area watch (armed by the PPU barrier probe): log SPU PUTs
          * that touch the per-SPU lane counters. */
         { extern uint32_t g_barrier_sync_watch;
