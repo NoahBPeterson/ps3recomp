@@ -16,6 +16,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <atomic>
 /* win32_compat.h is <windows.h> on Windows (CRITICAL_SECTION for the real
  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
@@ -359,32 +363,123 @@ static void sys_lwcond_create(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
-/* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
- * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
- * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
- * common single (non-recursive) hold. */
+
+/* Real lwcond semantics. The old wait released the lwmutex, slept 1 ms and
+ * returned success with every signal a no-op, on the theory that callers
+ * re-check a predicate in a loop. inFamous's movie player does not: it posts a
+ * frame-buffer request, waits once, and takes the first wakeup as "serviced"
+ * -- so it built Bink's frame planes from a NULL buffer and the decoder SPU
+ * DMA'd every video frame over the game's .text (jump tables included).
+ *
+ * Per lwcond EA: waiters registered and signal tokens granted. A waiter
+ * registers BEFORE it releases the lwmutex, and signalers hold that lwmutex,
+ * so no signal is lost; signal grants one token (if anyone waits), signal_all
+ * one per waiter. PS3_LWCOND_POLL=1 restores the old poll behaviour. */
+struct LwcondWaiter { uint32_t ea; bool released; LwcondWaiter* next; };
+static std::mutex s_lwc_mu;
+static std::condition_variable s_lwc_cv;
+static LwcondWaiter* s_lwc_head;   /* FIFO of registered waiters, all lwconds */
+
+static void lwc_enqueue(LwcondWaiter* w)   /* s_lwc_mu held */
+{
+    LwcondWaiter** p = &s_lwc_head;
+    while (*p) p = &(*p)->next;
+    w->next = nullptr;
+    *p = w;
+}
+
+static void lwc_unlink(LwcondWaiter* w)    /* s_lwc_mu held */
+{
+    for (LwcondWaiter** p = &s_lwc_head; *p; p = &(*p)->next)
+        if (*p == w) { *p = w->next; return; }
+}
+
+static bool lwc_poll_mode()
+{
+    static int m = -1;
+    if (m < 0) m = getenv("PS3_LWCOND_POLL") ? 1 : 0;
+    return m == 1;
+}
+
+static int lwc_log()
+{
+    static int n = -1;
+    if (n < 0) { const char* e = getenv("PS3_LWCOND_LOG"); n = e ? atoi(e) : 0; }
+    return n;
+}
+static std::atomic<int> s_lwc_logged{0};
+
+/* signal releases the oldest waiter registered on this lwcond, signal_all
+ * every one registered now. Released waiters leave the queue at once, so a
+ * thread that wakes and waits again can never take another waiter's wakeup. */
+static void lwc_signal(uint32_t ea, bool all, uint32_t tid = 0)
+{
+    std::lock_guard<std::mutex> lk(s_lwc_mu);
+    unsigned n = 0;
+    for (LwcondWaiter** p = &s_lwc_head; *p; ) {
+        LwcondWaiter* w = *p;
+        if (w->ea == ea) {
+            w->released = true;
+            *p = w->next;
+            n++;
+            if (!all) break;
+        } else {
+            p = &w->next;
+        }
+    }
+    if (lwc_log() && s_lwc_logged++ < lwc_log())
+        fprintf(stderr, "[lwcond] signal%s ea=0x%08X woke=%u tid=%u lwm_owner=0x%X\n", all ? "_all" : "", ea,
+                n, tid, vm_read32(vm_read32(ea) + LWM_OWNER));
+    if (n) s_lwc_cv.notify_all();
+}
+
+static void sys_lwcond_signal(ppu_context* ctx)     { lwc_signal((uint32_t)ctx->gpr[3], false, ctx->thread_id); ctx->gpr[3] = 0; }
+static void sys_lwcond_signal_all(ppu_context* ctx) { lwc_signal((uint32_t)ctx->gpr[3], true, ctx->thread_id);  ctx->gpr[3] = 0; }
+static void sys_lwcond_signal_to(ppu_context* ctx)  { lwc_signal((uint32_t)ctx->gpr[3], false, ctx->thread_id); ctx->gpr[3] = 0; }
+
 static void sys_lwcond_wait(ppu_context* ctx)
 {
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
+    uint64_t timeout = ctx->gpr[4];                 /* microseconds, 0 = forever */
     uint32_t lwmutex = vm_read32(lwcond + 0x00);
+    int32_t rc_out = 0;
 #if PS3_LWM_REAL
     HANDLE s = lwm_sem(lwmutex);
     if (s) {
+        const bool poll = lwc_poll_mode();
+        if (lwc_log() && s_lwc_logged++ < lwc_log())
+            fprintf(stderr, "[lwcond] wait ea=0x%08X lwm=0x%08X timeout=%llu tid=%u\n", lwcond, lwmutex,
+                    (unsigned long long)timeout, (unsigned)ctx->thread_id);
+        LwcondWaiter me{lwcond, false, nullptr};
+        if (!poll) {
+            std::lock_guard<std::mutex> lk(s_lwc_mu);
+            lwc_enqueue(&me);
+        }
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
         vm_write32(lwmutex + LWM_RECUR, 0);
         vm_write32(lwmutex + LWM_OWNER, 0);
         ReleaseSemaphore(s, 1, NULL);
-        Sleep(1);
+        if (poll) {
+            Sleep(1);
+        } else {
+            std::unique_lock<std::mutex> lk(s_lwc_mu);
+            auto ready = [&] { return me.released; };
+            if (timeout) {
+                if (!s_lwc_cv.wait_for(lk, std::chrono::microseconds(timeout), ready)) {
+                    lwc_unlink(&me);
+                    rc_out = (int32_t)0x8001000B;   /* CELL_ETIMEDOUT */
+                }
+            } else {
+                s_lwc_cv.wait(lk, ready);
+            }
+        }
         WaitForSingleObject(s, INFINITE);
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
     }
 #endif
-    ctx->gpr[3] = 0;
+    ctx->gpr[3] = (uint64_t)(int64_t)rc_out;
 }
 
 /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.

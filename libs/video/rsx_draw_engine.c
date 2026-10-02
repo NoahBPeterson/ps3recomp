@@ -1265,7 +1265,12 @@ static void sink_inline_array(void* user, const rsx_dispatch* r,
 {
     (void)user;
     const u32 stride = rsx_vertex_inline_layout(r, NULL);
-    if (!stride || bytes < stride) return;
+    if (!stride || bytes < stride) {
+        static int n;
+        if (getenv("PS3RECOMP_ENG_DROPLOG") && n++ < 6)
+            fprintf(stderr, "[rsx engine] inline array dropped: stride=%u bytes=%u\n", stride, bytes);
+        return;
+    }
     dc.inl = data;
     dc.inl_bytes = bytes;
     dc.n_packets++;
@@ -1369,12 +1374,33 @@ static u32 sink_bind_vertex_textures(
     return bound;
 }
 
+/* PS3RECOMP_ENG_DROPLOG=1: name each draw sink_end drops (first 6 per
+ * reason), with the primitive, packet/vertex counts and target address. */
+static void eng_drop(const char* why, u32 prim)
+{
+    static int on = -1; static u32 from;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_DROPLOG"); on = e ? 1 : 0; from = e ? (u32)atoi(e) : 0; }
+    if (!on || g.frames < from) return;   /* =<frame>: start counting there */
+    static struct { const char* why; u32 n; } seen[16];
+    u32 k = 0;
+    while (k < 16 && seen[k].why && seen[k].why != why) k++;
+    if (k == 16) return;
+    seen[k].why = why;
+    if (seen[k].n++ >= 6) return;
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(&g.rsx, &sf);
+    fprintf(stderr, "[rsx engine] drop #%u (%s): prim=%u packets=%u arr=%u idx=%u verts=%u fetch_ok=%d"
+                    " rt=0x%X clip=%ux%u frame=%u\n", seen[k].n, why, prim, dc.n_packets, dc.n_arr,
+            dc.n_idx, dc.n_verts, dc.fetch_ok, sf.color_offset[0], sf.clip_w, sf.clip_h, g.frames);
+}
+
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
-    if (!g.ready || !dc.n_packets) return;
-
+    if (!g.ready) return;
     const u32 prim = g.rsx.current_primitive;
+    if (!dc.n_packets) { eng_drop("no_packets", prim); return; }
+
     /* Everything that becomes triangles -- lists, strips, fans, quads, quad
      * strips and polygons -- is REBUILT into one triangle list through an
      * index buffer. A host strip topology cannot express a restart cut, which
@@ -1387,33 +1413,33 @@ static void sink_end(void* user, const rsx_dispatch* r)
     int scratch = 0;
     const int rebuild = eng_topology_rebuild(prim, 0, &scratch) != 0;
     if (!rebuild) {
-        if (rsx_primitive_needs_expansion(prim)) return;
+        if (rsx_primitive_needs_expansion(prim)) { eng_drop("needs_expansion", prim); return; }
         topology = rsx_primitive_topology(prim);
-        if (topology == RSX_TOPOLOGY_UNSUPPORTED) return;
+        if (topology == RSX_TOPOLOGY_UNSUPPORTED) { eng_drop("unsupported_topology", prim); return; }
     }
 
     rsx_vertex_layout_plan layout;
     eng_vertex_layout(&layout);
     dc_fetch(&layout, rebuild);
-    if (!dc.n_verts || !dc.fetch_ok) return;
+    if (!dc.n_verts || !dc.fetch_ok) { eng_drop("fetch", prim); return; }
 
     int indexed = 0;
     u32 n_draw = dc.n_source_refs;
     if (rebuild) {
-        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) return;
+        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) { eng_drop("rebuild", prim); return; }
         n_draw = indexed
             ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
                                                    dc.cuts, dc.n_cuts)
             : dc.n_source_refs - dc.n_source_refs % 3u;
     }
-    if (!n_draw) return;
+    if (!n_draw) { eng_drop("n_draw0", prim); return; }
 
     rsx_be_render_state rs;
     rsx_draw_engine_decode_render_state(&g.rsx, &rs);
 
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
-    if (!n_targets) return;
+    if (!n_targets) { eng_drop("no_targets", prim); return; }
     const u32 target = targets[0];
 
     rsx_dsp_surface sf;
@@ -1446,10 +1472,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed);
-    if (!pipeline) return;
+    if (!pipeline) { eng_drop("pipeline", prim); return; }
 
     if (indexed) {
-        if (!dc_reserve_indices(n_draw)) return;
+        if (!dc_reserve_indices(n_draw)) { eng_drop("reserve_indices", prim); return; }
         rsx_draw_engine_write_topology_indices(
             prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
             dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL,
@@ -1479,7 +1505,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 fp_bytes = (nslots + 1u) * 16u;
     if (g.fp_cb_cap < fp_bytes) {
         u8* n = (u8*)realloc(g.fp_cb, fp_bytes);
-        if (!n) return;
+        if (!n) { eng_drop("n0", prim); return; }
         g.fp_cb = n;
         g.fp_cb_cap = fp_bytes;
     }
