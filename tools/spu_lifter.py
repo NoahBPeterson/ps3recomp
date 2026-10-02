@@ -673,7 +673,8 @@ class SPULifter:
                     f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; "
                     f"spu_halt(ctx); return; }}")
         if mn == "stopd":
-            return ("ctx->stop_code = 0u; "
+            # stopd has no code field; the architected stop code it reports is 0x3FFF (RPCS3 STOPD).
+            return ("ctx->stop_code = 0x3FFFu; "
                     "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
 
         # ---- integer arithmetic (register) ----
@@ -854,7 +855,7 @@ class SPULifter:
             tgt = self._branch_target(insn)
             # Link register: preferred word only, other slots ZERO (real HW /
             # RPCS3 v128::from32r) -- splatting corrupts full-quadword link use.
-            link = f"{g(link_rt)} = spu_link(0x{addr + 4:X});"
+            link = f"{g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X});"   # wraps at the end of LS
             # SELF-LOOP TRAP: `brsl rX, .` (target == this instruction) is an
             # infinite loop on real SPU (re-sets the link each pass, never
             # advances) -- a trap, NOT a call. Emitting a host call recurses
@@ -941,19 +942,21 @@ class SPULifter:
             # Indirect call: nested dispatch bracketed like brsl (host_depth +
             # SPU_DRAIN + image save/restore) so the callee's tail-chains drain
             # here and its `bi $r0` returns via host return.
-            return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
-                    f"{{ int32_t _si = (int32_t)ctx->image_id; "
-                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
+            # read the target BEFORE writing the link: rt may be the same register as ra
+            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
+                    f"int32_t _si = (int32_t)ctx->image_id; "
+                    f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
                     f"spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
                     f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
-            link_rt = insn.raw & 0x7F            # rt = link; ra (last) = target
-            tgt_reg = _reg(ops[-1])
-            return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
+            link_rt = insn.raw & 0x7F            # rt = link
+            tgt_reg = (insn.raw >> 7) & 0x7F     # ra = target (the disassembler's last operand is rb, not the target)
+            # read the target before writing the link: rt may alias ra
+            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
-                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
+                    f"{_ied}ctx->pc = _tg; "
+                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }} }}")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
         if mn in ("biz", "binz", "bihz", "bihnz"):
             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
