@@ -111,7 +111,21 @@ static int spu_step(spu_context* ctx) {
     const uint8_t* p = ctx->ls;
     uint32_t insn = ((uint32_t)p[m] << 24) | ((uint32_t)p[m+1] << 16)
                   | ((uint32_t)p[m+2] << 8) | p[m+3];
-    spu_ins d; spu_decode1(insn, pc, &d);
+    /* Decode once per LS word. A decode is a function of (word, pc) alone, so
+     * a per-thread cache indexed by pc and validated against the word is
+     * right for every context and image the thread runs, and code a DMA or
+     * overlay replaces simply re-decodes. */
+    typedef struct { uint32_t insn; uint32_t valid; spu_ins d; } spu_dent;
+    static _Thread_local spu_dent* dc;
+    if (!dc) dc = (spu_dent*)calloc(0x10000, sizeof *dc);
+    spu_ins d;
+    if (dc) {
+        spu_dent* e = &dc[(m >> 2) & 0xFFFF];
+        if (!e->valid || e->insn != insn) { spu_decode1(insn, pc, &e->d); e->insn = insn; e->valid = 1; }
+        d = e->d;
+    } else {
+        spu_decode1(insn, pc, &d);
+    }
     uint32_t next = (pc + 4) & 0x3FFFC;
 
     switch (d.op) {
@@ -448,6 +462,19 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         const uint32_t _tpc = ctx->pc;
         const uint32_t _top = ((uint32_t)ctx->ls[_tpc] << 24) | ((uint32_t)ctx->ls[_tpc+1] << 16) |
                               ((uint32_t)ctx->ls[_tpc+2] << 8) | ctx->ls[_tpc+3];
+        /* SPU_INTERP_HIST=1: which (image, 4 KB LS page) the interpreter spends
+         * its steps in -- the candidates for ahead-of-time lifting. */
+        { static int on = -1; if (on < 0) on = getenv("SPU_INTERP_HIST") ? 1 : 0;
+          if (on) {
+              static _Atomic unsigned long long hist[64][64]; static _Atomic unsigned long long tot;
+              const int img = ctx->image_id < 0 ? 63 : (ctx->image_id & 63);
+              hist[img][(_tpc >> 12) & 63]++;
+              if ((++tot % 200000000ull) == 0) {
+                  fprintf(stderr, "[spu-hist] after %llu interpreted steps:\n", (unsigned long long)tot);
+                  for (int i = 0; i < 64; i++) for (int j = 0; j < 64; j++)
+                      if (hist[i][j] > tot / 50) fprintf(stderr, "[spu-hist]   img %d page 0x%05X: %.1f%%\n",
+                                                        i == 63 ? -1 : i, j << 12, 100.0 * hist[i][j] / tot);
+              } } }
         const int _st = spu_step(ctx);
         if (g_spu_oracle_trace_ctx == ctx && _tpc >= 0x3780 && g_spu_oracle_trace_left-- > 0) {
             const u128* r = &ctx->gpr[_top & 0x7F];

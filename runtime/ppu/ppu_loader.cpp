@@ -34,6 +34,7 @@
 #endif
 
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
+#define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
 #include "ppu_recomp.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
@@ -1382,6 +1383,7 @@ static inline int vm_null_store(uint32_t a, uint32_t v, int width, void* ra)
  * screen. None of them does anything unless its variable is set, so decide
  * once and give the accessors a fast path that skips the lot. PPU_HOTREAD=1
  * re-enables the spin detectors on their own. */
+extern "C" int vm_inline_ok = 0;
 static int g_vm_diag = -1;
 static int vm_diag_init(void)
 {
@@ -1391,6 +1393,7 @@ static int vm_diag_init(void)
     int d = 0;
     for (int i = 0; vars[i]; i++) if (getenv(vars[i])) d = 1;
     g_vm_diag = d;
+    vm_inline_ok = !d;   /* ppu_recomp.h inline loads: only with no diagnostic armed */
     return d;
 }
 static inline int vm_diag(void)

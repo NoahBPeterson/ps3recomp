@@ -131,6 +131,62 @@ int      ppu_stdcx64(uint64_t addr, uint64_t expected, uint64_t val);
 }
 #endif
 
+/* Inline guest-load fast paths. Every lifted load used to be an out-of-line
+ * call into the runtime; a CPU-bound title spends most of its main thread
+ * there (inFamous's culling leaf func_0041CF98: one read32 + seven read16 per
+ * call, ~60% of the frame in the calls themselves). The runtime sets
+ * vm_inline_ok once it knows no memory diagnostic is armed; anything the
+ * out-of-line path treats specially -- the null page, the raw-SPU register
+ * windows, the gcm ref-poll word, the end of the mapping -- still goes there,
+ * so the result is the same, just without the call. */
+#include <string.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern uint8_t* vm_base;
+extern int      vm_inline_ok;
+extern uint32_t ppu_vm_size;
+extern uint32_t ppu_hle_inject_base;
+#ifdef __cplusplus
+}
+#endif
+static inline int vm_inl_ok(uint32_t ea, uint32_t n)
+{
+    return __builtin_expect(vm_inline_ok, 1) && ea >= 0x10000u && ea < 0xE0000000u &&
+           ea != ppu_hle_inject_base + 0x2008u &&
+           (ppu_vm_size == 0 || (uint64_t)ea + n <= ppu_vm_size);
+}
+static inline uint8_t vm_read8_inl(uint64_t a)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_inl_ok(ea, 1)) return vm_base[ea];
+    return vm_read8(a);
+}
+static inline uint16_t vm_read16_inl(uint64_t a)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_inl_ok(ea, 2)) { uint16_t v; memcpy(&v, vm_base + ea, 2); return __builtin_bswap16(v); }
+    return vm_read16(a);
+}
+static inline uint32_t vm_read32_inl(uint64_t a)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_inl_ok(ea, 4)) { uint32_t v; memcpy(&v, vm_base + ea, 4); return __builtin_bswap32(v); }
+    return vm_read32(a);
+}
+static inline uint64_t vm_read64_inl(uint64_t a)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_inl_ok(ea, 8)) { uint64_t v; memcpy(&v, vm_base + ea, 8); return __builtin_bswap64(v); }
+    return vm_read64(a);
+}
+#ifndef PPU_NO_INLINE_LOADS
+#define vm_read8(a)  vm_read8_inl(a)
+#define vm_read16(a) vm_read16_inl(a)
+#define vm_read32(a) vm_read32_inl(a)
+#define vm_read64(a) vm_read64_inl(a)
+#endif
+
 /* Syscall handler */
 #ifdef __cplusplus
 extern "C"
