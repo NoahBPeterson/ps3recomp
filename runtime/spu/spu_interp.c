@@ -320,7 +320,7 @@ static int spu_step(spu_context* ctx) {
     case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) next = PREF(A) & 0x3FFFC; break;
     case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) next = PREF(A) & 0x3FFFC; break;
     case SPU_stop: case SPU_stopd:
-        ctx->pc = next; ctx->stop_code = (uint32_t)I;
+        ctx->pc = next; ctx->stop_code = (d.op == SPU_stopd) ? 0x3FFFu : (uint32_t)I;   /* stopd carries no code field: RPCS3 reports 0x3FFF */
         ctx->status = SPU_STATUS_STOPPED_BY_STOP; return 1;
     /* conditional halts (assertions): stop the SPU when the condition holds,
      * else continue. The preferred word of ra is compared. */
