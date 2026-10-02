@@ -2066,6 +2066,7 @@ typedef struct {
     id<MTLDepthStencilState>   ds;
     MTLCullMode cull;
     MTLWinding  winding;
+    char desc[96];   /* PS3RECOMP_METAL_PASS_LOG summary of the fixed-function state */
 } EngPipeline;
 static EngPipeline s_eng_pipe[ENG_MAX_PIPES];
 static u32 s_eng_pipe_count;
@@ -2603,6 +2604,12 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
                                     ? MTLCullModeFront
                                     : (rs->cull_face == 0x0405u ? MTLCullModeBack
                                                                 : MTLCullModeNone);
+    snprintf(s_eng_pipe[slot].desc, sizeof s_eng_pipe[slot].desc,
+             "z=%d/%X/w%d st=%d/%X/m%X/%X,%X,%X bl=%d/%X,%X cm=%X at=%d/%X cull=%d/%X",
+             rs->depth_test, rs->depth_func, rs->depth_write, rs->stencil_enable, rs->s_func,
+             rs->s_func_mask, rs->s_fail, rs->s_zfail, rs->s_zpass, rs->blend_enable,
+             rs->sf_rgb, rs->df_rgb, rs->color_mask, rs->alpha_test_enable, rs->alpha_func,
+             rs->cull_enable, rs->cull_face);
     s_eng_pipe[slot].winding = (rs->front_face == 0x0901u)
                                    ? MTLWindingCounterClockwise
                                    : MTLWindingClockwise;
@@ -2783,8 +2790,19 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
     if (!p->pso) return;
     [enc setRenderPipelineState:p->pso];
-    [enc setDepthStencilState:p->ds];
-    [enc setCullMode:p->cull];
+    /* PS3RECOMP_METAL_DBG_NOZ=<handle>: draws into that colour target skip
+     * the depth/stencil test and cull (isolates a pass clipped by bad depth). */
+    static long noz = -2;
+    if (noz == -2) { const char* e = getenv("PS3RECOMP_METAL_DBG_NOZ"); noz = e ? strtol(e, 0, 0) : -1; }
+    if (noz >= 0 && r->nrt && r->rt[0] == (u32)noz) {
+        static id<MTLDepthStencilState> off;
+        if (!off) off = [s_dev newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]];
+        [enc setDepthStencilState:off];
+        [enc setCullMode:MTLCullModeNone];
+    } else {
+        [enc setDepthStencilState:p->ds];
+        [enc setCullMode:p->cull];
+    }
     [enc setFrontFacingWinding:p->winding];
     [enc setStencilReferenceValue:r->stencil_ref];
     MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
@@ -3060,6 +3078,37 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         if (s_eng_stage_used)
             stage = [s_dev newBufferWithBytes:s_eng_stage length:s_eng_stage_used
                                       options:MTLResourceStorageModeShared];
+        /* PS3RECOMP_METAL_PASS_LOG=1: every 600th present, print the frame's
+         * record stream grouped into passes (kind, targets, depth, count, and
+         * the textures the first draw samples). */
+        if (present_dst && getenv("PS3RECOMP_METAL_PASS_LOG")) {
+            static unsigned s_pf;
+            if (s_eng_rec_count > 1000 && (s_pf++ % 300) == 0) {
+                fprintf(stderr, "[pass] ---- frame %u: %u records ----\n", s_pf, s_eng_rec_count);
+                u32 i = 0;
+                while (i < s_eng_rec_count) {
+                    const EngRecord* r = &s_eng_rec[i];
+                    u32 j = i + 1;
+                    while (j < s_eng_rec_count && s_eng_rec[j].kind == r->kind && s_eng_rec[j].nrt == r->nrt &&
+                           !memcmp(s_eng_rec[j].rt, r->rt, sizeof r->rt) && s_eng_rec[j].depth == r->depth) j++;
+                    fprintf(stderr, "[pass] %5u x%-4u kind=%d rt=", i, j - i, (int)r->kind);
+                    for (u32 k = 0; k < r->nrt; k++) fprintf(stderr, "%s%u", k ? "," : "", r->rt[k]);
+                    fprintf(stderr, " depth=%u", r->depth);
+                    if (r->kind == ENG_REC_DRAW) {
+                        fprintf(stderr, " tex=");
+                        for (u32 k = 0; k < RSX_BE_MAX_TEXTURES; k++) if (r->tex[k]) fprintf(stderr, "%u:%u ", k, r->tex[k]);
+                        if (r->pipeline && r->pipeline <= ENG_MAX_PIPES)
+                            fprintf(stderr, " [%s ref=%X sc=%u,%u,%u,%u vp=%.0f,%.0f,%.0f,%.0f n=%u/%u]",
+                                    s_eng_pipe[r->pipeline - 1].desc, r->stencil_ref,
+                                    r->sc[0], r->sc[1], r->sc[2], r->sc[3],
+                                    r->vp[0], r->vp[1], r->vp[2], r->vp[3],
+                                    r->vertex_count, r->index_count);
+                    }
+                    fputc('\n', stderr);
+                    i = j;
+                }
+            }
+        }
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         eng_encode_records(cb, stage);
         if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
@@ -3123,13 +3172,93 @@ static void eng_dump_frame(id<MTLTexture> src)
     free(rgba);
 }
 
+/* PS3RECOMP_METAL_SURF_DUMP=<dir>: every 600th present, write every live
+ * render-target texture (8-bit or half-float colour) as <dir>/f<frame>_h<handle>.ppm.
+ * The presented surface alone says nothing about which pass went wrong. */
+static float eng_half_to_float(uint16_t h)
+{
+    uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023, f;
+    if (e == 0) { float v = m / 1024.0f / 16384.0f; return s ? -v : v; }
+    if (e == 31) f = (s << 31) | 0x7F800000u | (m << 13);
+    else f = (s << 31) | ((e + 112) << 23) | (m << 13);
+    float r; memcpy(&r, &f, 4); return r;
+}
+static void eng_dump_surfaces(void)
+{
+    const char* dir = getenv("PS3RECOMP_METAL_SURF_DUMP");
+    if (!dir || !*dir) return;
+    static unsigned frame;
+    if ((frame++ % 300) != 0) return;
+    if (!s_headless) { id<MTLCommandBuffer> fence = [s_queue commandBuffer]; [fence commit]; [fence waitUntilCompleted]; }
+    for (u32 h = 1; h <= s_eng_obj_count; ++h) {
+        id<MTLTexture> t = s_eng_obj[h - 1];
+        /* PS3RECOMP_METAL_SURF_DUMP_EXTRA=h,h,...: also dump these handles even if
+         * they are plain (sampled) textures. */
+        int extra = 0;
+        { const char* e = getenv("PS3RECOMP_METAL_SURF_DUMP_EXTRA");
+          for (const char* q = e; q && *q; ) { char* end; unsigned long v = strtoul(q, &end, 10);
+              if (end == q) break; if (v == h) extra = 1; q = *end ? end + 1 : end; } }
+        if (!t) { if (extra) fprintf(stderr, "[surf-dump] h%u is empty\n", h); continue; }
+        if (!extra && (!([t usage] & MTLTextureUsageRenderTarget) || [t textureType] != MTLTextureType2D)) {
+            if (h < 32) fprintf(stderr, "[surf-dump] skip h%u usage=%lu type=%lu fmt=%lu %lux%lu samples=%lu\n", h,
+                                (unsigned long)[t usage], (unsigned long)[t textureType], (unsigned long)[t pixelFormat],
+                                (unsigned long)[t width], (unsigned long)[t height], (unsigned long)[t sampleCount]);
+            continue;
+        }
+        MTLPixelFormat pf = [t pixelFormat];
+        size_t w = [t width], hh = [t height], bpp;
+        if (pf == MTLPixelFormatRGBA8Unorm || pf == MTLPixelFormatBGRA8Unorm) bpp = 4;
+        else if (pf == MTLPixelFormatRGBA16Float) bpp = 8;
+        else { fprintf(stderr, "[surf-dump] skip h%u %zux%zu pixelFormat=%lu\n", h, w, hh, (unsigned long)pf); continue; }
+        if (w > 4096 || hh > 4096) continue;
+        unsigned char* px = malloc(w * hh * bpp);
+        if (!px) continue;
+        if ([t storageMode] == MTLStorageModePrivate) {
+            /* GPU-only target: blit into a shared buffer first. */
+            id<MTLBuffer> buf = [s_dev newBufferWithLength:w * hh * bpp options:MTLResourceStorageModeShared];
+            id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+            id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+            [bl copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                     sourceSize:MTLSizeMake(w, hh, 1) toBuffer:buf destinationOffset:0
+            destinationBytesPerRow:w * bpp destinationBytesPerImage:w * hh * bpp];
+            [bl endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            memcpy(px, [buf contents], w * hh * bpp);
+        } else {
+            [t getBytes:px bytesPerRow:w * bpp fromRegion:MTLRegionMake2D(0, 0, w, hh) mipmapLevel:0];
+        }
+        char path[1024]; snprintf(path, sizeof path, "%s/f%u_h%u.ppm", dir, frame, h);
+        FILE* f = fopen(path, "wb");
+        if (f) {
+            fprintf(f, "P6\n%zu %zu\n255\n", w, hh);
+            for (size_t p = 0; p < w * hh; ++p) {
+                unsigned char rgb[3];
+                if (bpp == 4) {
+                    int bgra = pf == MTLPixelFormatBGRA8Unorm;
+                    rgb[0] = px[p*4 + (bgra ? 2 : 0)]; rgb[1] = px[p*4 + 1]; rgb[2] = px[p*4 + (bgra ? 0 : 2)];
+                } else {
+                    const uint16_t* q = (const uint16_t*)(px + p * 8);
+                    for (int c = 0; c < 3; ++c) { float v = eng_half_to_float(q[c]); v = v < 0 ? 0 : v > 1 ? 1 : v; rgb[c] = (unsigned char)(v * 255.0f + 0.5f); }
+                }
+                fwrite(rgb, 1, 3, f);
+            }
+            fclose(f);
+        }
+        free(px);
+    }
+    fprintf(stderr, "[rsx engine/metal] dumped render targets for frame %u to %s\n", frame, dir);
+}
+
 static void eng_present(void* user, u32 surface)
 {
     (void)user;
     id<MTLTexture> src = eng_obj(surface);
     if (!src) { eng_encode_and_commit(nil); return; }
+    const u32 nrec = s_eng_rec_count;
     eng_encode_and_commit(src);
     eng_dump_frame(src);
+    if (nrec > 1000) eng_dump_surfaces();   /* world frames only */
 }
 
 static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
