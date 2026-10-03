@@ -489,7 +489,7 @@ static void pad_poll_file(void)
  * control, no overlaps, and only keys every Mac keyboard has:
  *   left stick W/A/S/D      right stick I/J/K/L     d-pad: arrow keys
  *   CROSS Space  CIRCLE Q   SQUARE E   TRIANGLE R
- *   L1 U  R1 O  L2 Y  R2 P  L3 G  R3 H              START Return  SELECT Tab */
+ *   L1 U  R1 O  L2 Y  R2 P  L3 G  R3 H              START Return/Enter  SELECT Tab */
 volatile uint32_t g_pad_host_keys[4];
 static int pad_key(unsigned vk) { return (g_pad_host_keys[(vk >> 5) & 3] >> (vk & 31)) & 1; }
 static void pad_poll_keys(void)
@@ -502,7 +502,8 @@ static void pad_poll_keys(void)
         {0x20, CELL_PAD_CTRL_L1}, {0x1F, CELL_PAD_CTRL_R1},
         {0x10, CELL_PAD_CTRL_L2}, {0x23, CELL_PAD_CTRL_R2},
         {0x05, CELL_PAD_CTRL_L3}, {0x04, CELL_PAD_CTRL_R3},
-        {0x24, CELL_PAD_CTRL_START}, {0x30, CELL_PAD_CTRL_SELECT},
+        {0x24, CELL_PAD_CTRL_START}, {0x4C, CELL_PAD_CTRL_START},   /* Return, keypad Enter */
+        {0x30, CELL_PAD_CTRL_SELECT},
     };
     u16 btns = 0;
     for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
