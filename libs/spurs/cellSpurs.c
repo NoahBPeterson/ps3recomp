@@ -1701,6 +1701,17 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              * when the workload is selected. */
             const u32 ready_now = *rdy;
             const int signalled = (sig & (0x8000u >> wid)) != 0;
+            /* Real kernel rule (libsre; RPCS3 spursKernel*SelectWorkload): a
+             * workload is dispatched only while readyCount exceeds its
+             * contention, or it has a signal (or flag). Dispatching every
+             * enabled workload regardless kept contention up forever, and
+             * inFamous waits for {readyCount 0, contention 0} after its job
+             * manager drains. SPURS_KERN_DISPATCH_ENABLED=1 restores the old
+             * enabled-means-runnable rule (a title that never stores a ready
+             * count -- see the comment above). */
+            { static int s_legacy = -1;
+              if (s_legacy < 0) s_legacy = getenv("SPURS_KERN_DISPATCH_ENABLED") ? 1 : 0;
+              if (!s_legacy && ready_now == 0 && !signalled) continue; }
             if (sig & (0x8000u >> wid))
                 vm_write32(ea + SPURS_WKL_SIGNAL1,
                            (vm_read32(ea + SPURS_WKL_SIGNAL1) & ~((0x8000u >> wid) << 16)));
@@ -3060,8 +3071,8 @@ s32 cellSpursSetExceptionEventHandler(u64 spurs_ea, u64 handler_ea, u64 arg_ea)
 
 s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
 {
-    static int _n = 0;
-    if (_n++ < 8) printf("[cellSpurs] GetWorkloadInfo(wid=%u info=0x%08X)\n", wid, (u32)info_ea);
+    static unsigned _n = 0;   /* unsigned: games poll this billions of times */
+    if (_n < 8) { _n++; printf("[cellSpurs] GetWorkloadInfo(wid=%u info=0x%08X)\n", wid, (u32)info_ea); }
 
     if (!spurs_ea || !info_ea)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
