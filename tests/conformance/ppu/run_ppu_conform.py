@@ -64,7 +64,7 @@ def oracle_config(work):
     return out
 
 
-def run_oracle(rpcs3, elf, work, timeout):
+def run_oracle(rpcs3, elf, work, timeout, marker=b"PPUCONF END"):
     tty = os.path.join(RPCS3_CACHE, "TTY.log")
     cfg = oracle_config(work)
     p = subprocess.Popen([rpcs3, "--headless", "--config", cfg, elf],
@@ -78,7 +78,7 @@ def run_oracle(rpcs3, elf, work, timeout):
         try:
             with open(tty, "rb") as f:
                 f.seek(max(0, os.path.getsize(tty) - 64))
-                if b"PPUCONF END" in f.read():
+                if marker in f.read():
                     break
         except OSError:
             pass
