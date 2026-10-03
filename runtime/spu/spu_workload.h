@@ -101,6 +101,14 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
  * writes the entry vaddr (e_entry, which may legitimately be 0) to *entry_out;
  * returns 0 if `image` is not a valid SPU ELF or a segment is out of range.
  * `ls` must point to SPU_LS_SIZE bytes (caller-zeroed if a clean BSS is wanted). */
+/* Start SPURS task `taskid` of the taskset at taskset_ea: the lifted image if
+ * one is registered (spu_workload_dispatch_async), else the interpreter with
+ * the taskset task ABI. Returns 1 when started. */
+int spu_task_dispatch(uint32_t taskset_ea, uint32_t taskid, const uint8_t* image,
+                      uint32_t image_size, uint32_t context_ea);
+int spu_task_dispatch_interp(uint32_t taskset_ea, uint32_t taskid,
+                             const uint8_t* image, uint32_t image_size);
+
 int spu_elf_load_to_ls(const uint8_t* image, size_t image_size, uint8_t* ls,
                        uint32_t* entry_out);
 

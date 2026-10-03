@@ -63,6 +63,13 @@ is Sony's SPURS kernel; ps3recomp answers with its HLE `libs/spurs`.
   finalizes. Every return code is printed, with the module's entry r4
   (workload data) and r5 (poll status).
 
+- **taskset**: four SPU tasks (ELF at LS 0x3000) each add {index + 1, 1} to a
+  shared line atomically and exit through the taskset syscall (LS 0x27C4,
+  r3 = 0). The PPU waits for all four (a shutdown request discards tasks that
+  have not started), shuts the taskset down and joins it.
+
+ps3recomp runs unlifted policy modules and tasks on its SPU interpreter.
+
 ```
 python3 tests/conformance/mc/run_mc_conform.py --suite spurs --work /tmp/spursconf
 ```
