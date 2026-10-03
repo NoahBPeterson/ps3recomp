@@ -3228,6 +3228,16 @@ extern "C" void lv2_syscall(ppu_context* ctx)
               char cur[128]; uint32_t cn = wlen;
               for (uint32_t i = 0; i < cn; i++) cur[i] = (char)vm_read8(buf + i);
               cur[cn] = 0;
+              /* PS3_TTY_BT=<text>: the first time a line containing it is
+               * written, print the host stack (= the guest call chain) and
+               * the writer's registers. */
+              { static const char* bt = (const char*)-1; static int done;
+                if (bt == (const char*)-1) bt = getenv("PS3_TTY_BT");
+                if (bt && !done && strstr(cur, bt)) {
+                    done = 1;
+                    void* fr[32]; int n = backtrace(fr, 32); backtrace_symbols_fd(fr, n, 2);
+                    ppu_dump_guest_stack(ctx, "tty");
+                } }
               if (run_len && strcmp(cur, last) == 0) {
                   run_len++;
                   if (run_len > 4 && (run_len % 1000ull) != 0) {
