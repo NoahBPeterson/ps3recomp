@@ -837,11 +837,14 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
     }
     fprintf(stderr, "[SPU-INTERP] tid=0x%X entry=0x%05X img=0x%08X args=0x%08X -> interpreting\n",
             tid, entry, t->img_ea, args_ea);
-    int32_t sc = spu_run_interp_job(ls, entry, args_ea, -1,  /* pure interp: no fast-path rejoin */
+    int32_t sc = spu_run_interp_job(ls, entry, t->args, -1,  /* pure interp: no fast-path rejoin */
                                     t->tid, t->group_id, 0); /* identify for mbox->event delivery */
     { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
       fprintf(stderr, "[SPU-INTERP] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
               tid, sc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }
+    { extern SPU_THREAD_LOCAL int g_spu_interp_exit_valid;
+      extern SPU_THREAD_LOCAL int32_t g_spu_interp_exit_status;
+      if (g_spu_interp_exit_valid) return g_spu_interp_exit_status; }
     return sc;
 }
 
@@ -914,7 +917,7 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
          * worker's spu_printf helper treats a non-empty inbox as EBUSY. The
          * work descriptor reaches the SPU through that service instead. */
         LARGE_INTEGER _t0, _t1, _fq; QueryPerformanceCounter(&_t0);
-        int32_t frc = spu_run_interp_job(ls, entry, t->args_ea, -1, t->tid, t->group_id,
+        int32_t frc = spu_run_interp_job(ls, entry, t->args, -1, t->tid, t->group_id,
                                          getenv("RD_SPU_FRAME_MBOX") ? work_ea : 0u);
         { static int _sp = -1; if (_sp < 0) _sp = getenv("SPU_SPEED") ? 1 : 0;
           if (_sp) { QueryPerformanceCounter(&_t1); QueryPerformanceFrequency(&_fq);
@@ -1167,7 +1170,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
          * flag for the same reason.
          *
          * Bounded, so a worker that dies during init cannot hang group_start. */
-        if (fb == spu_registry_fallback) {
+        if (fb == spu_registry_fallback || fb == spu_interp_fallback) {
             for (int spin = 0; spin < 2000 && !t->live_ctx && t->running; spin++)
 #ifdef _WIN32
                 Sleep(1);
@@ -2409,15 +2412,16 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005;
         return -1;
     }
-    if (t->sctx) {
-        spu_channel* ch = &t->sctx->ch_sig_notify[num];
+    spu_context* sc = t->live_ctx ? (spu_context*)t->live_ctx : t->sctx;
+    if (sc) {
+        spu_channel* ch = &sc->ch_sig_notify[num];
         int or_mode = (t->spu_cfg >> num) & 1;
         if (or_mode && ch->count)
             ch->value |= val;
         else
             spu_channel_write(ch, val);
         extern void spu_ch_wake(spu_context*);
-        spu_ch_wake(t->sctx);
+        spu_ch_wake(sc);
         { static int n = 0; if (n < 12) { n++;
             fprintf(stderr, "[SPU] write_snr tid=0x%X snr%u <- 0x%08X (%s)\n",
                     tid, num + 1, val, or_mode ? "OR" : "overwrite");
