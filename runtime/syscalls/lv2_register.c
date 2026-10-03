@@ -1177,7 +1177,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
 #else
                 { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
 #endif
-            if (!t->live_ctx)
+            if (!t->live_ctx && t->running)
                 fprintf(stderr, "[SPU] group_start tid=0x%X: worker never published "
                         "a context -- mailbox writes will fall back to re-runs\n",
                         t->tid);
