@@ -503,6 +503,37 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
+ * _sys_ppu_thread_create (syscall 52) / sys_ppu_thread_start (syscall 53)
+ *
+ * The raw lv2 ABI: r3 = &tid (u64), r4 = &{u32 entry OPD, u32 tls}, r5 = arg,
+ * r6 = unk, r7 = prio, r8 = stack size, r9 = flags, r10 = name. Translated to
+ * the sys_ppu_thread_create argument order above.
+ * ponytail: the thread starts here, not at syscall 53 (a no-op); liblv2 always
+ * calls start right after create, so only code that inspects a created but
+ * unstarted thread can tell.
+ * -----------------------------------------------------------------------*/
+static int64_t sys_ppu_thread_create_raw(ppu_context* ctx)
+{
+    uint32_t param = LV2_ARG_PTR(ctx, 1);
+    if (!param) return (int64_t)(int32_t)CELL_EFAULT;
+    const uint8_t* p = (const uint8_t*)vm_to_host(param);
+    uint32_t entry = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+    if (!entry) return (int64_t)(int32_t)CELL_EFAULT;
+    uint64_t r[7] = { ctx->gpr[3], entry, ctx->gpr[5], ctx->gpr[7], ctx->gpr[8], ctx->gpr[9], ctx->gpr[10] };
+    uint64_t save[7];
+    for (int i = 0; i < 7; i++) { save[i] = ctx->gpr[3 + i]; ctx->gpr[3 + i] = r[i]; }
+    int64_t rc = sys_ppu_thread_create(ctx);
+    for (int i = 1; i < 7; i++) ctx->gpr[3 + i] = save[i];
+    return rc;
+}
+
+static int64_t sys_ppu_thread_start(ppu_context* ctx)
+{
+    (void)ctx;
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
  * sys_ppu_thread_exit
  *
  * r3 = exit status
@@ -1340,7 +1371,8 @@ void sys_ppu_thread_init(lv2_syscall_table* tbl)
     }
 #endif
 
-    lv2_syscall_register(tbl, SYS_PPU_THREAD_CREATE,              sys_ppu_thread_create);
+    lv2_syscall_register(tbl, SYS_PPU_THREAD_CREATE,              sys_ppu_thread_create_raw);
+    lv2_syscall_register(tbl, SYS_PPU_THREAD_START,               sys_ppu_thread_start);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_EXIT,                sys_ppu_thread_exit);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_YIELD,               sys_ppu_thread_yield);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_JOIN,                sys_ppu_thread_join);

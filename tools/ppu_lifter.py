@@ -299,10 +299,57 @@ static inline double ppu_fp_single(double r)
 {
     return (double)(float)r;
 }
+/* frsp of a NaN (Book I 4.6.6): FRB[0:34] quieted, then 29 zero bits -- the
+ * payload truncated to the single fraction. Explicit, not host conversion. */
 static inline double ppu_frsp(double b)
 {
-    if (b != b) return ppu_fp_quiet(b);
+    if (b != b) {
+        double q = ppu_fp_quiet(b);
+        uint64_t u; memcpy(&u, &q, 8);
+        u &= ~((1ull << 29) - 1);
+        memcpy(&q, &u, 8);
+        return q;
+    }
     return (double)(float)b;
+}
+/* FPSCR (Book I 4.2.2), big-endian bit n = 1u << (31 - n). FEX (1) and VX (2)
+ * are summaries and never written directly: VX = OR of the VX* bits (7-12,
+ * 21-23), FEX = OR of each exception bit ANDed with its enable (VX/VE, OX/OE,
+ * UX/UE, ZX/ZE, XX/XE). FP arithmetic does not update FPSCR status yet; the
+ * move instructions below are exact. */
+static inline uint32_t ppu_fpscr_sum(uint32_t f)
+{
+    f &= ~0x60000000u;
+    if (f & 0x01F80700u) f |= 0x20000000u;
+    if ((f >> 22) & f & 0xF8u) f |= 0x40000000u;
+    return f;
+}
+static inline void ppu_mtfsb(ppu_context* ctx, int bt, int set)
+{
+    uint32_t m = 0x80000000u >> bt;
+    if (bt == 1 || bt == 2) return;
+    if (set) {
+        /* An exception bit going 0 -> 1 also sets FX (mtfsb1 is not among
+         * the instructions exempt from that rule: mtfsf, mtfsfi). */
+        if (!(ctx->fpscr & m) && (m & 0x1FF80700u)) ctx->fpscr |= 0x80000000u;
+        ctx->fpscr |= m;
+    } else {
+        ctx->fpscr &= ~m;
+    }
+    ctx->fpscr = ppu_fpscr_sum(ctx->fpscr);
+}
+static inline void ppu_mtfsf(ppu_context* ctx, uint32_t flm, uint32_t v)
+{
+    uint32_t m = 0;
+    for (int i = 0; i < 8; i++) if (flm & (0x80u >> i)) m |= 0xF0000000u >> (4 * i);
+    ctx->fpscr = ppu_fpscr_sum((ctx->fpscr & ~m) | (v & m));
+}
+static inline uint32_t ppu_mcrfs(ppu_context* ctx, int bfa)
+{
+    uint32_t sh = 28 - 4 * bfa, field = (ctx->fpscr >> sh) & 0xF;
+    /* The exception bits copied are cleared (FX OX UX ZX XX VX*). */
+    ctx->fpscr = ppu_fpscr_sum(ctx->fpscr & ~(0x9FF80700u & (0xFu << sh)));
+    return field;
 }
 
 /* AltiVec register byte order: ctx->vr holds RAW big-endian guest bytes (lvx is
@@ -1192,6 +1239,11 @@ class PPULifter:
                          f"uint32_t _c = (_r < 0) ? 8u : (_r > 0) ? 4u : 2u; "
                          f"_c |= (uint32_t)((ctx->xer >> 31) & 1u); "
                          f"ctx->cr = (ctx->cr & 0x0FFFFFFFu) | (_c << 28); }}")
+        # FP record forms: CR1 = FPSCR[FX FEX VX OX] after the op.
+        raw = insn.raw
+        if (raw is not None and (raw >> 26) in (59, 63) and raw & 1
+                and code and not code.startswith("/*")):
+            code += " ctx->cr = (ctx->cr & ~0x0F000000u) | ((ctx->fpscr >> 4) & 0x0F000000u);"
         return code
 
     def _translate_op(self, insn: Instruction, func: LiftedFunction) -> str:
@@ -2047,7 +2099,7 @@ class PPULifter:
             helper = fp_binary[mn_base]
             expr = f"{helper}(ctx->fpr[{fra}], ctx->fpr[{frb}])"
             # Book I 4.6.5: the single forms round the result to single
-            # precision (NaNs keep the double payload -- ppu_fp_single).
+            # precision (NaN payloads truncate to the single fraction).
             if mn_base.endswith("s"):
                 expr = f"ppu_fp_single({expr})"
             return f"ctx->fpr[{frd}] = {expr};"
@@ -2093,7 +2145,6 @@ class PPULifter:
         if mn_base in ("frsp",):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
-            # NaN: quiet and keep the FULL double payload (no single rounding).
             return f"ctx->fpr[{frd}] = ppu_frsp(ctx->fpr[{frb}]);"
 
         # Book I 4.6.7 float->int: SATURATE (>max => max, <min => min,
@@ -2314,23 +2365,25 @@ class PPULifter:
             me = int(ops[4])
             return f"ctx->gpr[{ra}] = ppc_rlw64(ctx->gpr[{rs}], (int)(ctx->gpr[{rb}] & 31), {mb}, {me}, 0, 0);"
 
-        # mffs — move from FPSCR
-        if mn == "mffs" or mn == "mffs.":
+        # FPSCR moves (Book I 4.6.10). Record forms set CR1 in _translate.
+        if mn.rstrip(".") == "mffs":
             frd = _reg_idx(ops[0])
             return f"{{ uint64_t fpscr64 = ctx->fpscr; memcpy(&ctx->fpr[{frd}], &fpscr64, 8); }}"
-
-        # mtfsf — move to FPSCR fields
-        # mtfsb0/mtfsb1 clear/set a single FPSCR bit; mtfsfi sets a 4-bit field.
-        # Those bits are the rounding mode, the exception enables and the sticky
-        # exception flags. We model none of them -- the same reason mtfsf below is
-        # ignored -- so there is nothing for these to change. They were reaching
-        # the unhandled catch-all and being emitted as "/* TODO */", which reads
-        # as a lifter gap rather than a deliberate omission.
-        if mn.rstrip(".") in ("mtfsb0", "mtfsb1", "mtfsfi"):
-            return f"/* {mn} {insn.operands}: FPSCR unmodeled */;"
-
-        if mn == "mtfsf":
-            return f"/* mtfsf: FPSCR update — ignored for now */;"
+        raw = insn.raw
+        if mn.rstrip(".") in ("mtfsb0", "mtfsb1") and raw is not None:
+            return f"ppu_mtfsb(ctx, {(raw >> 21) & 31}, {1 if mn.startswith('mtfsb1') else 0});"
+        if mn.rstrip(".") == "mtfsfi" and raw is not None:
+            bf, u = (raw >> 23) & 7, (raw >> 12) & 0xF
+            return f"ppu_mtfsf(ctx, 0x{0x80 >> bf:02X}u, 0x{(u << (28 - 4 * bf)) & 0xFFFFFFFF:08X}u);"
+        if mn.rstrip(".") == "mtfsf" and raw is not None:
+            flm, frb = (raw >> 17) & 0xFF, (raw >> 11) & 31
+            return (f"{{ uint64_t _v; memcpy(&_v, &ctx->fpr[{frb}], 8); "
+                    f"ppu_mtfsf(ctx, 0x{flm:02X}u, (uint32_t)_v); }}")
+        if mn == "mcrfs" and raw is not None:
+            bf, bfa = (raw >> 23) & 7, (raw >> 18) & 7
+            sh = 28 - 4 * bf
+            return (f"{{ uint32_t _f = ppu_mcrfs(ctx, {bfa}); "
+                    f"ctx->cr = (ctx->cr & ~(0xFu << {sh})) | (_f << {sh}); }}")
 
         # ------- Store/load with update indexed -------
         if mn == "stdux":

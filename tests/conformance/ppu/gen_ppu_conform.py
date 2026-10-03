@@ -78,11 +78,22 @@ class Asm:
         self.fix.append((len(self.w), name, "bc", 0))
         self.w.append(0)
 
+    def b(self, name):
+        self.fix.append((len(self.w), name, "b", 0))
+        self.w.append(0)
+
+    def bc(self, name, bo, bi):
+        """Conditional branch to a label: beq = (12, 2), bne = (4, 2) on CR0."""
+        self.fix.append((len(self.w), name, (bo, bi), 0))
+        self.w.append(0)
+
     def resolve(self):
         for i, name, kind, lk in self.fix:
             off = self.labels[name] - (self.base + 4 * i)
             if kind == "b":
                 self.w[i] = A.b(off, lk)
+            elif isinstance(kind, tuple):
+                self.w[i] = (16 << 26) | (kind[0] << 21) | (kind[1] << 16) | (off & 0xFFFC)
             else:  # bdnz: BO=16, BI=0
                 self.w[i] = (16 << 26) | (16 << 21) | (off & 0xFFFC)
 
