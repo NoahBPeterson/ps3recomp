@@ -341,7 +341,7 @@ static Ref ref_exec(int op, uint32_t insn, uint32_t pc, const u128* regs, const 
 
 
 /* ---- runtime stubs the lifter's emitted code references (lifted mode) ---- */
-SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+/* g_spu_trampoline_fn is a spu_context field now (spu_context.h). */
 static uint32_t g_lc_target; static int g_lc_called;
 void spu_indirect_branch(spu_context* c) { g_lc_called = 1; g_lc_target = c->pc & 0x3FFFC; }
 void spu_stop(spu_context* c) { (void)c; }
