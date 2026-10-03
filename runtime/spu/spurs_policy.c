@@ -135,16 +135,27 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * selectWorkload -- so it called our exit intercept for every poll and
      * branched to 0 for every select. It also tests wklCurrentId (0x1DC) against
      * 1, which only reads sensibly at the correct offset. */
+    /* Values as firmware libsre's kernel leaves them (t_workload reads them
+     * back from a policy module): the module's main-memory EA, tag 31, the
+     * workload's uniqueId, and the mask of runnable workloads. */
+    extern uint8_t* vm_base;
+    const uint32_t pm_ea = (uint32_t)((const uint8_t*)pm_host - vm_base);
+    const uint8_t* inst = vm_base + spurs_ea;
+    uint32_t runnable = 0;
+    for (uint32_t w = 0; w < 16; w++)
+        if (inst[0x80 + w] == 2) runnable |= 0x8000u >> w;     /* wklState1 RUNNABLE */
     KBE32(0x1C0, 0);                    /* spurs EA hi32 (u64 ptr)  */
     KBE32(0x1C4, spurs_ea);             /* spurs EA lo32            */
     KBE32(0x1C8, spu_num);              /* spuNum (virtual SPU / lane row) */
-    KBE32(0x1CC, 8);                    /* dmaTagId (kernel's tag)  */
+    KBE32(0x1CC, 31);                   /* dmaTagId (the kernel's tag) */
     KBE32(0x1D0, 0);                    /* wklCurrentAddr hi32 (u64 ptr) */
-    KBE32(0x1D4, 0xA00);                /* wklCurrentAddr lo32 = PM load base */
-    KBE32(0x1D8, wid);                  /* wklCurrentUniqueId       */
+    KBE32(0x1D4, pm_ea);                /* wklCurrentAddr lo32: the module in main memory */
+    KBE32(0x1D8, inst[0xB00 + 0x20 * wid + 0x14]);   /* wklCurrentUniqueId */
     KBE32(0x1DC, wid);                  /* wklCurrentId             */
     KBE32(0x1E0, SPURS_PM_EXIT_TO_KERNEL_LS);
     KBE32(0x1E4, SPURS_PM_SELECT_WORKLOAD_LS);
+    KBE32(0x1E8, 0x00000100);           /* moduleId {0,0}, sysSrvInitialised 1, spuIdling 0 */
+    KBE32(0x1EC, runnable << 16);       /* wklRunnable1, wklRunnable2 */
 #undef KBE32
 
     /* Entry registers per cellSpursModuleEntry. */
@@ -170,8 +181,9 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * 32-bit EA reads it with `rotqbyi 4`. */
     ctx->gpr[4]._u32[0] = (uint32_t)(wkl_data >> 32);
     ctx->gpr[4]._u32[1] = (uint32_t)wkl_data;
+    /* ...and the module's EA as the second doubleword (libsre). */
     ctx->gpr[4]._u32[2] = 0;
-    ctx->gpr[4]._u32[3] = 0;
+    ctx->gpr[4]._u32[3] = pm_ea;
     /* Poll status: READYCOUNT (1) when readyCount exceeded the contention the
      * workload had when this SPU picked it, SIGNAL (2), FLAG (4). */
     ctx->gpr[5]._u32[0] = poll_status;
@@ -284,10 +296,10 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
          * returns, as the lifted intercept in spu_indirect_branch does. */
         extern uint32_t spu_interp_run(spu_context*, uint32_t);
         static const uint8_t k_svc[12] = {
-            0x00, 0x00, 0x03, 0xE1,               /* 0x9C0: stop 0x3E1        */
+            0x00, 0x00, 0x03, 0xE1,               /* exitToKernel: stop 0x3E1 */
             0, 0, 0, 0, 0, 0, 0, 0 };
         static const uint8_t k_sel[8] = {
-            0x40, 0x80, 0x00, 0x03,               /* 0x9D0: il  $3, 0         */
+            0x40, 0x80, 0x00, 0x03,               /* selectWorkload: il $3, 0 */
             0x35, 0x00, 0x00, 0x00 };             /*        bi  $0            */
         memcpy(ctx->ls + SPURS_PM_EXIT_TO_KERNEL_LS, k_svc, 4);
         memcpy(ctx->ls + SPURS_PM_SELECT_WORKLOAD_LS, k_sel, sizeof k_sel);
@@ -544,7 +556,7 @@ int spurs_run_taskset_policy_probe(uint32_t taskset_ea, uint32_t taskid,
         ls[(off)+1] = (uint8_t)(_v >> 16); ls[(off)+2] = (uint8_t)(_v >> 8);   \
         ls[(off)+3] = (uint8_t)_v; } while (0)
     KBE32(0x1C0, 0);                    KBE32(0x1C4, spurs_ea);
-    KBE32(0x1C8, 0);                    KBE32(0x1CC, 8);
+    KBE32(0x1C8, 0);                    KBE32(0x1CC, 31);
     KBE32(0x1D0, 0);                    KBE32(0x1D4, 0xA00);
     KBE32(0x1D8, wid);                  KBE32(0x1DC, wid);
     KBE32(0x1E0, SPURS_PM_EXIT_TO_KERNEL_LS);

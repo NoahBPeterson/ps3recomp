@@ -188,20 +188,47 @@ class Test:
         assert self.res_off <= 0x10000
 
     # ---- control ------------------------------------------------------------
-    def wait_word(self, addr, value, tries=5000, usec=1000, mask=None):
-        """Poll the guest word at addr until it equals value (bounded)."""
+    def wait_word(self, addr, value, tries=5000, usec=1000, mask=None, cond="eq"):
+        """Poll the guest word at addr until it is `cond` value (bounded):
+        eq, ne, or geu (unsigned >=)."""
         tag = self.uniq("wait")
         self.emit(P.li32(20, tries))
         self.t.label(tag + "_poll")
         self.emit(P.li32(9, addr), P.lwz(9, 9, 0))
         if mask is not None:
             self.emit(P.li32(10, mask), P.X(31, 9, 9, 10, 28))   # and r9,r9,r10
-        self.emit(P.li32(10, value), P.X(31, 0, 9, 10, 0))       # cmpw r9,r10
-        self.t.bc(tag + "_done", 12, 2)
+        self.emit(P.li32(10, value), P.X(31, 0, 9, 10, 32 if cond == "geu" else 0))  # cmplw / cmpw
+        bo, bi = {"eq": (12, 2), "ne": (4, 2), "geu": (4, 0)}[cond]
+        self.t.bc(tag + "_done", bo, bi)
         self.syscall(SYS["usleep"], usec)
         self.emit(P.addi(20, 20, -1), P.D(11, 0, 20, 0))
         self.t.bc(tag + "_poll", 4, 2)
         self.t.label(tag + "_done")
+
+    def store_word(self, addr, value):
+        self.load(11, value)
+        self.emit(P.li32(12, addr), P.stw(11, 12, 0))
+
+    def record_nonzero(self, label, addr):
+        """Record 1 if the guest word at addr is nonzero, else 0 (for counters
+        whose exact value depends on timing)."""
+        self.emit(P.li32(9, addr), P.lwz(9, 9, 0),
+                  P.X(31, 9, 9, 0, 26),                                  # cntlzw r9,r9
+                  21 << 26 | 9 << 21 | 9 << 16 | 27 << 11 | 5 << 6 | 31 << 1,  # srwi r9,r9,5
+                  P.D(26, 9, 9, 1))                                      # xori r9,r9,1
+        self.record_reg(9, label)
+
+    def func(self, name, emit_fn):
+        """Define an ordinary PPU function `name` (callable through its OPD at
+        T.opd_of(name), e.g. as a hook); emit_fn(T) emits its body. Returns 0."""
+        if name not in self.funcs:
+            self.funcs.append(name)
+        self.threads.append((name, emit_fn, "func"))
+
+    def opd_of(self, name):
+        if name not in self.funcs:
+            self.funcs.append(name)
+        return self["opd"] + 8 * self.funcs.index(name)
 
     def sleep_us(self, usec):
         self.syscall(SYS["usleep"], usec)
@@ -211,7 +238,7 @@ class Test:
         call imports; r1 is its own stack). The thread exits with r3 = 0."""
         if name not in self.funcs:
             self.funcs.append(name)
-        self.threads.append((name, emit_fn))
+        self.threads.append((name, emit_fn, "thread"))
 
     def start_thread(self, name, arg, tid_addr, prio=1000):
         self.emit(P.li32(5, self["tparam"]), P.li32(6, self["opd"] + 8 * self.funcs.index(name)),
@@ -318,8 +345,13 @@ def build(test_mod, out_path):
         t.bl("puts")
         T.emit(P.addi(3, 0, 0), P.addi(11, 0, SYS["process_exit"]), P.sc(), P.b(0))
         emit_routines(t, T.D)
-        for name, fn in T.threads:
+        for name, fn, kind in T.threads:
             t.label(name)
+            if kind == "func":
+                T.emit(P.mfspr(0, 8), P.std(0, 1, 16), P.stdu(1, 1, -256), P.std(2, 1, 40))
+                fn(T)
+                T.emit(P.addi(1, 1, 256), P.ld(0, 1, 16), P.mtspr(8, 0), P.addi(3, 0, 0), P.blr())
+                continue
             T.emit(P.stdu(1, 1, -256))
             fn(T)
             T.emit(P.addi(3, 0, 0), P.addi(11, 0, SYS["thread_exit"]), P.sc(), P.b(0))
