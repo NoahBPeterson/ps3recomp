@@ -18,6 +18,18 @@ side creates thread groups from three SPU images assembled by `spu_asm.py`:
   in SPU_WrOutMbox, then `stop 0x102`).
 - **mbox**: the PPU writes four inbound-mailbox words and both signal
   notification registers; the SPU sums them and exits with the sum.
+- **event**: the SPU sends four `sys_spu_thread_send_event` events (each
+  answered in its inbound mailbox) and one `throw_event` to a PPU event queue;
+  the PPU prints each event as `sys_event_queue_receive` returns it in r4..r7
+  (the SPU thread id relative to the real one, since ids differ).
+- **PPU threads + sync**: four threads increment a counter under a
+  `sys_mutex`, yielding inside the critical section, then post a semaphore;
+  a `sys_cond` ping-pong with a worker writes an alternating log; an event
+  flag AND-wait with clear wakes only once both bits are set. Raw syscalls 52
+  / 53 create and start the threads; they exit through syscall 41.
+- **mfc2**: atomic status after GETLLAR (4), PUTLLC held (0), PUTLLC with no
+  reservation (1), PUTLLUC (2); immediate tag status; a GETL whose middle
+  element has stall-and-notify (RdListStallStat, WrListStallAck).
 
 The transcript also carries every join cause/status and per-thread exit status.
 The runner requires the MCCONF BEGIN..END blocks to be identical.

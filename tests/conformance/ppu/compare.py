@@ -9,6 +9,7 @@ buffer) after each memory case, then "PPUCONF END".
 """
 import argparse
 import json
+import math
 import struct
 import sys
 from collections import OrderedDict, defaultdict
@@ -81,6 +82,75 @@ def isa_nan(c, field):
     return None
 
 
+def isa_fnm_zero(c):
+    """fnmsub/fnmadd (double) result under round-to-nearest, as raw bits:
+    -(A*C - B) and -(A*C + B), negated AFTER rounding (Book I 4.6.5.2)."""
+    w = c["words"][0] if c["words"] else 0
+    if w >> 26 != 63 or (w >> 1) & 31 not in (30, 31):
+        return None
+    inp = bytes.fromhex(c["input"])
+    reg = lambda r: struct.unpack(">d", inp[0x100 + 8 * r:0x108 + 8 * r])[0]
+    a, b, cc = reg((w >> 16) & 31), reg((w >> 11) & 31), reg((w >> 6) & 31)
+    r = -math.fma(a, cc, -b if (w >> 1) & 31 == 30 else b)
+    return struct.unpack(">Q", struct.pack(">d", r))[0]
+
+
+def _fpscr_sum(f):
+    f &= ~0x60000000
+    if f & 0x01F80700:
+        f |= 0x20000000
+    if (f >> 22) & f & 0xF8:
+        f |= 0x40000000
+    return f
+
+
+def fpscr_reference(c):
+    """Independent PowerISA reference (Book I 4.2.2, 4.6.10) for the FPSCR
+    instructions, which RPCS3 does not model. Returns {field: expected bytes}
+    for the fields they define, or None for any other op."""
+    w = c["words"][0] if c["words"] else 0
+    if w >> 26 != 63:
+        return None
+    xo = (w >> 1) & 0x3FF
+    if xo not in (583, 711, 134, 70, 38, 64):
+        return None
+    inp = bytes.fromhex(c["input"])
+    cr = struct.unpack(">I", inp[0x400:0x404])[0]
+    f = _fpscr_sum(struct.unpack(">Q", inp[0x420:0x428])[0] & 0xFFFFFFFF)  # as the harness's mtfsf loads it
+    out = {}
+    if xo == 583:                                             # mffs
+        out["f%d" % ((w >> 21) & 31)] = struct.pack(">Q", f)
+    elif xo == 711:                                           # mtfsf
+        flm, v = (w >> 17) & 0xFF, struct.unpack(">Q", inp[0x100 + 8 * ((w >> 11) & 31):0x108 + 8 * ((w >> 11) & 31)])[0]
+        m = sum(0xF0000000 >> (4 * i) for i in range(8) if flm & (0x80 >> i))
+        f = _fpscr_sum((f & ~m) | (v & m))
+    elif xo == 134:                                           # mtfsfi
+        bf, u = (w >> 23) & 7, (w >> 12) & 0xF
+        m = 0xF0000000 >> (4 * bf)
+        f = _fpscr_sum((f & ~m) | ((u << (28 - 4 * bf)) & m))
+    elif xo in (70, 38):                                      # mtfsb0 / mtfsb1
+        bt = (w >> 21) & 31
+        m = 0x80000000 >> bt
+        if bt not in (1, 2):
+            if xo == 38:
+                if not f & m and m & 0x1FF80700:
+                    f |= 0x80000000                          # exception bit 0 -> 1 sets FX
+                f |= m
+            else:
+                f &= ~m
+            f = _fpscr_sum(f)
+    else:                                                     # mcrfs
+        bf, bfa = (w >> 23) & 7, (w >> 18) & 7
+        field = (f >> (28 - 4 * bfa)) & 0xF
+        f = _fpscr_sum(f & ~(0x9FF80700 & (0xF << (28 - 4 * bfa))))
+        cr = (cr & ~(0xF << (28 - 4 * bf))) | (field << (28 - 4 * bf))
+    if w & 1:                                                 # record: CR1 = FX FEX VX OX
+        cr = (cr & ~0x0F000000) | ((f >> 4) & 0x0F000000)
+    out["fpscr"] = struct.pack(">Q", f)
+    out["cr"] = struct.pack(">I", cr)
+    return out
+
+
 def allowed(c, diffs):
     """Known, documented oracle deviations (README: 'Known oracle limitations').
     Returns (remaining diffs, reasons)."""
@@ -101,14 +171,37 @@ def allowed(c, diffs):
             exp = isa_nan(c, name)
             if exp is not None and vu == exp and vo != vu:
                 why.append("NaN operand priority (RPCS3 follows the host)"); continue
+            # fnmsub/fnmadd: an exact-zero A*C -/+ B is negated after rounding,
+            # so +0 becomes -0. RPCS3's compiled interpreter returns B - A*C
+            # (+0) despite its source. Accept ours iff it is the ISA's zero.
+            if op in ("FNMSUB", "FNMADD") and (vo | vu) & ~(1 << 63) == 0 and vu == isa_fnm_zero(c):
+                why.append("fnmsub/fnmadd zero sign (RPCS3 folds the negation)"); continue
             # fres/frsqrte are estimates. PowerISA bounds them: fres within 1/256,
             # frsqrte within 1/32 of the exact value. RPCS3 reproduces the PPE's
             # tables; ps3recomp computes exactly. Accept anything within the bound.
             if op in ESTIMATES:
                 fo, fu = _dbl(o), _dbl(u)
-                tol = 2.0 ** -8 if op == "FRES" else 2.0 ** -5
+                tol = (2.0 ** -8 if op == "FRES" else 2.0 ** -5) + 2.0 ** -23  # bound + one single ulp
                 if fo == fu or (fo == fo and fu == fu and abs(fo - fu) <= abs(fu) * tol):
                     why.append("fres/frsqrte within the ISA estimate bound"); continue
+                # RPCS3's PPE table model flushes at the denormal edges: fres
+                # results below single range become 0, frsqrte of a denormal
+                # input is treated as +-0 (-> +-inf). The ISA does neither.
+                # Accept ours iff it is the ISA's value for that input.
+                if fo in (0.0, float("inf"), float("-inf")):
+                    w = c["words"][0]
+                    inp = bytes.fromhex(c["input"])
+                    rb = (w >> 11) & 31
+                    vb = struct.unpack(">Q", inp[0x100 + 8 * rb:0x108 + 8 * rb])[0]
+                    fb = struct.unpack(">d", inp[0x100 + 8 * rb:0x108 + 8 * rb])[0]
+                    if op == "FRSQRTE" and (vb >> 52) & 0x7FF == 0 and vb & ((1 << 52) - 1):
+                        exp = float("nan") if fb < 0 else 1 / math.sqrt(fb)
+                        if (fu != fu and exp != exp) or (fu == fu and abs(fu - exp) <= abs(exp) * tol):
+                            why.append("fres/frsqrte denormal edge (RPCS3 PPE model flushes)"); continue
+                    if op == "FRES" and fu != 0 and abs(fu) < 2.0 ** -126:
+                        exp = struct.unpack("f", struct.pack("f", 1 / fb))[0]
+                        if abs(fu - exp) <= abs(exp) * tol + 2.0 ** -149:
+                            why.append("fres/frsqrte denormal edge (RPCS3 PPE model flushes)"); continue
         if name == "cr" and c["op"].startswith("F") and c["op"].endswith("."):
             # FP record forms set CR1 = FPSCR[FX FEX VX OX]; RPCS3 writes FPCC
             # there and does not model FPSCR. Pending an FPSCR reference: mask CR1.
@@ -143,10 +236,16 @@ def main():
             continue
         diffs = []
         mask = c.get("mask", {})
+        ref = fpscr_reference(c)
         for name, off, n in FIELDS:
-            if name in ignore:
+            if name in ignore and not (ref and name in ref):
                 continue
             vo, vu, vi = so[off:off + n], su[off:off + n], bytes.fromhex(c["input"])[off:off + n]
+            if ref and name in ref:
+                vo = ref[name]
+                if name == "fpscr" or name.startswith("f"):
+                    # FPSCR is 32 bits; mffs leaves FRT[0:31] undefined
+                    vo, vu = vo[4:], vu[4:]
             if name == "vscr":
                 # RPCS3 keeps VSCR in BE word 0; the ISA (and ps3recomp) in word 3
                 vo, vu, vi = vo[0:4], vu[12:16], vi[12:16]

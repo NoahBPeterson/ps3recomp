@@ -37,18 +37,29 @@ is not expressible and is not tested.
 Every allowance is counted and printed at the end of a run.
 
 - **FPSCR**: RPCS3 does not model it (mtfsf drops RN and the sticky bits; it
-  keeps FPCC). Ignored by default (`--ignore r1,fpscr`). The FPSCR-only ops
-  (mffs, mtfsf., mtfsfi., mtfsb0./1., mcrfs) stay FAILING until an independent
-  FPSCR reference exists: neither side models FP status today.
-- **CR1 of FP record forms**: the ISA sets CR1 = FPSCR[FX FEX VX OX]; RPCS3
-  writes the result's FPCC. Masked (pending the FPSCR reference).
+  keeps FPCC). The FPSCR instructions (mffs, mtfsf, mtfsfi, mtfsb0/1, mcrfs and
+  their record forms) are therefore checked against an independent PowerISA
+  reference in `compare.py` (`fpscr_reference`: FEX/VX summaries, FX rules,
+  mcrfs clearing, CR1), not against the oracle. That reference and the
+  lifter's implementation share an author; a misreading of the ISA would match
+  on both sides. FP arithmetic does not yet update FPSCR status (FPRF, FR/FI,
+  exception bits) in ps3recomp, so the `fpscr` field is ignored for every other
+  op (`--ignore r1,fpscr`).
+- **CR1 of FP record forms**: the ISA sets CR1 = FPSCR[FX FEX VX OX] (as
+  ps3recomp does); RPCS3 writes the result's FPCC. Masked for arithmetic ops.
 - **NaN operand priority**: PowerISA propagates the first NaN of FRA, FRB, FRC
   (quieted), signalling or not; RPCS3 inherits the host rule (an SNaN wins).
   Accepted only when ps3recomp produced exactly the ISA's NaN.
 - **FMA-family NaN sign**: RPCS3 negates operands with host arithmetic, which
   flips a propagated NaN's sign; the ISA says QNaNs propagate unchanged.
 - **fres / frsqrte**: estimates. RPCS3 reproduces the PPE's tables, ps3recomp
-  computes exactly; accepted within the ISA bounds (1/256, 1/32).
+  computes exactly; accepted within the ISA bounds (1/256, 1/32). At the
+  denormal edges RPCS3's table model flushes (fres results below single range
+  become 0; frsqrte treats a denormal input as +-0). The ISA does neither;
+  ps3recomp's ISA value is accepted. Real PPE behaviour here is unverified.
+- **fnmsub / fnmadd zero sign**: the ISA negates after rounding, so an exact
+  +0 from A*C -/+ B becomes -0. RPCS3's compiled interpreter returns +0 (its
+  source is right; the build folds the negation). ps3recomp's -0 is accepted.
 - **VSCR**: RPCS3 reads/writes it in big-endian word 0 of the vector; the ISA
   says word 3 (VRB bits 96:127). The harness feeds both words and compares
   RPCS3's word 0 with ps3recomp's word 3.
