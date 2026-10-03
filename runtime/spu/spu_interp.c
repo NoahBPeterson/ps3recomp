@@ -509,6 +509,15 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
                 ctx->status = SPU_STATUS_RUNNING;
                 continue;
             }
+            /* lv2 stop-and-signal syscalls (yield, receive_event from a bound
+             * SPU queue, tryreceive_event): the same service lifted threads use
+             * (spu_stop). The pc is already past the stop. */
+            { extern int (*g_spu_lv2_stop_hook)(spu_context*);
+              if (ctx->status == SPU_STATUS_STOPPED_BY_STOP && g_spu_lv2_stop_hook &&
+                  g_spu_lv2_stop_hook(ctx)) {
+                  ctx->status = SPU_STATUS_RUNNING;
+                  continue;
+              } }
             g_spu_interp_steps = steps;
             if (_tr>0) { fprintf(stderr,"[spu-trace] halt stop=0x%X pc=0x%05X after %llu steps; last %d PCs:",
                     ctx->stop_code, ctx->pc, (unsigned long long)steps, rn);
