@@ -4907,18 +4907,28 @@ def main() -> None:
     # Firmware-import stub split: the .lib.stub trampolines are usually lumped
     # into one big function by boundary detection. Carve each 0x20-byte stub out
     # as its own function so direct calls land on it and it can be emitted as a
-    # single ps3_hle_call(nid). Drop any original function that overlaps the stub
-    # span (it's just the concatenated literal trampolines).
+    # single ps3_hle_call(nid). A function that overlaps the stub span is
+    # trimmed to the parts outside it: boundary detection often runs the last
+    # real function before the stubs on into them, and dropping it whole lost
+    # that function's code.
     if hle_stubs:
         smin = min(hle_stubs); smax = max(hle_stubs)
         STUB = 0x20
-        kept = [(s, e) for (s, e) in func_bounds
-                if e <= smin or s >= smax + STUB]
-        dropped = len(func_bounds) - len(kept)
+        send = smax + STUB
+        kept, trimmed = [], 0
+        for (s, e) in func_bounds:
+            if e <= smin or s >= send:
+                kept.append((s, e))
+                continue
+            trimmed += 1
+            if s < smin:
+                kept.append((s, smin))
+            if e > send:
+                kept.append((send, e))
         kept.extend((a, a + STUB) for a in hle_stubs)
         func_bounds = sorted(set(kept))
         print(f"  hle-stubs: {len(hle_stubs)} import stubs -> ps3_hle_call "
-              f"(dropped {dropped} overlapping function(s))")
+              f"(trimmed {trimmed} overlapping function(s))")
 
     print(f"Lifting {len(func_bounds)} functions...")
 
