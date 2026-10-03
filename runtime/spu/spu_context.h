@@ -402,12 +402,14 @@ typedef struct spu_context {
     uint32_t drain_ret_pc;
 } spu_context;
 
-/* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
- * base) that the HLE kernel plants as exitToKernelAddr / selectWorkloadAddr in
- * the SpursKernelContext. A policy module branching to them is performing a
- * kernel service; spu_indirect_branch intercepts (policy_mode only). */
-#define SPURS_PM_EXIT_TO_KERNEL_LS   0x9C0u
-#define SPURS_PM_SELECT_WORKLOAD_LS  0x9D0u
+/* The SPURS kernel's own service entry points, which it plants as
+ * exitToKernelAddr / selectWorkloadAddr in the SpursKernelContext: the
+ * addresses firmware libsre's kernel uses (read back by a policy module under
+ * libsre, tests/conformance/spurs/t_workload). A policy module branching to
+ * them is performing a kernel service; spu_indirect_branch intercepts
+ * (policy_mode only). */
+#define SPURS_PM_EXIT_TO_KERNEL_LS   0x808u
+#define SPURS_PM_SELECT_WORKLOAD_LS  0x290u
 
 /* The taskset policy module's syscall trampoline. Both the full resolver
  * (spu_channels.c) and the musttail fast path (spu_dispatch_mt.c) must treat a
