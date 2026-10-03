@@ -47,3 +47,22 @@ not run at all and its group "completes" with status 0.
 SPU thread arguments follow LV2/RPCS3: each u64 in the register's preferred
 doubleword (`v128::from64(0, arg)`), so the programs `rotqbyi 4` to reach the
 low word.
+
+## SPURS (`--suite spurs`)
+
+`gen_spurs_conform.py` builds an executable with real firmware imports
+(`lv2_imports.py`: sys_process_param, sys_proc_prx_param, .lib.stub entries and
+SDK-shaped 0x20-byte call trampolines). On RPCS3 the imports bind to the
+firmware's own `libsre.sprx` (RPCS3 runs libsre LLE by default), so the oracle
+is Sony's SPURS kernel; ps3recomp answers with its HLE `libs/spurs`.
+
+- **custom workload**: SPURS on 2 SPUs runs a hand-written policy module (the
+  path WWS-style job managers take) with readyCount 1. Each dispatch does one
+  capped GETLLAR/PUTLLC increment and returns to the kernel through r0; the
+  PPU waits for the cap, shuts the workload down, waits, removes it and
+  finalizes. Every return code is printed, with the module's entry r4
+  (workload data) and r5 (poll status).
+
+```
+python3 tests/conformance/mc/run_mc_conform.py --suite spurs --work /tmp/spursconf
+```

@@ -38,6 +38,7 @@ class SpuAsm:
 
     # constants
     def il(self, rt, i16):   self.ri16(0x081, rt, i16)
+    def fsmbi(self, rt, i16): self.ri16(0x065, rt, i16)
     def ilhu(self, rt, i16): self.ri16(0x082, rt, i16)
     def iohl(self, rt, i16): self.ri16(0x0C1, rt, i16)
     def ila(self, rt, i18):  self.ri18(0x21, rt, i18)
@@ -57,6 +58,7 @@ class SpuAsm:
     def ori(self, rt, ra, i):  self.ri10(0x04, rt, ra, i)
     def xor(self, rt, ra, rb): self.rr(0x241, rt, ra, rb)
     def ceq(self, rt, ra, rb): self.rr(0x3C0, rt, ra, rb)
+    def clgt(self, rt, ra, rb): self.rr(0x2C0, rt, ra, rb)
     def ceqi(self, rt, ra, i): self.ri10(0x7C, rt, ra, i)
     def cgti(self, rt, ra, i): self.ri10(0x4C, rt, ra, i)
     def clgti(self, rt, ra, i): self.ri10(0x5C, rt, ra, i)

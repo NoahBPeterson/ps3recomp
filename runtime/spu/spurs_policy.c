@@ -40,9 +40,10 @@ volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,
                           uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
-                          uint32_t spu_num)
+                          uint32_t spu_num, uint32_t poll_status)
 {
-    if (!entry || !pm_host || !pm_size || pm_size > SPU_LS_SIZE - 0xA00)
+    /* entry == NULL: the module was not lifted; it runs on the interpreter. */
+    if (!pm_host || !pm_size || pm_size > SPU_LS_SIZE - 0xA00)
         return -1;
 
     /* Reuse one context per thread: this runs per policy dispatch (thousands
@@ -162,11 +163,18 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * 0x13F0, via func_3038 -> 2418), i.e. r4's SECOND word. Both word 0
      * (attach) and word 1 (claim) must carry the 32-bit EA; the hi half
      * rides in words 2-3. */
-    ctx->gpr[4]._u32[0] = (uint32_t)wkl_data;          /* attach reads word0  */
-    ctx->gpr[4]._u32[1] = (uint32_t)wkl_data;          /* claim reads word1   */
-    ctx->gpr[4]._u32[2] = (uint32_t)(wkl_data >> 32);
-    ctx->gpr[4]._u32[3] = (uint32_t)(wkl_data >> 32);
-    ctx->gpr[5]._u32[0] = 0;                           /* poll status */
+    /* ...which was a misreading. Sony's kernel (libsre, run by RPCS3 and
+     * checked by tests/conformance/mc --suite spurs) enters the module with
+     * the u64 in r4's preferred DOUBLEWORD: word0 = high half, word1 = low
+     * half -- the same layout as SPU thread arguments. A module that takes a
+     * 32-bit EA reads it with `rotqbyi 4`. */
+    ctx->gpr[4]._u32[0] = (uint32_t)(wkl_data >> 32);
+    ctx->gpr[4]._u32[1] = (uint32_t)wkl_data;
+    ctx->gpr[4]._u32[2] = 0;
+    ctx->gpr[4]._u32[3] = 0;
+    /* Poll status: READYCOUNT (1) when readyCount exceeded the contention the
+     * workload had when this SPU picked it, SIGNAL (2), FLAG (4). */
+    ctx->gpr[5]._u32[0] = poll_status;
 
     g_spurs_pm_polls  = 0;
     g_spurs_pm_exited = 0;
@@ -266,7 +274,30 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     unsigned batch_before = g_wws_batch_gets;
     unsigned claim_before = g_spu_putllc_sync_hit;
 
-    const int pm_halted = spu_run_with_halt(entry, ctx);
+    int pm_halted;
+    if (entry) {
+        pm_halted = spu_run_with_halt(entry, ctx);
+    } else {
+        /* Interpreted module: the two kernel services are real SPU code at the
+         * addresses the context advertises. exitToKernel stops the run;
+         * selectWorkload answers "no contention, keep running" (r3 = 0) and
+         * returns, as the lifted intercept in spu_indirect_branch does. */
+        extern uint32_t spu_interp_run(spu_context*, uint32_t);
+        static const uint8_t k_svc[12] = {
+            0x00, 0x00, 0x03, 0xE1,               /* 0x9C0: stop 0x3E1        */
+            0, 0, 0, 0, 0, 0, 0, 0 };
+        static const uint8_t k_sel[8] = {
+            0x40, 0x80, 0x00, 0x03,               /* 0x9D0: il  $3, 0         */
+            0x35, 0x00, 0x00, 0x00 };             /*        bi  $0            */
+        memcpy(ctx->ls + SPURS_PM_EXIT_TO_KERNEL_LS, k_svc, 4);
+        memcpy(ctx->ls + SPURS_PM_SELECT_WORKLOAD_LS, k_sel, sizeof k_sel);
+        ctx->policy_mode = 0;                     /* no lifted intercepts */
+        spu_interp_run(ctx, 0xA00);
+        ctx->policy_mode = 1;
+        pm_halted = 0;
+        if (ctx->status == SPU_STATUS_STOPPED_BY_STOP && ctx->stop_code == 0x3E1)
+            ctx->pc = SPURS_PM_EXIT_TO_KERNEL_LS;
+    }
     /* A lane's run should only end through exitToKernel. Anything else strands
      * the jobs it had claimed (GH3's once-per-~10-songs freeze): say how. */
     if (((uint32_t)ctx->pc & SPU_LS_MASK) != SPURS_PM_EXIT_TO_KERNEL_LS) {

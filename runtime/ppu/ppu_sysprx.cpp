@@ -574,6 +574,8 @@ extern "C" int64_t sys_ppu_thread_exit(ppu_context* ctx);
  * hand back 0 and the caller's init (sub_C1484 / KdConvert) bails. */
 static void hle_ppu_thread_create(ppu_context* ctx) { ctx->gpr[3] = sys_ppu_thread_create(ctx); }
 static void hle_ppu_thread_exit(ppu_context* ctx)   { ctx->gpr[3] = sys_ppu_thread_exit(ctx); }
+extern "C" void _cellSpursWorkloadAttributeInitialize_ctx(uint64_t* gpr);
+static void hle_spurs_wkattr_init(ppu_context* ctx) { _cellSpursWorkloadAttributeInitialize_ctx(ctx->gpr); }
 
 /* _cellGcmInitBody (NID 0x15BAE46B) -- the GCM init every PS3 game calls via the
  * cellGcmInit() SDK macro. cellGcmSys.c provides the layout-correct core
@@ -1020,6 +1022,9 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_get_id"),      "sys_ppu_thread_get_id",      sys_ppu_thread_get_id);
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_create"),      "sys_ppu_thread_create",      hle_ppu_thread_create);
     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_exit"),        "sys_ppu_thread_exit",        hle_ppu_thread_exit);
+    /* 9 arguments: maxContention arrives on the stack (see cellSpurs.c). */
+    ps3_hle_register_ctx(ps3_compute_nid("_cellSpursWorkloadAttributeInitialize"),
+                         "_cellSpursWorkloadAttributeInitialize", hle_spurs_wkattr_init);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_allocate_memory"), "sys_mmapper_allocate_memory", sys_mmapper_allocate_memory);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_allocate_memory_from_container"), "sys_mmapper_allocate_memory_from_container", sys_mmapper_allocate_memory_from_container);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_map_memory"),     "sys_mmapper_map_memory",     crt_ok);
