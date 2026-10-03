@@ -615,6 +615,22 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                   fprintf(stderr, "[spu-SMC] img=%d DMA-GET into CODE @0x%05X size=%u ea=0x%08X pc=0x%05X\n",
                           spu->image_id, lsa, size, (uint32_t)ea, (uint32_t)spu->pc & SPU_LS_MASK);
           } }
+        /* SPU_GET_HAS=<hexword>: log GETs whose payload holds that BE word. */
+        { static int on = -1; static uint32_t want;
+          if (on < 0) { const char* e = getenv("SPU_GET_HAS"); on = e != 0; if (e) want = (uint32_t)strtoul(e, 0, 16); }
+          if (on) for (uint32_t o = 0; o + 4 <= size; o += 4) {
+              const uint8_t* q = (const uint8_t*)ls_ptr + o;
+              if ((uint32_t)((q[0]<<24)|(q[1]<<16)|(q[2]<<8)|q[3]) == want)
+                  fprintf(stderr, "[mfc] GETHAS ea=0x%08x size=0x%x off=0x%x lsa=0x%05x job@4000: %08x %08x\n",
+                          (uint32_t)ea, size, o, lsa, spu_ls_read32(spu, 0x4010), spu_ls_read32(spu, 0x4014)); } }
+        /* SPU_GET_EA=<lo>:<hi>: log plain GETs from [lo,hi) (RPCS3 oracle format). */
+        { static int on = -1; static uint32_t lo, hi;
+          if (on < 0) { const char* e = getenv("SPU_GET_EA"); on = e != 0;
+              if (e) { char* d; lo = (uint32_t)strtoul(e, &d, 16); hi = (uint32_t)strtoul(d + 1, 0, 16); } }
+          if (on && (uint32_t)ea < hi && (uint32_t)ea + size > lo)
+              fprintf(stderr, "[mfc] GETEA ea=0x%08x size=0x%x lsa=0x%05x job@4000: %08x %08x %08x %08x\n",
+                      (uint32_t)ea, size, lsa, spu_ls_read32(spu, 0x4010), spu_ls_read32(spu, 0x4014),
+                      spu_ls_read32(spu, 0x4018), spu_ls_read32(spu, 0x4020)); }
         /* Swappable-overlay tracking: a GET from a registered overlay source
          * (by EA or by content signature) marks that overlay's lifted
          * functions resident for this context. */
@@ -778,6 +794,23 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
         int stall_notify = (size_and_flags >> 31) & 1;
 
         uint64_t ea = (ea_base & 0xFFFFFFFF00000000ull) | eal;
+
+        /* SPU_PUT_EA=<lo>:<hi>: log list-PUT elements landing in [lo,hi), with
+         * the resident WWS job header (same format as the RPCS3 oracle). */
+        { static int on = -1; static uint32_t lo, hi;
+          static int gon = -1; static uint32_t glo, ghi;
+          if (gon < 0) { const char* e = getenv("SPU_GET_EA"); gon = e != 0;
+              if (e) { char* d; glo = (uint32_t)strtoul(e, &d, 16); ghi = (uint32_t)strtoul(d + 1, 0, 16); } }
+          if (gon && (base_cmd & 0x40) && eal < ghi && eal + xfer_size > glo)
+              fprintf(stderr, "[mfc-list] GETL-elem ea=0x%08x size=0x%x lsa=0x%05x job@4000: %08x %08x %08x %08x\n",
+                      eal, xfer_size, (dest_lsa & ~15u) | (eal & 15u), spu_ls_read32(spu, 0x4010),
+                      spu_ls_read32(spu, 0x4014), spu_ls_read32(spu, 0x4018), spu_ls_read32(spu, 0x4020));
+          if (on < 0) { const char* e = getenv("SPU_PUT_EA"); on = e != 0;
+              if (e) { char* d; lo = (uint32_t)strtoul(e, &d, 16); hi = (uint32_t)strtoul(d + 1, 0, 16); } }
+          if (on && !(base_cmd & 0x40) && (base_cmd & 0x20) == 0x20 && eal < hi && eal + xfer_size > lo)
+              fprintf(stderr, "[mfc-list] PUTL-elem ea=0x%08x size=0x%x lsa=0x%05x job@4000: %08x %08x %08x %08x\n",
+                      eal, xfer_size, (dest_lsa & ~15u) | (eal & 15u), spu_ls_read32(spu, 0x4010),
+                      spu_ls_read32(spu, 0x4014), spu_ls_read32(spu, 0x4018), spu_ls_read32(spu, 0x4020)); }
 
         if (xfer_size) {
             /* Each list element occupies whole LS quadwords, even for
