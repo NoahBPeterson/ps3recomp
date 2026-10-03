@@ -49,6 +49,75 @@ def split_cases(man, lines):
     return res
 
 
+FMA_FAMILY = {"FMSUB", "FMSUBS", "FNMSUB", "FNMSUBS", "FNMADD", "FNMADDS", "FMADD", "FMADDS"}
+ESTIMATES = {"FRES", "FRSQRTE"}
+allowed_tally = defaultdict(int)
+
+
+def _dbl(h):
+    return struct.unpack(">d", bytes.fromhex(h))[0]
+
+
+def isa_nan(c, field):
+    """The PowerISA NaN result of an A-form FP op whose destination is `field`,
+    or None if no operand is a NaN / not an A-form op."""
+    w = c["words"][0] if c["words"] else 0
+    po, xo = w >> 26, (w >> 1) & 31
+    if po not in (59, 63) or xo < 18 or "f%d" % ((w >> 21) & 31) != field:
+        return None
+    inp = bytes.fromhex(c["input"])
+    reg = lambda r: struct.unpack(">Q", inp[0x100 + 8 * r:0x108 + 8 * r])[0]
+    uses_b = xo != 25                      # fmul/fmuls: A, C
+    uses_c = xo in (23, 25, 28, 29, 30, 31)
+    uses_a = xo not in (22, 24, 26)        # fsqrt/fres/frsqrte: B only
+    order = ([reg((w >> 16) & 31)] if uses_a else []) + ([reg((w >> 11) & 31)] if uses_b else []) + \
+            ([reg((w >> 6) & 31)] if uses_c else [])
+    for v in order:
+        if (v >> 52) & 0x7FF == 0x7FF and v & ((1 << 52) - 1):
+            q = v | (1 << 51)
+            if po == 59:                   # single: payload truncated to the single fraction
+                q &= ~((1 << 29) - 1)
+            return q
+    return None
+
+
+def allowed(c, diffs):
+    """Known, documented oracle deviations (README: 'Known oracle limitations').
+    Returns (remaining diffs, reasons)."""
+    op = c["op"].rstrip(".")
+    keep, why = [], []
+    for d in diffs:
+        name, o, u = d[0], d[1], d[2]
+        if name.startswith("f") and len(o) == 16:
+            vo, vu = int(o, 16), int(u, 16)
+            # RPCS3 negates FMA operands with host arithmetic, flipping a
+            # propagated NaN's sign; PowerISA: QNaNs propagate with no effect
+            # on their sign bit.
+            if op in FMA_FAMILY and _dbl(o) != _dbl(o) and (vo ^ vu) == 1 << 63:
+                why.append("fma NaN sign (RPCS3 deviates from the ISA)"); continue
+            # PowerISA NaN propagation: the first NaN operand in the order FRA,
+            # FRB, FRC wins (quieted), signalling or not. RPCS3 follows the host
+            # (ARM: an SNaN beats a QNaN). Accept ours iff it is the ISA's NaN.
+            exp = isa_nan(c, name)
+            if exp is not None and vu == exp and vo != vu:
+                why.append("NaN operand priority (RPCS3 follows the host)"); continue
+            # fres/frsqrte are estimates. PowerISA bounds them: fres within 1/256,
+            # frsqrte within 1/32 of the exact value. RPCS3 reproduces the PPE's
+            # tables; ps3recomp computes exactly. Accept anything within the bound.
+            if op in ESTIMATES:
+                fo, fu = _dbl(o), _dbl(u)
+                tol = 2.0 ** -8 if op == "FRES" else 2.0 ** -5
+                if fo == fu or (fo == fo and fu == fu and abs(fo - fu) <= abs(fu) * tol):
+                    why.append("fres/frsqrte within the ISA estimate bound"); continue
+        if name == "cr" and c["op"].startswith("F") and c["op"].endswith("."):
+            # FP record forms set CR1 = FPSCR[FX FEX VX OX]; RPCS3 writes FPCC
+            # there and does not model FPSCR. Pending an FPSCR reference: mask CR1.
+            if (int(o, 16) ^ int(u, 16)) & ~0x0F000000 == 0:
+                why.append("CR1 of FP record forms (pending FPSCR model)"); continue
+        keep.append(d)
+    return keep, why
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("manifest"); ap.add_argument("oracle"); ap.add_argument("ours")
@@ -93,6 +162,9 @@ def main():
         if c.get("resv") and not (so[0x400] & 0x20) and (su[0x400] & 0x20):
             diffs = [x for x in diffs if x[0] != "cr"]
             sco = scu
+        diffs, why = allowed(c, diffs)
+        for w in why:
+            allowed_tally[w] += 1
         if c["mem"] and sco != scu:
             k = next(i for i in range(len(sco)) if sco[i] != scu[i])
             diffs.append(("mem+0x%x" % k, sco[k:k + 16].hex(), scu[k:k + 16].hex(), ""))
@@ -116,6 +188,8 @@ def main():
             for name, o, u, i in diffs[:8]:
                 print("   %-8s oracle=%s ours=%s  (in=%s)" % (name, o, u, i))
     print("\nops: %d  failing ops: %d  cases: %d  missing: %d" % (len(per_op), nbad, len(man["cases"]), missing))
+    for w, n in sorted(allowed_tally.items()):
+        print("allowed (documented oracle deviation): %-55s %d fields" % (w, n))
     if a.json:
         json.dump({k: {"cases": v["cases"], "bad": v["bad"], "fields": dict(v["fields"])}
                    for k, v in per_op.items()}, open(a.json, "w"), indent=1)
