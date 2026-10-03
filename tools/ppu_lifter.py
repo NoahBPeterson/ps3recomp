@@ -106,6 +106,7 @@ typedef struct ppu_context {
     uint64_t reserve_addr;  /* lwarx/stwcx. reservation address */
     uint64_t reserve_value; /* lwarx/stwcx. reservation value   */
     int      reserve_valid; /* lwarx/stwcx. reservation flag    */
+    uint32_t vrsave;        /* VRSAVE (SPR 256): plain state      */
 } ppu_context;
 
 /* Memory access helpers (provided by runtime) */
@@ -379,6 +380,8 @@ static inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) {
 }
 #endif
 
+#include "ppu_vmx.h"   /* exact VMX semantics (runtime/ppu/ppu_vmx.h) */
+
 /* VM base pointer (defined by game project) */
 extern "C" uint8_t* vm_base;
 
@@ -386,6 +389,8 @@ extern "C" uint8_t* vm_base;
  * Looks up the guest address in CTR via a hash table and calls the
  * corresponding host function. Handles OPD resolution. */
 extern "C" void ps3_indirect_call(ppu_context* ctx);
+/* Indirect call to an explicit target, CTR untouched (b<cond>lrl). */
+extern "C" void ps3_indirect_call_to(ppu_context* ctx, uint32_t target);
 
 /* Firmware-import HLE dispatch: a lifted import stub (a .lib.stub trampoline)
  * is replaced with a direct call to the registered HLE handler for its NID
@@ -1050,8 +1055,125 @@ class PPULifter:
     # (those set CR1), VMX dot-forms (those set CR6), mt*/mf* specials.
     _CR0_SELF_HANDLED = ("stwcx.", "stdcx.")
 
-    def _translate(self, insn: Instruction, func: LiftedFunction) -> str:
+    # XO-form ops with an OE bit (opcode 31, 9-bit XO) -> OV expression over
+    # _a = (RA) and _b = (RB) as they were BEFORE the op, _r = (RT) after, _ci = CA
+    # in. PowerISA, 64-bit mode: OV is signed overflow of the 64-bit result,
+    # except mullw/divw/divwu, which are defined on the 32-bit operation.
+    _OE_OV = {
+        266: "(((_a ^ _r) & (_b ^ _r)) >> 63)",                       # add
+        10:  "(((_a ^ _r) & (_b ^ _r)) >> 63)",                       # addc
+        138: "(((_a ^ _r) & (_b ^ _r)) >> 63)",                       # adde
+        40:  "(((~_a ^ _r) & (_b ^ _r)) >> 63)",                      # subf
+        8:   "(((~_a ^ _r) & (_b ^ _r)) >> 63)",                      # subfc
+        136: "(((~_a ^ _r) & (_b ^ _r)) >> 63)",                      # subfe
+        234: "(((_a ^ _r) & ~_r) >> 63)",                             # addme
+        202: "(((_a ^ _r) & _r) >> 63)",                              # addze
+        232: "(((~_a ^ _r) & ~_r) >> 63)",                            # subfme
+        200: "(((~_a ^ _r) & _r) >> 63)",                             # subfze
+        104: "(_a == 0x8000000000000000ull)",                         # neg
+        235: "({ int64_t _p = (int64_t)(int32_t)_a * (int64_t)(int32_t)_b; _p != (int64_t)(int32_t)_p; })",  # mullw
+        233: "({ int64_t _p; __builtin_mul_overflow((int64_t)_a, (int64_t)_b, &_p); })",                     # mulld
+        491: "((uint32_t)_b == 0 || ((uint32_t)_a == 0x80000000u && (uint32_t)_b == 0xFFFFFFFFu))",          # divw
+        459: "((uint32_t)_b == 0)",                                                                          # divwu
+        489: "(_b == 0 || (_a == 0x8000000000000000ull && _b == ~0ull))",                                   # divd
+        457: "(_b == 0)",                                                                                   # divdu
+    }
+
+    def _oe_wrap(self, insn: Instruction, code: str) -> str:
+        raw = insn.raw
+        if raw is None or (raw >> 26) != 31 or not (raw >> 10) & 1:
+            return code
+        ov = self._OE_OV.get((raw >> 1) & 0x1FF)
+        if ov is None or not code or code.startswith("/*"):
+            return code
+        rt, ra, rb = (raw >> 21) & 31, (raw >> 16) & 31, (raw >> 11) & 31
+        return (f"{{ const uint64_t _a = ctx->gpr[{ra}], _b = ctx->gpr[{rb}]; (void)_b; "
+                f"{code} {{ const uint64_t _r = ctx->gpr[{rt}]; (void)_r; "
+                f"const uint32_t _ov = (uint32_t)({ov}); "
+                f"ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); }} }}")
+
+    # VMX ops implemented by runtime/ppu/ppu_vmx.h, keyed by mnemonic (record
+    # forms share the entry). Forms: ab = (d,a,b); abS = +&vscr; abF = +vscr value;
+    # abc / abcS / abcF likewise with C; bF = (d,b,vscr); u = (d,b,uimm);
+    # uS = +&vscr; up = unpack (d,b,lo); cmp = (d,a,b) -> CR6 nibble.
+    _VMX_HELPERS = {
+        **{m: "ab" for m in ("vrlb vrlh vrlw vslb vslh vslw vsrb vsrh vsrw vsrab vsrah vsraw "
+                             "vavgub vavguh vavguw vavgsb vavgsh vavgsw vaddcuw vsubcuw "
+                             "vmuleub vmuloub vmulesb vmulosb vmuleuh vmulouh vmulesh vmulosh "
+                             "vsl vsr vslo vsro").split()},
+        **{m: "abS" for m in ("vaddubs vadduhs vadduws vaddsbs vaddshs vaddsws vsububs vsubuhs vsubuws "
+                              "vsubsbs vsubshs vsubsws vsum4ubs vsum4sbs vsum4shs vsum2sws vsumsws "
+                              "vpkuhum vpkuwum vpkuhus vpkuwus vpkshus vpkswus vpkshss vpkswss vpkpx").split()},
+        **{m: "abF" for m in "vaddfp vsubfp vmaxfp vminfp".split()},
+        **{m: "abc" for m in "vmladduhm vmsumubm vmsummbm vmsumuhm vmsumshm".split()},
+        **{m: "abcS" for m in "vmhaddshs vmhraddshs vmsumuhs vmsumshs".split()},
+        **{m: "abcF" for m in "vmaddfp vnmsubfp".split()},
+        **{m: "bF" for m in "vrefp vrsqrtefp vexptefp vlogefp vrfin vrfiz vrfip vrfim".split()},
+        **{m: "u" for m in "vcfux vcfsx".split()},
+        **{m: "uS" for m in "vctuxs vctsxs".split()},
+        "vupkhpx": ("up", "vmx_vupkpx", 0), "vupklpx": ("up", "vmx_vupkpx", 1),
+        "vupkhsb": ("up", "vmx_vupksb", 0), "vupklsb": ("up", "vmx_vupksb", 1),
+        "vupkhsh": ("up", "vmx_vupksh", 0), "vupklsh": ("up", "vmx_vupksh", 1),
+        **{m: "cmp" for m in ("vcmpequb vcmpequh vcmpequw vcmpgtub vcmpgtuh vcmpgtuw vcmpgtsb "
+                              "vcmpgtsh vcmpgtsw vcmpeqfp vcmpgefp vcmpgtfp vcmpbfp").split()},
+    }
+
+    # Opcode-4 names by XO (from PowerISA / RPCS3 PPUOpcodes.h); the router keys
+    # on these so ops the disassembler leaves as vmx_xNNN still lift.
+    _VMX_VX_NAMES = {0x000: 'vaddubm', 0x002: 'vmaxub', 0x004: 'vrlb', 0x006: 'vcmpequb', 0x008: 'vmuloub', 0x00A: 'vaddfp', 0x00C: 'vmrghb', 0x00E: 'vpkuhum', 0x040: 'vadduhm', 0x042: 'vmaxuh', 0x044: 'vrlh', 0x046: 'vcmpequh', 0x048: 'vmulouh', 0x04A: 'vsubfp', 0x04C: 'vmrghh', 0x04E: 'vpkuwum', 0x080: 'vadduwm', 0x082: 'vmaxuw', 0x084: 'vrlw', 0x086: 'vcmpequw', 0x08C: 'vmrghw', 0x08E: 'vpkuhus', 0x0C6: 'vcmpeqfp', 0x0CE: 'vpkuwus', 0x102: 'vmaxsb', 0x104: 'vslb', 0x108: 'vmulosb', 0x10A: 'vrefp', 0x10C: 'vmrglb', 0x10E: 'vpkshus', 0x142: 'vmaxsh', 0x144: 'vslh', 0x148: 'vmulosh', 0x14A: 'vrsqrtefp', 0x14C: 'vmrglh', 0x14E: 'vpkswus', 0x180: 'vaddcuw', 0x182: 'vmaxsw', 0x184: 'vslw', 0x18A: 'vexptefp', 0x18C: 'vmrglw', 0x18E: 'vpkshss', 0x1C4: 'vsl', 0x1C6: 'vcmpgefp', 0x1CA: 'vlogefp', 0x1CE: 'vpkswss', 0x200: 'vaddubs', 0x202: 'vminub', 0x204: 'vsrb', 0x206: 'vcmpgtub', 0x208: 'vmuleub', 0x20A: 'vrfin', 0x20C: 'vspltb', 0x20E: 'vupkhsb', 0x240: 'vadduhs', 0x242: 'vminuh', 0x244: 'vsrh', 0x246: 'vcmpgtuh', 0x248: 'vmuleuh', 0x24A: 'vrfiz', 0x24C: 'vsplth', 0x24E: 'vupkhsh', 0x280: 'vadduws', 0x282: 'vminuw', 0x284: 'vsrw', 0x286: 'vcmpgtuw', 0x28A: 'vrfip', 0x28C: 'vspltw', 0x28E: 'vupklsb', 0x2C4: 'vsr', 0x2C6: 'vcmpgtfp', 0x2CA: 'vrfim', 0x2CE: 'vupklsh', 0x300: 'vaddsbs', 0x302: 'vminsb', 0x304: 'vsrab', 0x306: 'vcmpgtsb', 0x308: 'vmulesb', 0x30A: 'vcfux', 0x30E: 'vpkpx', 0x340: 'vaddshs', 0x342: 'vminsh', 0x344: 'vsrah', 0x346: 'vcmpgtsh', 0x348: 'vmulesh', 0x34A: 'vcfsx', 0x34E: 'vupkhpx', 0x380: 'vaddsws', 0x382: 'vminsw', 0x384: 'vsraw', 0x386: 'vcmpgtsw', 0x38A: 'vctuxs', 0x3C6: 'vcmpbfp', 0x3CA: 'vctsxs', 0x3CE: 'vupklpx', 0x400: 'vsububm', 0x402: 'vavgub', 0x404: 'vand', 0x406: 'vcmpequb.', 0x40A: 'vmaxfp', 0x40C: 'vslo', 0x440: 'vsubuhm', 0x442: 'vavguh', 0x444: 'vandc', 0x446: 'vcmpequh.', 0x44A: 'vminfp', 0x44C: 'vsro', 0x480: 'vsubuwm', 0x482: 'vavguw', 0x484: 'vor', 0x486: 'vcmpequw.', 0x4C4: 'vxor', 0x4C6: 'vcmpeqfp.', 0x502: 'vavgsb', 0x504: 'vnor', 0x542: 'vavgsh', 0x580: 'vsubcuw', 0x582: 'vavgsw', 0x5C6: 'vcmpgefp.', 0x600: 'vsububs', 0x606: 'vcmpgtub.', 0x608: 'vsum4ubs', 0x640: 'vsubuhs', 0x646: 'vcmpgtuh.', 0x648: 'vsum4shs', 0x680: 'vsubuws', 0x686: 'vcmpgtuw.', 0x688: 'vsum2sws', 0x6C6: 'vcmpgtfp.', 0x700: 'vsubsbs', 0x706: 'vcmpgtsb.', 0x708: 'vsum4sbs', 0x740: 'vsubshs', 0x746: 'vcmpgtsh.', 0x780: 'vsubsws', 0x786: 'vcmpgtsw.', 0x788: 'vsumsws', 0x7C6: 'vcmpbfp.'}
+    _VMX_VA_NAMES = {0x20: 'vmhaddshs', 0x21: 'vmhraddshs', 0x22: 'vmladduhm', 0x24: 'vmsumubm', 0x25: 'vmsummbm', 0x26: 'vmsumuhm', 0x27: 'vmsumuhs', 0x28: 'vmsumshm', 0x29: 'vmsumshs', 0x2A: 'vsel', 0x2B: 'vperm', 0x2E: 'vmaddfp', 0x2F: 'vnmsubfp'}
+
+    def _vmx_helper(self, insn: Instruction):
+        raw = insn.raw
+        mn = self._VMX_VA_NAMES.get(raw & 0x3F) if (raw & 0x3F) >= 0x20 and (raw & 0x3F) < 0x30 else \
+            self._VMX_VX_NAMES.get(raw & 0x7FF)
+        if mn is None:
+            return None
+        mn = mn.rstrip(".")
+        form = self._VMX_HELPERS.get(mn)
+        if form is None:
+            return None
+        raw = insn.raw
+        vd, va, vb, vc = (raw >> 21) & 31, (raw >> 16) & 31, (raw >> 11) & 31, (raw >> 6) & 31
+        D, A, B, C = (f"&ctx->vr[{x}]" for x in (vd, va, vb, vc))
+        fn = f"vmx_{mn}"
+        if isinstance(form, tuple):
+            _, fn, lo = form
+            return f"{fn}({D}, {B}, {lo});"
+        if form == "ab":   return f"{fn}({D}, {A}, {B});"
+        if form == "abS":  return f"{fn}({D}, {A}, {B}, &ctx->vscr);"
+        if form == "abF":  return f"{fn}({D}, {A}, {B}, ctx->vscr);"
+        if form == "abc":  return f"{fn}({D}, {A}, {B}, {C});"
+        if form == "abcS": return f"{fn}({D}, {A}, {B}, {C}, &ctx->vscr);"
+        if form == "abcF": return f"{fn}({D}, {A}, {B}, {C}, ctx->vscr);"
+        if form == "bF":   return f"{fn}({D}, {B}, ctx->vscr);"
+        if form == "u":    return f"{fn}({D}, {B}, {va});"
+        if form == "uS":   return f"{fn}({D}, {B}, {va}, &ctx->vscr);"
+        if form == "cmp":
+            if (raw >> 10) & 1:   # record form: CR6 = [all, 0, none, 0]
+                return (f"{{ uint32_t _c6 = {fn}({D}, {A}, {B}); "
+                        f"ctx->cr = (ctx->cr & ~0xF0u) | (_c6 << 4); }}")
+            return f"(void){fn}({D}, {A}, {B});"
+        return None
+
+    def _translate_xo_base(self, insn: Instruction, func: LiftedFunction) -> str:
+        """Lift an XO-form arithmetic op. Its OE (o) and record (.) variants share
+        the base op's computation; _oe_wrap adds XER[OV/SO] and _translate adds
+        CR0, so a variant with no handler of its own lifts through the base."""
         code = self._translate_op(insn, func)
+        raw = insn.raw
+        if (raw is None or (raw >> 26) != 31 or ((raw >> 1) & 0x1FF) not in self._OE_OV
+                or not code.startswith("/* TODO")):
+            return code
+        base = insn.mnemonic.rstrip(".")
+        if (raw >> 10) & 1 and base.endswith("o"):
+            base = base[:-1]
+        alt = Instruction(insn.addr, raw, base, insn.operands, insn.comment)
+        code2 = self._translate_op(alt, func)
+        return code if code2.startswith("/* TODO") else code2
+
+    def _translate(self, insn: Instruction, func: LiftedFunction) -> str:
+        code = self._oe_wrap(insn, self._translate_xo_base(insn, func))
         mn = insn.mnemonic
         if (mn.endswith(".") and code and not code.startswith("/*")
                 and mn not in self._CR0_SELF_HANDLED
@@ -1070,6 +1192,11 @@ class PPULifter:
         mn = insn.mnemonic
         ops = _parse_operands(insn.operands)
         addr = insn.addr
+
+        if insn.raw is not None and (insn.raw >> 26) == 4:
+            v = self._vmx_helper(insn)
+            if v is not None:
+                return v
 
         # ------- Arithmetic -------
         if mn == "li":
@@ -1133,8 +1260,10 @@ class PPULifter:
             # mulli is the low 64 bits of the full RA * EXTS(SI) product
             # (PowerISA); a 32-bit multiply truncates it.
             rd, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
-            return (f"ctx->gpr[{rd}] = (uint64_t)((int64_t)ctx->gpr[{ra}] * "
-                    f"(int64_t)({_imm(ops[2])}));")
+            # Unsigned (wrapping) multiply: a signed 64-bit overflow is UB in C,
+            # and the optimizer exploits it (e.g. folds "x*x < 0" to false).
+            return (f"ctx->gpr[{rd}] = ctx->gpr[{ra}] * "
+                    f"(uint64_t)(int64_t)({_imm(ops[2])});")
 
         if mn in ("mullw", "mullw."):
             # Full 64-bit product of the sign-extended low words (PowerISA);
@@ -1156,7 +1285,8 @@ class PPULifter:
 
         if mn.startswith("mulhwu"):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{rd}] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[{ra}] * (uint64_t)(uint32_t)ctx->gpr[{rb}] >> 32));"
+            # The high word is undefined in 64-bit mode; zero, as RPCS3 does.
+            return f"ctx->gpr[{rd}] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[{ra}] * (uint64_t)(uint32_t)ctx->gpr[{rb}]) >> 32);"
 
         # PPC integer divide does NOT trap on a zero divisor (or signed
         # INT_MIN/-1 overflow) -- it leaves an undefined result and continues.
@@ -1165,12 +1295,12 @@ class PPULifter:
         if mn in ("divw", "divw."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ int32_t _a=(int32_t)ctx->gpr[{ra}], _b=(int32_t)ctx->gpr[{rb}]; "
-                    f"ctx->gpr[{rd}] = (int64_t)(int32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }}")
+                    f"ctx->gpr[{rd}] = (uint32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }}")  # high word undefined: 0, as RPCS3
 
         if mn in ("divwu", "divwu."):
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint32_t _b=(uint32_t)ctx->gpr[{rb}]; "
-                    f"ctx->gpr[{rd}] = (int64_t)(int32_t)(_b==0?0:(uint32_t)ctx->gpr[{ra}]/_b); }}")
+                    f"ctx->gpr[{rd}] = (uint32_t)(_b==0?0:(uint32_t)ctx->gpr[{ra}]/_b); }}")
 
         # ------- Logical -------
         if mn == "ori":
@@ -1260,8 +1390,8 @@ class PPULifter:
             # (the old (int64_t)(int32_t) cast) corrupted every rlwinm whose bit
             # 31 was set -- e.g. newlib dtoa's exponent-field extraction, which
             # then fed __pow5mult a garbage exponent and spun forever.
-            return (f"ctx->gpr[{ra}] = (uint64_t)"
-                    f"ppc_rlwinm((uint32_t)ctx->gpr[{rs}], {sh}, {mb}, {me});")
+            # MB > ME wraps the mask into the high word (ppc_rlw64 handles both).
+            return (f"ctx->gpr[{ra}] = ppc_rlw64(ctx->gpr[{rs}], {sh}, {mb}, {me}, 0, 0);")
 
         if mn.startswith("rlwimi"):
             ra, rs = _reg_idx(ops[0]), _reg_idx(ops[1])
@@ -1269,8 +1399,7 @@ class PPULifter:
             # RA = (ROTL32(RS,SH) & m) | (RA & ~m), m = MASK(MB+32,ME+32) which
             # is confined to the low 32 bits -- so RA's HIGH 32 bits are always
             # preserved, and the merged low word is zero-extended.
-            return (f"ctx->gpr[{ra}] = (ctx->gpr[{ra}] & 0xFFFFFFFF00000000ull) | "
-                    f"(uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[{ra}], (uint32_t)ctx->gpr[{rs}], {sh}, {mb}, {me});")
+            return f"ctx->gpr[{ra}] = ppc_rlw64(ctx->gpr[{rs}], {sh}, {mb}, {me}, ctx->gpr[{ra}], 1);"
 
         if mn in ("slw", "slw."):
             # PPC slw: shift amount is rB[58:63]; if bit 0x20 is set (>= 32) the
@@ -1531,7 +1660,7 @@ class PPULifter:
             cast = "(int32_t)" if mn == "cmpwi" else "(int64_t)"
             shift = (7 - bf) * 4
             return (f"{{ int64_t a = {cast}ctx->gpr[{ra_i}]; int64_t b = (int64_t){imm}; "
-                    f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
+                    f"uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         if mn in ("cmplwi", "cmpldi"):
@@ -1546,7 +1675,7 @@ class PPULifter:
             cast = "(uint32_t)" if mn == "cmplwi" else "(uint64_t)"
             shift = (7 - bf) * 4
             return (f"{{ uint64_t a = {cast}ctx->gpr[{ra_i}]; uint64_t b = (uint64_t){imm}; "
-                    f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
+                    f"uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         if mn in ("cmpw", "cmpd"):
@@ -1561,7 +1690,7 @@ class PPULifter:
             cast = "(int32_t)" if mn == "cmpw" else "(int64_t)"
             shift = (7 - bf) * 4
             return (f"{{ int64_t a = {cast}ctx->gpr[{ra_i}]; int64_t b = {cast}ctx->gpr[{rb_i}]; "
-                    f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
+                    f"uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         if mn in ("cmplw", "cmpld"):
@@ -1576,7 +1705,7 @@ class PPULifter:
             cast = "(uint32_t)" if mn == "cmplw" else "(uint64_t)"
             shift = (7 - bf) * 4
             return (f"{{ uint64_t a = {cast}ctx->gpr[{ra_i}]; uint64_t b = {cast}ctx->gpr[{rb_i}]; "
-                    f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
+                    f"uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         # ------- Branches -------
@@ -1622,6 +1751,14 @@ class PPULifter:
             except ValueError:
                 return f"goto {target}; /* branch */"
 
+        # The get-PC idiom: bl $+4 / bcl 20,31,$+4 only sets LR to the next
+        # instruction. Lifted as a call it would run the rest of the function
+        # as a "callee" and then run it again on return.
+        if insn.raw is not None and (insn.raw & 1) and (
+                (insn.raw >> 26) == 18 and (insn.raw & 0x3FFFFFE) == 4 or
+                (insn.raw >> 26) == 16 and (insn.raw & 0xFFFE) == 4 and ((insn.raw >> 21) & 0x14) == 0x14):
+            return f"ctx->lr = 0x{insn.addr + 4:08X};  /* get-PC: bl $+4 */"
+
         if mn == "bl":
             target = ops[0]
             try:
@@ -1647,15 +1784,17 @@ class PPULifter:
         if (mn.endswith("lr") and mn not in ("bl", "blr", "blrl") and
                 mn.startswith("b") and
                 not mn.startswith("blr")):  # guard against "blr" literal
-            cond = self._branch_condition(mn, ops)
+            cond = self._branch_condition(mn, ops, insn.raw)
             return f"if ({cond}) return;"
 
         # Conditional indirect call through LR with link (b<cond>lrl) — the LR twin
         # of b<cond>ctrl below. Dispatch via LR, then CONTINUE (link = call).
         if (mn.endswith("lrl") and mn != "blrl" and mn.startswith("b")):
-            cond = self._branch_condition(mn, ops)
-            return (f"if ({cond}) {{ ctx->ctr = (uint32_t)ctx->lr; "
-                    f"ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); }}")
+            cond = self._branch_condition(mn, ops, insn.raw)
+            # Target is the OLD LR; LR becomes the return address whether or not
+            # the branch is taken; CTR is not touched (it used to be clobbered).
+            return (f"{{ const uint32_t _t = (uint32_t)ctx->lr; ctx->lr = 0x{insn.addr + 4:08X}; "
+                    f"if ({cond}) {{ ps3_indirect_call_to(ctx, _t); DRAIN_TRAMPOLINE(ctx); }} }}")
 
         # Indirect call/jump through CTR in any conditional or named form:
         #   b<cond>ctr / bcctr  (no link) -> tail jump: dispatch, then return
@@ -1667,9 +1806,10 @@ class PPULifter:
         # (func_00000030). On a real title this is thousands of vtable calls.
         if (mn.startswith("b") and mn not in ("bctr", "bctrl")
                 and (mn.endswith("ctr") or mn.endswith("ctrl"))):
-            cond = self._branch_condition(mn, ops)
+            cond = self._branch_condition(mn, ops, insn.raw)
             if mn.endswith("ctrl"):   # link = call: keep executing after it
-                return f"if ({cond}) {{ ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); }}"
+                return (f"ctx->lr = 0x{insn.addr + 4:08X}; "
+                        f"if ({cond}) {{ ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); }}")
             return f"if ({cond}) {{ ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); return; }}"
 
         # Conditional branches
@@ -1683,19 +1823,19 @@ class PPULifter:
                         and tgt in self.function_entries):
                     # conditional tail call to a function prologue inside this
                     # (merged) range -- trampoline, don't goto (see the `b` case).
-                    cond = self._branch_condition(mn, ops)
+                    cond = self._branch_condition(mn, ops, insn.raw)
                     self.branch_targets.add(tgt)
                     return (f"if ({cond}) {{ g_trampoline_fn = "
                             f"(void(*)(void*)){self.prefix}func_{tgt:08X}; return; }}")
                 if func.start_addr <= tgt < func.end_addr:
-                    cond = self._branch_condition(mn, ops)
+                    cond = self._branch_condition(mn, ops, insn.raw)
                     return f"if ({cond}) goto loc_{tgt:08X};"
                 elif self._outside_code(tgt):
                     # Conditional branch to non-code: data misread as code.
-                    cond = self._branch_condition(mn, ops)
+                    cond = self._branch_condition(mn, ops, insn.raw)
                     return f"if ({cond}) return; /* bc -> non-code 0x{tgt:08X} */"
                 else:
-                    cond = self._branch_condition(mn, ops)
+                    cond = self._branch_condition(mn, ops, insn.raw)
                     # Use trampoline for cross-fragment conditional branches
                     self.branch_targets.add(tgt)
                     return f"if ({cond}) {{ g_trampoline_fn = (void(*)(void*)){self.prefix}func_{tgt:08X}; return; }}"
@@ -1739,7 +1879,7 @@ class PPULifter:
             # Indirect call through CTR register. The CTR value is a GUEST
             # address (or OPD pointer). We dispatch through a hash table
             # that maps guest addresses to host function pointers.
-            return "ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx);"
+            return f"ctx->lr = 0x{insn.addr + 4:08X}; ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx);"
 
         # ------- SPR -------
         if mn == "mflr":
@@ -1756,13 +1896,22 @@ class PPULifter:
 
         if mn == "mtctr":
             rs_i = _reg_idx(ops[0])
-            # Mask CTR to 32 bits — PS3 games use 32-bit loop counts.
-            # Without masking, sign-extended 64-bit values from addi/rldicr
-            # produce CTR values like 0x9FFFFFFFE0000000 causing infinite loops.
-            return f"ctx->ctr = (uint32_t)ctx->gpr[{rs_i}];"
+            # CTR is 64 bits (bdnz tests all of it). The 32-bit mask that used to
+            # sit here hid wrong sign extension elsewhere; the conformance suite
+            # (tests/conformance/ppu) checks addi/rldicr directly instead.
+            return f"ctx->ctr = ctx->gpr[{rs_i}];"
 
-        if mn == "mfcr":
+        if mn in ("mfcr", "mfocrf"):
             rd_i = _reg_idx(ops[0])
+            raw = insn.raw
+            if raw is not None and (raw >> 20) & 1:
+                # mfocrf: only the field FXM names (the rest is undefined; 0 as RPCS3)
+                fxm = (raw >> 12) & 0xFF
+                mask = 0
+                for f in range(8):
+                    if fxm & (0x80 >> f):
+                        mask |= 0xF << (28 - 4 * f)
+                return f"ctx->gpr[{rd_i}] = ctx->cr & 0x{mask:08X}u;"
             return f"ctx->gpr[{rd_i}] = ctx->cr;"
 
         if mn in ("mfspr", "mtspr"):
@@ -1788,16 +1937,31 @@ class PPULifter:
             # left the destination GPR holding whatever happened to be in it, so
             # the guest read a stale register instead of a defined one.
             if s in ("VRSAVE", "256"):
+                # Kept as plain 32-bit state so a read returns what was written.
                 if mn == "mfspr":
-                    return f"ctx->gpr[{g}] = 0;  /* mfspr VRSAVE: unmodeled (we save all of VMX) */"
-                return f"/* mtspr VRSAVE, r{g}: unmodeled -- we save all of VMX */;"
+                    return f"ctx->gpr[{g}] = ctx->vrsave;"
+                return f"ctx->vrsave = (uint32_t)ctx->gpr[{g}];"
             if spr_field is None:
                 return f"/* {mn} {insn.operands}: unsupported SPR -- no-op */;"
             if mn == "mfspr":
                 return f"ctx->gpr[{g}] = ctx->{spr_field};"
-            if spr_field == "ctr":
-                return f"ctx->ctr = (uint32_t)ctx->gpr[{g}];"
+            if spr_field == "xer":
+                # only SO OV CA and the byte count exist; the rest is reserved (reads 0)
+                return f"ctx->xer = (uint32_t)ctx->gpr[{g}] & 0xE000007Fu;"
             return f"ctx->{spr_field} = ctx->gpr[{g}];"
+
+        # VSCR lives in the low-order word of the vector (VRB bits 96:127):
+        # NJ = 0x00010000, SAT = 0x00000001. Vectors are held big-endian.
+        if mn == "mtvscr":
+            vb = int(ops[0][1:])
+            return (f"{{ const uint8_t* _b = (const uint8_t*)&ctx->vr[{vb}]; "
+                    f"ctx->vscr = ((uint32_t)_b[12] << 24 | (uint32_t)_b[13] << 16 | "
+                    f"(uint32_t)_b[14] << 8 | _b[15]) & 0x00010001u; }}")
+        if mn == "mfvscr":
+            vd = int(ops[0][1:])
+            return (f"{{ uint8_t* _d = (uint8_t*)&ctx->vr[{vd}]; memset(_d, 0, 12); "
+                    f"_d[12] = 0; _d[13] = (uint8_t)(ctx->vscr >> 16); _d[14] = 0; "
+                    f"_d[15] = (uint8_t)ctx->vscr; }}")
 
         if mn == "mtcr":
             return f"ctx->cr = (uint32_t)ctx->gpr[{_reg_idx(ops[-1])}];"
@@ -2000,7 +2164,8 @@ class PPULifter:
         # ------- 64-bit multiply / divide -------
         if mn == "mulld":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
-            return f"ctx->gpr[{rd}] = (int64_t)ctx->gpr[{ra}] * (int64_t)ctx->gpr[{rb}];"
+            # wrapping multiply (low 64 bits are sign-agnostic; signed overflow is UB)
+            return f"ctx->gpr[{rd}] = ctx->gpr[{ra}] * ctx->gpr[{rb}];"
 
         if mn == "mullw":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -2139,7 +2304,7 @@ class PPULifter:
             rb = _reg_idx(ops[2])
             mb = int(ops[3])
             me = int(ops[4])
-            return f"ctx->gpr[{ra}] = ppc_rlwinm((uint32_t)ctx->gpr[{rs}], (int)(ctx->gpr[{rb}] & 31), {mb}, {me});"
+            return f"ctx->gpr[{ra}] = ppc_rlw64(ctx->gpr[{rs}], (int)(ctx->gpr[{rb}] & 31), {mb}, {me}, 0, 0);"
 
         # mffs — move from FPSCR
         if mn == "mffs" or mn == "mffs.":
@@ -2203,7 +2368,7 @@ class PPULifter:
             return (f"{{ uint64_t ea = {ea}; "
                     f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
                     f"ppu_stwcx32(ea, (uint32_t)ctx->reserve_value, (uint32_t)ctx->gpr[{rs}]); "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u); "  # CR0 EQ = success
+                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u) | ((ctx->xer >> 31) << 28); "  # CR0 EQ = success
                     f"ctx->reserve_addr = 0; }}")
 
         if mn == "ldarx":
@@ -2219,8 +2384,56 @@ class PPULifter:
             return (f"{{ uint64_t ea = {ea}; "
                     f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
                     f"ppu_stdcx64(ea, ctx->reserve_value, ctx->gpr[{rs}]); "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u); "
+                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u) | ((ctx->xer >> 31) << 28); "
                     f"ctx->reserve_addr = 0; }}")
+
+        # ------- Data-stream hints: no architected effect -------
+        if mn in ("dst", "dstst", "dss"):
+            return f"/* {mn}: data-stream hint */;"
+
+        # ------- Cell unaligned vector stores -------
+        # stvlx: the leading 16-sh bytes of vS go to EA..end of its quadword.
+        # stvrx: the trailing sh bytes of vS go to the start of EA's quadword.
+        if mn in ("stvlx", "stvlxl", "stvrx", "stvrxl"):
+            vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
+            ra, rb = _reg_idx(ops[1]), _reg_idx(ops[2])
+            if mn.startswith("stvl"):
+                loop = "for (uint32_t i = 0; i < 16u - sh; i++) m[sh + i] = s[i];"
+            else:
+                loop = "for (uint32_t i = 16u - sh; i < 16u; i++) m[i - (16u - sh)] = s[i];"
+            return (f"{{ uint64_t ea = {_xea(ra, rb)}; uint32_t sh = (uint32_t)(ea & 0xF); "
+                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
+                    f"const uint8_t* s = (const uint8_t*)&ctx->vr[{vs}]; {loop} }}")
+
+        if mn == "lwaux":
+            rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = ctx->gpr[{ra}] + ctx->gpr[{rb}]; "
+                    f"ctx->gpr[{rd}] = (int64_t)(int32_t)vm_read32(ea); ctx->gpr[{ra}] = ea; }}")
+
+        if mn == "stdbrx":
+            rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
+            return (f"{{ uint64_t ea = {_xea(ra, rb)}; uint64_t raw = ctx->gpr[{rs}]; "
+                    f"memcpy(vm_base + (uint32_t)ea, &raw, 8); }}")   # host LE = byte-reversed
+
+        # ------- String word load/store -------
+        # NB bytes (lswi: NB field, 0 = 32; lswx: XER[25:31]) move between memory
+        # and RT, RT+1, ... (wrapping r31 -> r0), 4 bytes per register into the
+        # low word, big-endian, the last register zero-padded on the right.
+        if mn in ("lswi", "lswx", "stswi", "stswx"):
+            rt, ra = _reg_idx(ops[0]), _reg_idx(ops[1])
+            if mn.endswith("i"):
+                nb = int(ops[2]) or 32
+                ea, n = ("0" if str(ra) == "0" else f"ctx->gpr[{ra}]"), str(nb)
+            else:
+                ea, n = _xea(ra, _reg_idx(ops[2])), "(ctx->xer & 0x7Fu)"
+            if mn.startswith("l"):
+                body = ("for (uint32_t i = 0; i < n; i++) { uint32_t r = (rt + i / 4) & 31, k = i & 3; "
+                        "if (!k) ctx->gpr[r] = 0; "
+                        "ctx->gpr[r] |= (uint64_t)vm_read8(ea + i) << (24 - 8 * k); }")
+            else:
+                body = ("for (uint32_t i = 0; i < n; i++) { uint32_t r = (rt + i / 4) & 31, k = i & 3; "
+                        "vm_write8(ea + i, (uint8_t)(ctx->gpr[r] >> (24 - 8 * k))); }")
+            return f"{{ uint64_t ea = {ea}; uint32_t n = {n}, rt = {rt}; {body} }}"
 
         # ------- Trap (tw) — used for assertions, safe to no-op in recomp -------
         if mn == "tw" or mn == "twi" or mn == "td" or mn == "tdi":
@@ -3194,8 +3407,24 @@ class PPULifter:
         # ------- Default: emit as comment -------
         return f"/* TODO: {mn} {insn.operands} */;"
 
-    def _branch_condition(self, mnemonic: str, ops: list[str]) -> str:
-        """Generate a C condition expression for a conditional branch."""
+    def _branch_condition(self, mnemonic: str, ops: list[str], raw: int | None = None) -> str:
+        """Generate a C condition expression for a conditional branch.
+
+        With the raw word (bc/bclr/bcctr) the condition is decoded from BO/BI
+        exactly as PowerISA defines it: a BO without 0x04 decrements the full
+        64-bit CTR (and tests it for != 0, or == 0 with 0x02), a BO without
+        0x10 tests CR bit BI against BO 0x08. Both tests must pass. Mnemonic
+        decoding is the fallback for callers without the word; it knew no
+        combined forms (bdnzt/bdnzf/bdzt/bdzf), which fell through to "1"."""
+        if raw is not None and (raw >> 26) in (16, 19):
+            bo, bi = (raw >> 21) & 31, (raw >> 16) & 31
+            parts = []
+            if not bo & 0x04:
+                parts.append("(--ctx->ctr == 0)" if bo & 0x02 else "(--ctx->ctr != 0)")
+            if not bo & 0x10:
+                bit = f"((ctx->cr >> {31 - bi}) & 1)"
+                parts.append(bit if bo & 0x08 else f"(!{bit})")
+            return " && ".join(parts) if parts else "1"
         mn = mnemonic.rstrip("la")  # strip link and absolute bits
         if mn.startswith("b"):
             mn = mn[1:]  # strip leading 'b'
@@ -3222,8 +3451,8 @@ class PPULifter:
             "le": f"(!((ctx->cr >> {shift}) & 4))",
             "so": f"((ctx->cr >> {shift}) & 1)",
             "ns": f"(!((ctx->cr >> {shift}) & 1))",
-            "dnz": "((ctx->ctr = (uint32_t)(ctx->ctr - 1)) != 0)",
-            "dz": "((ctx->ctr = (uint32_t)(ctx->ctr - 1)) == 0)",
+            "dnz": "(--ctx->ctr != 0)",
+            "dz": "(--ctx->ctr == 0)",
         }
 
         return cond_map.get(mn, f"/* cond: {mnemonic} */ 1")
@@ -3400,6 +3629,17 @@ class PPULifter:
 
         # Emit helper macros
         lines.append("/* Rotate helpers */")
+        # rlwinm/rlwnm/rlwimi in 64-bit mode: ROTL32 rotates (RS)[32:63] || (RS)[32:63],
+        # and MASK(MB+32, ME+32) wraps into the high word when MB > ME.
+        lines.append("static inline uint64_t ppc_rlw64(uint64_t rs, int sh, int mb, int me, uint64_t ra, int insert) {")
+        lines.append("    uint32_t w = (uint32_t)rs; sh &= 31;")
+        lines.append("    uint32_t rw = sh ? ((w << sh) | (w >> (32 - sh))) : w;")
+        lines.append("    uint64_t r = ((uint64_t)rw << 32) | rw;")
+        lines.append("    int x = mb + 32, y = me + 32;")
+        lines.append("    uint64_t m = (x <= y) ? ((~0ull >> x) & (~0ull << (63 - y)))")
+        lines.append("                          : ((~0ull >> x) | (~0ull << (63 - y)));")
+        lines.append("    return insert ? ((r & m) | (ra & ~m)) : (r & m);")
+        lines.append("}")
         lines.append("static inline uint32_t ppc_rlwinm(uint32_t rs, int sh, int mb, int me) {")
         lines.append("    sh &= 31;")
         lines.append("    uint32_t rotated = sh ? ((rs << sh) | (rs >> (32 - sh))) : rs;")
@@ -4157,6 +4397,9 @@ def main() -> None:
     parser.add_argument("--output", "-o", default=".", help="Output directory")
     parser.add_argument("--header-name", default="ppu_recomp.h", help="Header file name")
     parser.add_argument("--source-name", default="ppu_recomp.c", help="Source file name")
+    parser.add_argument("--max-chunk-lines", type=int, default=600_000,
+                        help="Split the lifted source into chunks of at most this many lines "
+                             "(smaller chunks compile in parallel)")
     parser.add_argument("--single-file", action="store_true",
                         help="Emit one ppu_recomp.c instead of split chunks (for "
                              "single-file post-processing, e.g. flOw's vmx_splice)")
@@ -4721,7 +4964,7 @@ def main() -> None:
         print(f"Wrote {os.path.basename(src_path)}")
     else:
         print("Writing C source (split into chunks)...", flush=True)
-        paths = lifter.write_source_files(args.output, base=base)
+        paths = lifter.write_source_files(args.output, base=base, max_lines=args.max_chunk_lines)
         print(f"Wrote {header_path}")
         print(f"Wrote {len(paths)} source chunks: "
               f"{os.path.basename(paths[0])} .. {os.path.basename(paths[-1])}")
