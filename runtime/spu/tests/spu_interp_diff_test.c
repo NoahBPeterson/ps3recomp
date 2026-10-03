@@ -10,7 +10,7 @@
  * range). That block is `#if 0` dead code in this RPCS3 snapshot; extract.py enables it.
  * FI is a port of the SPU LLVM recompiler's spu_fi intrinsic (the interpreter's FI is a TODO).
  * Ops RPCS3 does not implement (dfceq/dfcgt/dfcmeq/dfcmgt) fall back to the hand-written ISA
- * reference below (ref_exec); dftsv has no reference at all (neither RPCS3 nor ours implements it).
+ * reference below (ref_exec); so does dftsv (RPCS3 stubs it as fatal), checked against the Cell SPU ISA.
  * --audit compares that hand-written reference with RPCS3 itself (they agree on every integer op;
  * they differ on float/double, where the hand reference is plain IEEE).
  * Known RPCS3 precise-path quirk compensated for: CSFLT/CUFLT of a zero lane with i8 > 155 returns
@@ -330,6 +330,13 @@ static Ref ref_exec(int op, uint32_t insn, uint32_t pc, const u128* regs, const 
     case R_DFCGT: for (int d_ = 0; d_ < 2; d_++) sd(&r, d_, DBL(A) > DBL(B) ? ~0ull : 0); break;
     case R_DFCMEQ: for (int d_ = 0; d_ < 2; d_++) sd(&r, d_, fabs(DBL(A)) == fabs(DBL(B)) ? ~0ull : 0); break;
     case R_DFCMGT: for (int d_ = 0; d_ < 2; d_++) sd(&r, d_, fabs(DBL(A)) > fabs(DBL(B)) ? ~0ull : 0); break;
+    case R_DFTSV: for (int d_ = 0; d_ < 2; d_++) {     /* Cell SPU ISA dftsv (no RPCS3 impl) */
+        uint64_t v = qd(&A, d_), e = (v >> 52) & 0x7FF, f = v & 0xFFFFFFFFFFFFFull; int ng = (int)(v >> 63), t = 0;
+        if (e == 0x7FF && f) t |= i7 & 0x40;
+        if (e == 0x7FF && !f) t |= i7 & (ng ? 0x10 : 0x20);
+        if (e == 0 && !f) t |= i7 & (ng ? 0x04 : 0x08);
+        if (e == 0 && f) t |= i7 & (ng ? 0x01 : 0x02);
+        sd(&r, d_, t ? ~0ull : 0); } break;
     case R_FESD: for (int d_ = 0; d_ < 2; d_++) DSET((double)f_of(qw(&A, 2*d_))); break;
     case R_FRDS: for (int d_ = 0; d_ < 2; d_++) { uint64_t u = qd(&A, d_); double dd; memcpy(&dd, &u, 8); sw(&r, 2*d_, u_of((float)dd)); } break;
     default: R.next = ~0u; return R;      /* not covered by the reference: caller skips */

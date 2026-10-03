@@ -313,6 +313,7 @@ static int spu_step(spu_context* ctx) {
     case SPU_dfcgt:  DST = spu_dfcgt(A,B); break;
     case SPU_dfcmeq: DST = spu_dfcmeq(A,B); break;
     case SPU_dfcmgt: DST = spu_dfcmgt(A,B); break;
+    case SPU_dftsv:  DST = spu_dftsv(A, (int32_t)(d.rb & 0x7F)); break;   /* I7 sits in the rb field */
     /* control flow */
     case SPU_br: case SPU_bra: next = d.tgt; break;
     case SPU_brsl: case SPU_brasl: DST = spu_link((pc + 4) & 0x3FFFC); next = d.tgt;
