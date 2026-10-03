@@ -1270,6 +1270,8 @@ extern "C" uint32_t ppu_vm_size = 0;
  * the free window just below the mmapper region (0x11000000) and above any
  * game's high data segments, so it doesn't collide with the static image. */
 static uint32_t g_tls_vaddr = 0, g_tls_filesz = 0, g_tls_memsz = 0;
+/* Highest PT_LOAD end (vaddr + memsz): argv must not be written over the image. */
+static uint32_t g_image_hi = 0;
 #define PPU_TLS_IMG   0x10F00000u
 #define PPU_TLS_TP    (PPU_TLS_IMG + 0x7000u)
 
@@ -2469,6 +2471,18 @@ static void icall_hist(ppu_context* ctx, uint32_t tgt, int phase)
     ReleaseSRWLockExclusive(&lk);
 }
 
+/* ps3_indirect_call_to: dispatch to an explicit guest target with CTR left as
+ * the guest had it (b<cond>lrl branches through LR; CTR must not change). */
+static PPU_THREAD_LOCAL uint32_t g_icall_target;
+static PPU_THREAD_LOCAL int      g_icall_target_set;
+extern "C" void ps3_indirect_call(ppu_context* ctx);
+extern "C" void ps3_indirect_call_to(ppu_context* ctx, uint32_t target)
+{
+    g_icall_target = target;
+    g_icall_target_set = 1;
+    ps3_indirect_call(ctx);
+}
+
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
     static int on = -1;
@@ -2523,6 +2537,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         fprintf(stderr,"%s\n",ln); } } }
 #endif
     uint32_t addr = (uint32_t)ctx->ctr;
+    if (g_icall_target_set) { addr = g_icall_target; g_icall_target_set = 0; }
     /* PS3_CALLTRACE=N: log the first N indirect calls (target + r3/r4) --
      * generic visibility into vtable/callback dispatch (e.g. which job body a
      * JobManager worker runs). */
@@ -3466,6 +3481,7 @@ extern "C" uint32_t ppu_load_elf(const char* path)
         uint64_t p_filesz = be64(ph + 32);
         uint64_t p_memsz  = be64(ph + 40);
         if (p_memsz == 0) continue;
+        { uint64_t hi = be64(ph + 16) + p_memsz; if (hi > g_image_hi) g_image_hi = (uint32_t)hi; }
         /* Bounds-check both ends before touching host memory: the source range
          * must lie inside the ELF file, and the destination range inside the
          * guest VM (ppu_vm_size==0 = unchecked, matching the vm accessors).
@@ -3893,6 +3909,9 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
         }
 
         uint32_t argv_base = 0x00B00000u;          /* scratch in the .data/heap gap */
+        /* ...unless the image itself reaches past it: then just above the image
+         * (a fixed address silently overwrote a large ELF's data). */
+        if (g_image_hi > argv_base) argv_base = (g_image_hi + 0xFFFFu) & ~0xFFFFu;
         /* argc_n argv pointers, a NULL argv terminator, then a NULL envp. */
         uint32_t slots     = (argc_n + 2u) * 8u;
         uint32_t str_addr  = argv_base + ((slots + 0x1Fu) & ~0x1Fu);
