@@ -885,6 +885,14 @@ int64_t sys_event_port_disconnect(ppu_context* ctx)
     return CELL_OK;
 }
 
+/* Does an lv2 event queue with this id exist? (HLE libraries that bind a
+ * queue on the guest's behalf report ESRCH for one that does not.) */
+int sys_event_queue_exists(uint32_t queue_id)
+{
+    return queue_id != 0 && queue_id <= SYS_EVENT_QUEUE_MAX &&
+           g_sys_event_queues[queue_id - 1].active;
+}
+
 /* Public helper for non-syscall callers: push an event into a queue by
  * ID. Returns 0 on success, -1 if the queue is unknown/inactive or full. */
 int sys_event_queue_push_by_id(uint32_t queue_id,
