@@ -1025,9 +1025,10 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                 size_t sz = spu_elf_image_size(host_elf, 2u * 1024 * 1024);
                 if (sz)
                     /* Async: SPURS tasks are persistent workers — running them
-                     * inline would block this PPU thread forever (deadlock). */
-                    spu_workload_dispatch_async(host_elf, (uint32_t)sz,
-                                                (uint32_t)(uintptr_t)context);
+                     * inline would block this PPU thread forever (deadlock).
+                     * Unlifted images run on the interpreter (spu_task_dispatch). */
+                    spu_task_dispatch(taskset_ea, i, host_elf, (uint32_t)sz,
+                                      (uint32_t)(uintptr_t)context);
             }
             return CELL_OK;
         }

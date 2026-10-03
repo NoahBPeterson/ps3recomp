@@ -94,6 +94,7 @@ class SpuAsm:
     def brnz(self, rt, lab):   self._br(0x042, rt, lab)
     def brsl(self, rt, lab):   self._br(0x066, rt, lab)
     def bi(self, ra):          self.rr(0x1A8, 0, ra, 0)
+    def bisl(self, rt, ra):    self.rr(0x1A9, rt, ra, 0)
 
     def bytes(self):
         for i, op9, rt, lab in self.fix:

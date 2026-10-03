@@ -434,7 +434,9 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
                         "(after task %u exited)\n", t, taskset_ea, elf, done_task);
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
-        spu_workload_dispatch_async(vm_base + elf, (uint32_t)sz, ctx);
+        ts_unlock();                      /* the interpreter path marks running itself */
+        spu_task_dispatch(taskset_ea, t, vm_base + elf, (uint32_t)sz, ctx);
+        ts_lock();
     }
     ts_unlock();
 }
@@ -1268,4 +1270,124 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     pthread_detach(th);
 #endif
     return 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * Unlifted SPURS tasks on the interpreter, with the taskset policy module's
+ * task ABI (as libsre sets it up; checked by tests/conformance/mc --suite
+ * spurs):
+ *   r3 = the task's CellSpursTaskArgument (task_info[id].args, 16 bytes)
+ *   r4 = {taskset->args (u64), taskset->spurs (u64)}
+ *   LS 0x27C4 (SpursTasksetContext.syscallAddr) = the task syscall entry:
+ *     r3 = syscall number (low 4 bits: 0 exit, 1 yield, ...), returns via r0.
+ * The syscall entry and the return-from-main link are planted `stop`s that
+ * this runner services. Only images with no lifted registration come here;
+ * the lifted path (spu_workload_dispatch_async) is unchanged.
+ * -----------------------------------------------------------------------*/
+#define TASK_INTERP_SYSCALL_LS  0xA70u
+#define TASK_INTERP_RETURN_LS   0xA80u
+#define TASK_INTERP_STOP_SC     0x3E2u
+#define TASK_INTERP_STOP_RET    0x3E3u
+
+typedef struct { uint32_t taskset_ea, taskid, size; const uint8_t* image; } spu_task_interp_job;
+
+static uint32_t ti_be32(const uint8_t* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+static void ti_put32(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+}
+
+static void spu_task_interp_run(spu_task_interp_job* j)
+{
+    extern uint8_t* vm_base;
+    extern uint32_t spu_interp_run(spu_context*, uint32_t);
+    spu_context* ctx = (spu_context*)malloc(sizeof(spu_context));
+    if (!ctx) return;
+    memset(ctx, 0, sizeof(*ctx));
+    spu_context_init(ctx, 0);
+    uint32_t entry = 0;
+    if (!spu_elf_load_to_ls(j->image, j->size, ctx->ls, &entry)) {
+        fprintf(stderr, "[spurs-task] taskset 0x%08X task %u: ELF load failed\n", j->taskset_ea, j->taskid);
+    } else {
+        const uint8_t* ts = vm_base + j->taskset_ea;
+        const uint8_t* ti = ts + 0x80 + 0x30 * j->taskid;
+        uint8_t* ls = ctx->ls;
+        ti_put32(ls + 0x27C4, TASK_INTERP_SYSCALL_LS);
+        ti_put32(ls + TASK_INTERP_SYSCALL_LS, TASK_INTERP_STOP_SC);
+        ti_put32(ls + TASK_INTERP_RETURN_LS, TASK_INTERP_STOP_RET);
+        for (int k = 0; k < 4; k++) ctx->gpr[3]._u32[k] = ti_be32(ti + 4 * k);
+        ctx->gpr[4]._u32[0] = ti_be32(ts + 0x68); ctx->gpr[4]._u32[1] = ti_be32(ts + 0x6C);
+        ctx->gpr[4]._u32[2] = ti_be32(ts + 0x60); ctx->gpr[4]._u32[3] = ti_be32(ts + 0x64);
+        ctx->gpr[1]._u32[0] = 0x3FFF0;
+        ctx->gpr[0]._u32[0] = TASK_INTERP_RETURN_LS;           /* return from main = exit */
+        uint32_t pc = entry;
+        for (;;) {
+            spu_interp_run(ctx, pc);
+            if (ctx->status == SPU_STATUS_STOPPED_BY_STOP && ctx->stop_code == TASK_INTERP_STOP_SC) {
+                uint32_t sc = ctx->gpr[3]._u32[0] & 0xF;
+                if (sc == 0) break;                            /* CELL_SPURS_TASK_SYSCALL_EXIT */
+                if (sc != 1) {                                 /* yield is a no-op here */
+                    static int n = 0;
+                    if (n++ < 8)
+                        fprintf(stderr, "[spurs-task] task syscall %u not modelled (returning 0)\n", sc);
+                }
+                ctx->gpr[3] = spu_make_preferred_u32(0);
+                pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+                continue;
+            }
+            if (!(ctx->status == SPU_STATUS_STOPPED_BY_STOP && ctx->stop_code == TASK_INTERP_STOP_RET))
+                fprintf(stderr, "[spurs-task] taskset 0x%08X task %u ended: status 0x%X stop 0x%X pc 0x%05X\n",
+                        j->taskset_ea, j->taskid, ctx->status, ctx->stop_code, ctx->pc);
+            break;
+        }
+    }
+    { extern void spu_coh_unregister(spu_context*); spu_coh_unregister(ctx); }
+    free(ctx);
+    spu_taskset_task_exited(j->taskset_ea, j->taskid);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI spu_task_interp_thread(LPVOID p)
+#else
+static void* spu_task_interp_thread(void* p)
+#endif
+{
+    spu_task_interp_job* j = (spu_task_interp_job*)p;
+    spu_task_interp_run(j);
+    free(j);
+    return 0;
+}
+
+int spu_task_dispatch_interp(uint32_t taskset_ea, uint32_t taskid,
+                             const uint8_t* image, uint32_t image_size)
+{
+    spu_task_interp_job* j = (spu_task_interp_job*)malloc(sizeof(*j));
+    if (!j) return 0;
+    j->taskset_ea = taskset_ea; j->taskid = taskid; j->image = image; j->size = image_size;
+    fprintf(stderr, "[spurs-task] taskset 0x%08X task %u: no lifted image, interpreting\n",
+            taskset_ea, taskid);
+#ifdef _WIN32
+    HANDLE th = CreateThread(NULL, 1u << 20, spu_task_interp_thread, j, 0, NULL);
+    if (!th) { free(j); return 0; }
+    CloseHandle(th);
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, spu_task_interp_thread, j) != 0) { free(j); return 0; }
+    pthread_detach(th);
+#endif
+    return 1;
+}
+
+int spu_task_dispatch(uint32_t taskset_ea, uint32_t taskid, const uint8_t* image,
+                      uint32_t image_size, uint32_t context_ea)
+{
+    int image_id = 0;
+    /* Running from now, not from when the host thread gets going: until then
+     * a sibling task's exit (spu_taskset_task_exited) saw this task enabled,
+     * ready and not running, and started it a second time. */
+    spu_taskset_mark(taskset_ea, taskid, 1);
+    if (spu_workload_find_img(spu_workload_fingerprint(image, image_size), &image_id))
+        return spu_workload_dispatch_async(image, image_size, context_ea);
+    return spu_task_dispatch_interp(taskset_ea, taskid, image, image_size);
 }
