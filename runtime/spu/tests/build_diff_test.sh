@@ -18,7 +18,7 @@ echo "built $OUT/spu_interp_diff_test"
 # lifted mode: sample instruction words, lift each with tools/spu_lifter.py, compile that C into a second binary
 "$OUT/spu_interp_diff_test" --emit-cases "${CASE_SCALE:-1}" > "$OUT/cases.txt"
 python3 "$HERE/gen_lifted_cases.py" "$OUT/cases.txt" > "$OUT/lifted_cases.inc"
-"$CC" -std=gnu11 -O1 -w -DLIFTED_CASES_INC=\"lifted_cases.inc\" -I"$HERE/.." -I"$HERE/rpcs3_oracle" -I"$OUT" -c "$HERE/spu_interp_diff_test.c" -o "$OUT/diff_test_lifted.o"
+"$CC" -std=gnu11 -O2 -fwrapv -w -DLIFTED_CASES_INC=\"lifted_cases.inc\" -I"$HERE/.." -I"$HERE/rpcs3_oracle" -I"$OUT" -c "$HERE/spu_interp_diff_test.c" -o "$OUT/diff_test_lifted.o"
 "$CXX" "$OUT/diff_test_lifted.o" "$OUT/oracle.o" -o "$OUT/spu_lifted_diff_test" -lm
 echo "built $OUT/spu_lifted_diff_test  (run with --lifted)"
 if [ "$1" = "--run" ]; then shift; [ "$1" = "--" ] && shift; "$OUT/spu_interp_diff_test" "$@"; exec "$OUT/spu_lifted_diff_test" --lifted "$@"; fi
