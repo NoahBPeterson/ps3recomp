@@ -288,10 +288,12 @@ def build(cases, out_path):
     return manifest
 
 
-def write_elf(text, data_base, data, entry_opd, opd_size):
+def write_elf(text, data_base, data, entry_opd, opd_size, extra_ph=()):
     """ELF64 BE PPC64 ET_EXEC: two PT_LOADs, plus section headers for .text
-    and .opd (ppu_loader.py finds functions through the section holding e_entry)."""
-    ehdr, phsz, phnum, shsz = 64, 56, 2, 64
+    and .opd (ppu_loader.py finds functions through the section holding e_entry).
+    extra_ph: (p_type, vaddr, size) program headers for blocks inside the data
+    segment (sys_process_param 0x60000001, sys_proc_prx_param 0x60000002)."""
+    ehdr, phsz, phnum, shsz = 64, 56, 2 + len(extra_ph), 64
     text_off = 0x1000
     data_off = (text_off + len(text) + 0xFFF) & ~0xFFF
     shstr = b"\0.text\0.opd\0.data\0.shstrtab\0"
@@ -307,6 +309,9 @@ def write_elf(text, data_base, data, entry_opd, opd_size):
                          filesz, memsz, 0x10000)
     ph(0, text_off, TEXT_BASE, len(text), len(text), 5)
     ph(1, data_off, data_base, len(data), len(data), 6)
+    for i, (typ, vaddr, size) in enumerate(extra_ph):
+        struct.pack_into(">IIQQQQQQ", out, ehdr + (2 + i) * phsz, typ, 4, data_off + vaddr - data_base,
+                         vaddr, vaddr, size, size, 4)
     out[text_off:text_off + len(text)] = text
     out[data_off:data_off + len(data)] = data
     out[shstr_off:shstr_off + len(shstr)] = shstr

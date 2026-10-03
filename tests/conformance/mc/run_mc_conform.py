@@ -8,7 +8,8 @@ MFC DMA, atomics and PPU<->SPU mailboxes/signals.
      as resident, concurrent threads with blocking channels
   4. the MCCONF BEGIN..END transcripts must be identical
 
-usage: run_mc_conform.py --work DIR [--rpcs3 PATH] [--skip-oracle] [--skip-build]
+usage: run_mc_conform.py --work DIR [--suite mc|spurs] [--rpcs3 PATH] [--skip-oracle] [--skip-build]
+  --suite spurs runs gen_spurs_conform.py instead (SPURS through firmware imports).
 """
 import argparse
 import os
@@ -27,14 +28,23 @@ SPU_ENV = {"RD_SPU_INTERP": "1", "RD_SPU_INTERP_ASYNC": "1", "SPU_CH_BLOCK": "1"
            "PS3_VERBOSE": "0"}
 
 
-def cut(path):
-    m = re.search(rb"MCCONF BEGIN.*?MCCONF END", open(path, "rb").read(), re.S)
-    return m.group(0).decode("latin-1").splitlines() if m else None
+SUITES = {"mc": ("gen_mc_conform.py", "mc_conform", b"MCCONF"),
+          "spurs": ("gen_spurs_conform.py", "spurs_conform", b"SPURSCONF")}
+
+
+def cut(path, tag):
+    m = re.search(tag + rb" BEGIN.*?" + tag + rb" END", open(path, "rb").read(), re.S)
+    if not m:
+        return None
+    # the harness prints only hex lines; runtime logging on stdout is dropped
+    return [l for l in m.group(0).decode("latin-1").splitlines()
+            if l.startswith(tag.decode()) or (l and all(c in "0123456789abcdef" for c in l))]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", required=True)
+    ap.add_argument("--suite", choices=sorted(SUITES), default="mc")
     ap.add_argument("--rpcs3", default=DEFAULT_RPCS3)
     ap.add_argument("--skip-oracle", action="store_true")
     ap.add_argument("--skip-build", action="store_true")
@@ -43,13 +53,14 @@ def main():
     a = ap.parse_args()
     work = os.path.abspath(a.work)
     os.makedirs(work, exist_ok=True)
-    elf = os.path.join(work, "mc_conform.elf")
+    gen, stem, tag = SUITES[a.suite]
+    elf = os.path.join(work, stem + ".elf")
     py = sys.executable
 
-    if sh([py, os.path.join(HERE, "gen_mc_conform.py"), "-o", elf]).returncode:
+    if sh([py, os.path.join(HERE, gen), "-o", elf]).returncode:
         sys.exit(2)
     if not a.skip_oracle:
-        run_oracle(a.rpcs3, elf, work, a.timeout, marker=b"MCCONF END")
+        run_oracle(a.rpcs3, elf, work, a.timeout, marker=tag + b" END")
 
     rec, bld = os.path.join(work, "recompiled"), os.path.join(work, "build")
     if not a.skip_build:
@@ -58,8 +69,8 @@ def main():
               stdout=subprocess.DEVNULL).returncode:
             sys.exit(2)
         if sh([py, os.path.join(ROOT, "tools", "ppu_lifter.py"), elf,
-               "--functions", os.path.join(load, "mc_conform.functions.json"),
-               "--hle-stubs", os.path.join(load, "mc_conform.imports.json"),
+               "--functions", os.path.join(load, stem + ".functions.json"),
+               "--hle-stubs", os.path.join(load, stem + ".imports.json"),
                "-o", rec], stdout=subprocess.DEVNULL).returncode:
             sys.exit(2)
         if not os.path.exists(os.path.join(bld, "build.ninja")):
@@ -80,11 +91,11 @@ def main():
         except subprocess.TimeoutExpired:
             print("lifted run: TIMEOUT")
 
-    want, got = cut(os.path.join(work, "oracle.txt")), cut(ours)
+    want, got = cut(os.path.join(work, "oracle.txt"), tag), cut(ours, tag)
     if want is None:
-        print("oracle transcript has no MCCONF block"); sys.exit(2)
+        print("oracle transcript has no %s block" % tag.decode()); sys.exit(2)
     if got is None:
-        print("our transcript has no MCCONF block (see ours.stderr.txt)"); sys.exit(1)
+        print("our transcript has no %s block (see ours.stderr.txt)" % tag.decode()); sys.exit(1)
     bad = [(i, w, g) for i, (w, g) in enumerate(zip(want, got)) if w != g]
     if len(want) != len(got):
         bad.append((min(len(want), len(got)), "<%d lines>" % len(want), "<%d lines>" % len(got)))

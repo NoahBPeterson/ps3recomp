@@ -1416,7 +1416,10 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
         *(vm_base + (u32)attr_ea + WKATTR_PRIORITY + i) =
             prio_ea ? *(vm_base + (u32)prio_ea + i) : 0;
     vm_write32((u32)attr_ea + WKATTR_MIN_CONT, minContention);
-    vm_write32((u32)attr_ea + WKATTR_MAX_CONT, 1);   /* 9th arg is beyond the 8-GPR adapter */
+    /* maxContention is the 9th argument: the plain 8-GPR adapter cannot see
+     * it, so it defaults to 1 here and the context handler below
+     * (_cellSpursWorkloadAttributeInitialize_ctx) stores the real value. */
+    vm_write32((u32)attr_ea + WKATTR_MAX_CONT, 1);
     vm_write32((u32)attr_ea + WKATTR_NAME_CLASS, 0);
     vm_write32((u32)attr_ea + WKATTR_NAME_INST,  0);
     vm_write32((u32)attr_ea + WKATTR_HOOK,     0);
@@ -1424,6 +1427,18 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
     printf("[cellSpurs] _WorkloadAttributeInitialize(attr=0x%08X pm=0x%08X size=%u data=0x%llX minC=%u)\n",
            (u32)attr_ea, (u32)pm_ea, size, (unsigned long long)data, minContention);
     return CELL_OK;
+}
+
+/* Context-ABI entry (registered by ppu_sysprx.cpp): PPC64 passes arguments 9+
+ * in the caller's parameter save area, so maxContention is the u32 at
+ * r1 + 112 (low word of the doubleword at 112). */
+void _cellSpursWorkloadAttributeInitialize_ctx(uint64_t* gpr)
+{
+    s32 rc = _cellSpursWorkloadAttributeInitialize(gpr[3], (u32)gpr[4], (u32)gpr[5], gpr[6],
+                                                   (u32)gpr[7], gpr[8], gpr[9], (u32)gpr[10]);
+    if (rc == CELL_OK)
+        vm_write32((u32)gpr[3] + WKATTR_MAX_CONT, vm_read32((u32)gpr[1] + 112 + 4));
+    gpr[3] = (uint64_t)(int64_t)rc;
 }
 
 s32 cellSpursWorkloadAttributeSetName(u64 attr_ea, u64 nameClass_ea, u64 nameInstance_ea)
@@ -1500,13 +1515,16 @@ static WklPm* spurs_resolve_pm(u32 wid)
     uint64_t fp = spu_workload_fingerprint(vm_base + (uint32_t)(uintptr_t)w->pm,
                                            w->sizePm);
     r->fn = spu_workload_find_img(fp, &r->image_id);
-    r->resolved = r->fn ? 1 : -1;
+    /* An unlifted module still runs: spu_run_policy_module interprets it
+     * (fn == NULL). Skipping it -- the old behaviour -- left the workload dead
+     * while every API call reported success. */
+    r->resolved = 1;
     if (r->fn)
-        printf("[cellSpurs] wid=%u PM resolved (fp=0x%016llX image=%d)\n",
-               wid, (unsigned long long)fp, r->image_id);
+        fprintf(stderr, "[cellSpurs] wid=%u PM resolved (fp=0x%016llX image=%d)\n",
+                wid, (unsigned long long)fp, r->image_id);
     else
-        printf("[cellSpurs] wid=%u PM NOT LIFTED (fp=0x%016llX size=%u) -- workload will not run\n",
-               wid, (unsigned long long)fp, w->sizePm);
+        fprintf(stderr, "[cellSpurs] wid=%u PM not lifted (fp=0x%016llX size=%u) -- interpreting\n",
+                wid, (unsigned long long)fp, w->sizePm);
     /* Dump the PM as laid down at runtime so the port can lift exactly these
      * bytes and re-register by this fingerprint (SPURS_PM_DUMP_DIR, default
      * "./spu_pm_dumps"). Runs once per unlifted workload. */
@@ -1523,7 +1541,7 @@ static WklPm* spurs_resolve_pm(u32 wid)
             printf("[cellSpurs]   dumped PM -> %s\n", path);
         }
     }
-    return r->fn ? r : NULL;
+    return r;
 }
 
 /* Thread creation, waiting and Sleep come from runtime/platform/win32_compat.h
@@ -1543,7 +1561,7 @@ static WklPm* spurs_resolve_pm(u32 wid)
 struct spurs_pm_worker_arg {
     spu_lifted_entry_fn fn; int image_id;
     const uint8_t* pm; uint32_t pm_size;
-    uint64_t arg; uint32_t wid, ea, spu_num;
+    uint64_t arg; uint32_t wid, ea, spu_num, poll;
 };
 static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
@@ -1552,7 +1570,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
 #endif
     struct spurs_pm_worker_arg* a = (struct spurs_pm_worker_arg*)p;
     spu_run_policy_module(a->fn, a->image_id, a->pm, a->pm_size,
-                          a->arg, a->wid, a->ea, a->spu_num);
+                          a->arg, a->wid, a->ea, a->spu_num, a->poll);
     return 0;
 }
 
@@ -1676,7 +1694,12 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             volatile u8* rdy = vm_base + ea + SPURS_WKL_READY1 + wid;
             u32 sig = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;    /* be u16 @0x70 */
             int kicked = (*rdy != 0) || ((sig & (0x8000u >> wid)) != 0);
-            if (*rdy) (*rdy)--;
+            /* The kernel never consumes readyCount: it is the number of SPUs
+             * the workload asks for, owned by the PPU and the module. (This
+             * used to decrement it per dispatch.) The signal bit is cleared
+             * when the workload is selected. */
+            const u32 ready_now = *rdy;
+            const int signalled = (sig & (0x8000u >> wid)) != 0;
             if (sig & (0x8000u >> wid))
                 vm_write32(ea + SPURS_WKL_SIGNAL1,
                            (vm_read32(ea + SPURS_WKL_SIGNAL1) & ~((0x8000u >> wid) << 16)));
@@ -1744,6 +1767,11 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
               if (s_fs == -2) { const char* e = getenv("SPURS_FORCE_SPUS");
                 s_fs = e ? atoi(e) : -1; }
               if (s_fs > 0) maxcont = (u8)(s_fs > 6 ? 6 : s_fs); }
+            /* The kernel puts a workload on another SPU only while readyCount
+             * exceeds its contention, so a readyCount of n runs at most n
+             * SPUs. (readyCount 0 keeps the enabled-means-runnable behaviour
+             * described above.) */
+            if (ready_now && ready_now < maxcont) maxcont = (u8)ready_now;
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = maxcont;
             { static volatile int s_mc_logged[16];
               if (wid < 16 && !__atomic_exchange_n(&s_mc_logged[wid], 1, __ATOMIC_RELAXED))
@@ -1752,8 +1780,10 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             {
                 const uint8_t* pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm;
                 uint32_t sz = s_workloads[wid].sizePm;
+                /* lane k picks the workload with contention k already running */
+                #define POLL_FOR(k) ((ready_now > (k) ? 1u : 0u) | (signalled ? 2u : 0u))
                 if (maxcont <= 1) {
-                    spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
+                    spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0, POLL_FOR(0));
                 } else {
                     /* Run the workload's virtual SPUs CONCURRENTLY (see
                      * spurs_pm_worker): each lane advances in parallel so the
@@ -1765,10 +1795,10 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                         wa[nth].fn = r->fn; wa[nth].image_id = r->image_id;
                         wa[nth].pm = pm; wa[nth].pm_size = sz;
                         wa[nth].arg = arg; wa[nth].wid = wid; wa[nth].ea = ea;
-                        wa[nth].spu_num = sn;
+                        wa[nth].spu_num = sn; wa[nth].poll = POLL_FOR(sn);
                         th[nth] = CreateThread(NULL, 1u << 20, spurs_pm_worker, &wa[nth], 0, NULL);
                     }
-                    spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
+                    spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0, POLL_FOR(0));
                     if (nth) {
                         WaitForMultipleObjects(nth, th, TRUE, INFINITE);
                         for (unsigned k = 0; k < nth; k++) CloseHandle(th[k]);
@@ -1776,6 +1806,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 }
             }
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;
+            #undef POLL_FOR
             /* "Found work" heuristic: a module that did something polls the
              * kernel for MORE work before exiting (selectWorkload calls >0);
              * an idle module exits immediately with polls==0. Grow the idle
