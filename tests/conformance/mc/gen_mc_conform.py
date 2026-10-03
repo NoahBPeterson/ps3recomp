@@ -21,6 +21,10 @@ Tests (each prints hex lines on tty 0, deterministic by construction):
      alternating log; an event flag AND-wait wakes only when both bits are set.
   F  more MFC: GETLLAR/PUTLLC/PUTLLUC atomic status values, immediate tag
      status, and a GETL whose middle element has stall-and-notify set.
+  G  PPU -> SPU events: the PPU sends three sys_event_port_send events through
+     a local port to an SPU queue bound to the thread; the SPU receives them
+     with sys_spu_thread_receive_event (stop 0x110) and PUTs status + data.
+     The group's RUN event queue reports the start.
   Every group join prints (cause, status) and each thread's exit status.
 
 The same bytes run on RPCS3 and through ps3recomp; run_mc_conform.py diffs.
@@ -48,7 +52,10 @@ SC = dict(process_exit=3, tty_write=403, spu_initialize=169, image_import=157,
           mutex_create=100, mutex_lock=102, mutex_unlock=104,
           cond_create=105, cond_wait=107, cond_signal=108,
           sem_create=90, sem_wait=92, sem_post=94,
-          eflag_create=82, eflag_wait=85, eflag_set=87)
+          eflag_create=82, eflag_wait=85, eflag_set=87,
+          group_connect_event=185, bind_queue=193, port_create=134,
+          port_connect_local=136, port_send=138)
+SPUQ = 0x20             # SPU queue number for test G
 SPUP = 5                # SPU event port used by test D
 N_MUTEX = 200           # increments per PPU thread in test E
 N_PING = 16             # cond ping-pong rounds
@@ -199,6 +206,24 @@ def spu_mfc2_prog():
     return a.bytes()
 
 
+def spu_recv_prog():
+    """arg1 = EA of 192 result bytes. Three sys_spu_thread_receive_event
+    (spuq in SPU_WrOutMbox, stop 0x110, then status/data1/data2/data3 from the
+    inbound mailbox); each value is stored as its own quadword (rdch zeroes
+    words 1-3) and the twelve are PUT out. Exits 0x7000."""
+    a = S.SpuAsm(SPU_BASE)
+    a.rotqbyi(3, 3, 4)
+    a.ila(13, 0x10000)
+    for k in range(3):
+        a.il(10, SPUQ); a.wrch(S.SPU_WrOutMbox, 10); a.stop(0x110)
+        for w in range(4):
+            a.rdch(20, S.SPU_RdInMbox); a.stqd(20, 13, 16 * (4 * k + w))
+    a.il(11, 192)
+    a.mfc(S.PUT, 13, 3, 11, 2, 12); a.wait_tag(2, 12)
+    a.li32(30, 0x7000); a.wrch(S.SPU_WrOutMbox, 30); a.stop(0x102)
+    return a.bytes()
+
+
 def wrap_spu(code, tmpdir, name):
     raw = os.path.join(tmpdir, name + ".bin")
     elf = os.path.join(tmpdir, name + ".elf")
@@ -299,7 +324,8 @@ def build(out_path):
             "atomic": wrap_spu(spu_atomic_prog(), tmp, "atomic"),
             "mbox": wrap_spu(spu_mbox_prog(), tmp, "mbox"),
             "event": wrap_spu(spu_event_prog(), tmp, "event"),
-            "mfc2": wrap_spu(spu_mfc2_prog(), tmp, "mfc2")}
+            "mfc2": wrap_spu(spu_mfc2_prog(), tmp, "mfc2"),
+            "recv": wrap_spu(spu_recv_prog(), tmp, "recv")}
 
     D = Data()
     D.take("opd", 8 * len(FUNCS))
@@ -335,6 +361,9 @@ def build(out_path):
     D.take("ef_res", 16)
     # F: MFC block
     D.take("mfc2", 0x400, 128)
+    # G: PPU -> SPU events
+    D.take("spuq_attr", 16); D.take("spuq_id", 16); D.take("grpq_id", 16)
+    D.take("port_id", 16); D.take("grp_ev", 32); D.take("recv_out", 192, 128)
     HDR = b"MCCONF BEGIN\n"
     END = b"MCCONF END\n"
 
@@ -478,6 +507,31 @@ def build(out_path):
         join_and_report(1)
         dump(d["mfc2"], 0x300)
 
+        # G: PPU -> SPU events
+        sc(SC["equeue_create"], d["spuq_id"], d["spuq_attr"], 0, 16)
+        sc(SC["equeue_create"], d["grpq_id"], d["eq_attr"], 0, 16)
+        sc(SC["port_create"], d["port_id"], 1, 0)
+        lwz_arg(3, d["port_id"]); lwz_arg(4, d["spuq_id"])
+        t.emit(P.addi(11, 0, SC["port_connect_local"]), P.sc())
+        def bind():
+            lwz_arg(3, d["ids"]); lwz_arg(4, d["grpq_id"])
+            t.emit(P.addi(5, 0, 1), P.addi(11, 0, SC["group_connect_event"]), P.sc())
+            lwz_arg(3, d["ids"] + 4); lwz_arg(4, d["spuq_id"])
+            t.emit(P.addi(5, 0, SPUQ), P.addi(11, 0, SC["bind_queue"]), P.sc())
+        group("recv", 1, lambda i: (d["recv_out"], 0), bind)
+        lwz_arg(3, d["grpq_id"])
+        t.emit(P.li32(4, d["grp_ev"]), P.addi(5, 0, 0), P.addi(11, 0, SC["equeue_receive"]), P.sc())
+        lwz_arg(10, d["ids"])
+        t.emit(P.X(31, 5, 10, 5, 40),                            # r5 -= group id
+               P.li32(9, d["grp_ev"]), P.std(4, 9, 0), P.std(5, 9, 8), P.std(6, 9, 16), P.std(7, 9, 24))
+        for k in range(3):
+            lwz_arg(3, d["port_id"])
+            t.emit(P.li32(4, 0x100 + k), P.li32(5, 0x2000 + k), P.li32(6, 0x30000 + k),
+                   P.addi(11, 0, SC["port_send"]), P.sc())
+        join_and_report(1)
+        dump(d["grp_ev"], 32)
+        dump(d["recv_out"], 192)
+
         puts(d["end"], len(END))
         t.emit(P.addi(3, 0, 0), P.addi(11, 0, SC["process_exit"]), P.sc(), P.b(0))
         emit_routines(t, d)
@@ -504,6 +558,7 @@ def build(out_path):
     put(d["gattr"], struct.pack(">IIiI", 8, d["gname"], 0, 0))
     put(d["tattr"], struct.pack(">III", d["gname"], 8, 0))
     put(d["eq_attr"], struct.pack(">Ii8s", 1, 1, b"confq"))     # SYS_SYNC_FIFO, SYS_PPU_QUEUE
+    put(d["spuq_attr"], struct.pack(">Ii8s", 1, 2, b"confsq"))  # SYS_SYNC_FIFO, SYS_SPU_QUEUE
     # FIFO / not recursive / not process-shared / not adaptive
     put(d["mtx_attr"], struct.pack(">IIIIQiI8s", 1, 0x20, 0x200, 0x2000, 0, 0, 0, b"confm"))
     put(d["sem_attr"], struct.pack(">IIQiI8s", 1, 0x200, 0, 0, 0, b"confs"))
