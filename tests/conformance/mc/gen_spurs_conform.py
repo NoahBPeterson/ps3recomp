@@ -14,6 +14,10 @@ Tests:
      waits for the shutdown, removes it and finalizes SPURS. Every call's return
      code and the counter line are printed, with the r4 (workload data, u64)
      and r5 (poll status) the kernel entered the module with.
+  T  taskset: four SPU tasks (an ELF loaded at LS 0x3000 by the taskset policy
+     module) each add {index+1, 1} to a shared line with GETLLAR/PUTLLC and exit
+     through the taskset syscall (LS 0x27C4, r3 = 0). The PPU waits for all
+     four, then shuts the taskset down and joins it; expected line {10, 4}.
 """
 import argparse
 import os
@@ -30,6 +34,8 @@ from gen_mc_conform import Data  # noqa: E402
 from lv2_imports import Imports, SDK_VERSION  # noqa: E402
 
 N_PM = 64               # policy-module increments
+N_TASKS = 4
+TASK_BASE = 0x3000      # tasks load above the taskset policy module
 PM_BASE = 0xA00         # SPURS loads a policy module at LS 0xA00
 SYS_TIMER_USLEEP, SYS_PROCESS_EXIT = 141, 3
 FUNCS = ["_start", "hexdump", "puts", "reset_scratch", "load_state", "save_state", "dump_scratch"]
@@ -39,7 +45,9 @@ IMPORTS = Imports({
     "cellSpurs": ["_cellSpursAttributeInitialize", "cellSpursInitializeWithAttribute",
                   "_cellSpursWorkloadAttributeInitialize", "cellSpursAddWorkloadWithAttribute",
                   "cellSpursReadyCountStore", "cellSpursShutdownWorkload",
-                  "cellSpursWaitForWorkloadShutdown", "cellSpursRemoveWorkload", "cellSpursFinalize"],
+                  "cellSpursWaitForWorkloadShutdown", "cellSpursRemoveWorkload", "cellSpursFinalize",
+                  "_cellSpursTasksetAttributeInitialize", "cellSpursCreateTasksetWithAttribute",
+                  "cellSpursCreateTask", "cellSpursShutdownTaskset", "cellSpursJoinTaskset"],
 })
 
 
@@ -72,8 +80,36 @@ def policy_module():
     return code + b"\0" * (-len(code) % 16)
 
 
+def task_prog():
+    """A SPURS task. r3 = the 16-byte task argument {line EA, index, 0, 0}.
+    Adds {index + 1, 1, 0, 0} to the line atomically, then
+    cellSpursTaskExit: bisl to the taskset syscall address (LS 0x27C4) with
+    r3 = CELL_SPURS_TASK_SYSCALL_EXIT."""
+    a = S.SpuAsm(TASK_BASE)
+    a.il(9, 0)
+    a.rotqbyi(6, 3, 4); a.il(8, 1); a.a(6, 6, 8)        # pref = index + 1
+    a.fsmbi(8, 0xF000); a.and_(6, 6, 8)
+    a.il(7, 1); a.fsmbi(8, 0x0F00); a.and_(7, 7, 8)     # {0, 1, 0, 0}
+    a.or_(6, 6, 7)
+    a.ila(10, 0x30000)
+    a.label("again")
+    a.wrch(S.MFC_LSA, 10); a.wrch(S.MFC_EAH, 9); a.wrch(S.MFC_EAL, 3)
+    a.il(12, S.GETLLAR); a.wrch(S.MFC_Cmd, 12); a.rdch(12, S.MFC_RdAtomicStat)
+    a.lqd(21, 10, 0); a.a(21, 21, 6); a.stqd(21, 10, 0)
+    a.wrch(S.MFC_LSA, 10); a.wrch(S.MFC_EAH, 9); a.wrch(S.MFC_EAL, 3)
+    a.il(12, S.PUTLLC); a.wrch(S.MFC_Cmd, 12); a.rdch(13, S.MFC_RdAtomicStat)
+    a.brnz(13, "again")
+    a.lqa(5, 0x27C0); a.rotqbyi(5, 5, 4)              # syscallAddr (0x27C4)
+    a.il(3, 0); a.il(4, 0); a.bisl(0, 5)
+    a.stop(0x3FF)                                      # not reached
+    return a.bytes()
+
+
 def build(out_path):
     pm = policy_module()
+    from gen_mc_conform import wrap_spu
+    import tempfile
+    task = wrap_spu(task_prog(), tempfile.mkdtemp(prefix="spursconf"), "task", base=TASK_BASE)
     D = Data()
     IMPORTS.take(D)                             # first: the tables must be in the low 32 KB
     D.take("opd", 8 * len(FUNCS))
@@ -87,7 +123,11 @@ def build(out_path):
     D.take("pm", len(pm), 128, pm)
     D.take("counter", 128, 128)
     D.take("wid", 16)
-    D.take("rcs", 64)
+    D.take("rcs", 128)
+    D.take("taskset", 6400, 128); D.take("tsattr", 512, 8)
+    D.take("task", len(task), 128, task)
+    D.take("tline", 128, 128); D.take("tids", 16 * N_TASKS)
+    D.take("targs", 16 * N_TASKS, 16)
     HDR, END = b"SPURSCONF BEGIN\n", b"SPURSCONF END\n"
     calls = []
 
@@ -115,6 +155,17 @@ def build(out_path):
             t.emit(P.li32(11, d["rcs"] + 4 * len(calls)), P.stw(3, 11, 0))
             calls.append(fn)
 
+        def wait_word(addr, value, tag):
+            """Poll a guest word until it equals value (bounded: 5000 x 1 ms)."""
+            t.emit(P.li32(20, 5000))
+            t.label(tag + "_poll")
+            t.emit(P.li32(9, addr), P.lwz(9, 9, 0), P.D(11, 0, 9, value))
+            t.bc(tag + "_done", 12, 2)
+            t.emit(P.addi(3, 0, 1000), P.addi(11, 0, SYS_TIMER_USLEEP), P.sc())
+            t.emit(P.addi(20, 20, -1), P.D(11, 0, 20, 0))
+            t.bc(tag + "_poll", 4, 2)
+            t.label(tag + "_done")
+
         calls.clear()
         t.label("_start")
         t.emit(P.li32(30, d["saved_r1"]), P.std(1, 30, 0), P.stdu(1, 1, -512))
@@ -128,21 +179,25 @@ def build(out_path):
              d["counter"], d["prio"], 1, stack=(2,))
         call("cellSpursAddWorkloadWithAttribute", d["spurs"], d["wid"], d["wattr"])
         call("cellSpursReadyCountStore", d["spurs"], ("mem", d["wid"]), 1)
-        # wait for the policy module to reach N_PM (bounded: 5000 x 1 ms)
-        t.emit(P.li32(20, 5000))
-        t.label("poll")
-        t.emit(P.li32(9, d["counter"]), P.lwz(9, 9, 0), P.D(11, 0, 9, N_PM))
-        t.bc("polled", 12, 2)
-        t.emit(P.addi(3, 0, 1000), P.addi(11, 0, SYS_TIMER_USLEEP), P.sc())
-        t.emit(P.addi(20, 20, -1), P.D(11, 0, 20, 0))
-        t.bc("poll", 4, 2)
-        t.label("polled")
+        wait_word(d["counter"], N_PM, "pm")
         call("cellSpursShutdownWorkload", d["spurs"], ("mem", d["wid"]))
         call("cellSpursWaitForWorkloadShutdown", d["spurs"], ("mem", d["wid"]))
         call("cellSpursRemoveWorkload", d["spurs"], ("mem", d["wid"]))
+        # T: taskset with four tasks
+        call("_cellSpursTasksetAttributeInitialize", d["tsattr"], 1, SDK_VERSION, 0, d["prio"], 2)
+        call("cellSpursCreateTasksetWithAttribute", d["spurs"], d["taskset"], d["tsattr"])
+        for i in range(N_TASKS):
+            call("cellSpursCreateTask", d["taskset"], d["tids"] + 4 * i, d["task"], 0, 0, 0,
+                 d["targs"] + 16 * i)
+        # a shutdown request does not wait for tasks that have not started:
+        # wait for all of them to report (line word 1 counts exits)
+        wait_word(d["tline"] + 4, N_TASKS, "tasks")
+        call("cellSpursShutdownTaskset", d["taskset"])
+        call("cellSpursJoinTaskset", d["taskset"])
         call("cellSpursFinalize", d["spurs"])
         dump(d["rcs"], 4 * len(calls))
         dump(d["counter"], 48)
+        dump(d["tline"], 16)
 
         puts(d["end"], len(END))
         t.emit(P.addi(3, 0, 0), P.addi(11, 0, SYS_PROCESS_EXIT), P.sc(), P.b(0))
@@ -169,6 +224,8 @@ def build(out_path):
     put(d["hex"], b"0123456789abcdef")
     put(d["hdr"], HDR); put(d["end"], END)
     IMPORTS.fill(put, d, t)
+    for i in range(N_TASKS):
+        put(d["targs"] + 16 * i, struct.pack(">IIII", d["tline"], i, 0, 0))
     elf = write_elf(text, data_base, bytes(data), d["opd"], 8 * len(FUNCS), IMPORTS.extra_ph(d))
     open(out_path, "wb").write(elf)
     print("wrote %s (%d SPURS calls, policy module %d bytes)" % (out_path, len(calls), len(pm)))

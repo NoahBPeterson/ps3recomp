@@ -224,12 +224,12 @@ def spu_recv_prog():
     return a.bytes()
 
 
-def wrap_spu(code, tmpdir, name):
+def wrap_spu(code, tmpdir, name, base=SPU_BASE):
     raw = os.path.join(tmpdir, name + ".bin")
     elf = os.path.join(tmpdir, name + ".elf")
     open(raw, "wb").write(code)
     subprocess.run([sys.executable, os.path.join(ROOT, "tools", "wrap_spu_elf.py"), raw,
-                    "--entry", hex(SPU_BASE), "--base", hex(SPU_BASE), "--out", elf],
+                    "--entry", hex(base), "--base", hex(base), "--out", elf],
                    check=True, capture_output=True)
     return open(elf, "rb").read()
 
