@@ -18,6 +18,9 @@ Tests:
      module) each add {index+1, 1} to a shared line with GETLLAR/PUTLLC and exit
      through the taskset syscall (LS 0x27C4, r3 = 0). The PPU waits for all
      four, then shuts the taskset down and joins it; expected line {10, 4}.
+  E  SPURS event flag (ANY2ANY, auto clear) from the PPU: attach an lv2 queue,
+     set/wait OR and AND, clear, then a blocking wait satisfied by a second PPU
+     thread's cellSpursEventFlagSet; detach. Return codes and output masks.
 """
 import argparse
 import os
@@ -38,7 +41,9 @@ N_TASKS = 4
 TASK_BASE = 0x3000      # tasks load above the taskset policy module
 PM_BASE = 0xA00         # SPURS loads a policy module at LS 0xA00
 SYS_TIMER_USLEEP, SYS_PROCESS_EXIT = 141, 3
-FUNCS = ["_start", "hexdump", "puts", "reset_scratch", "load_state", "save_state", "dump_scratch"]
+SYS_THREAD_CREATE, SYS_THREAD_START, SYS_THREAD_JOIN, SYS_THREAD_EXIT = 52, 53, 44, 41
+FUNCS = ["_start", "hexdump", "puts", "reset_scratch", "load_state", "save_state", "dump_scratch",
+         "ef_worker"]
 
 IMPORTS = Imports({
     "cellSysmodule": ["cellSysmoduleLoadModule"],
@@ -47,7 +52,10 @@ IMPORTS = Imports({
                   "cellSpursReadyCountStore", "cellSpursShutdownWorkload",
                   "cellSpursWaitForWorkloadShutdown", "cellSpursRemoveWorkload", "cellSpursFinalize",
                   "_cellSpursTasksetAttributeInitialize", "cellSpursCreateTasksetWithAttribute",
-                  "cellSpursCreateTask", "cellSpursShutdownTaskset", "cellSpursJoinTaskset"],
+                  "cellSpursCreateTask", "cellSpursShutdownTaskset", "cellSpursJoinTaskset",
+                  "_cellSpursEventFlagInitialize", "cellSpursEventFlagAttachLv2EventQueue",
+                  "cellSpursEventFlagSet", "cellSpursEventFlagWait", "cellSpursEventFlagClear",
+                  "cellSpursEventFlagDetachLv2EventQueue"],
 })
 
 
@@ -105,6 +113,10 @@ def task_prog():
     return a.bytes()
 
 
+def D_sth(rs, ra, d):
+    return P.D(44, rs, ra, d)                   # sth
+
+
 def build(out_path):
     pm = policy_module()
     from gen_mc_conform import wrap_spu
@@ -128,6 +140,8 @@ def build(out_path):
     D.take("task", len(task), 128, task)
     D.take("tline", 128, 128); D.take("tids", 16 * N_TASKS)
     D.take("targs", 16 * N_TASKS, 16)
+    D.take("ef", 128, 128); D.take("efmask", 16); D.take("efmasks", 16)
+    D.take("tparam", 16); D.take("tname", 16, 16, b"efset\0"); D.take("tid", 16); D.take("tret", 16)
     HDR, END = b"SPURSCONF BEGIN\n", b"SPURSCONF END\n"
     calls = []
 
@@ -194,14 +208,44 @@ def build(out_path):
         wait_word(d["tline"] + 4, N_TASKS, "tasks")
         call("cellSpursShutdownTaskset", d["taskset"])
         call("cellSpursJoinTaskset", d["taskset"])
+        # E: SPURS event flag from the PPU
+        def wait(mask, mode, k):
+            t.emit(P.li32(3, d["efmask"]), P.li32(4, mask), D_sth(4, 3, 0))
+            call("cellSpursEventFlagWait", d["ef"], d["efmask"], mode)
+            t.emit(P.li32(3, d["efmask"]), P.lwz(4, 3, 0), P.li32(5, d["efmasks"] + 4 * k), P.stw(4, 5, 0))
+        call("_cellSpursEventFlagInitialize", d["spurs"], 0, d["ef"], 0, 3)
+        call("cellSpursEventFlagAttachLv2EventQueue", d["ef"])
+        call("cellSpursEventFlagSet", d["ef"], 0x5)
+        wait(0x4, 0, 0)                                   # OR
+        call("cellSpursEventFlagSet", d["ef"], 0x2)
+        wait(0x3, 1, 1)                                   # AND
+        call("cellSpursEventFlagClear", d["ef"], 0xFFFF)
+        t.emit(P.li32(5, d["tparam"]), P.li32(6, d["opd"] + 8 * FUNCS.index("ef_worker")), P.stw(6, 5, 0))
+        for i, v in enumerate((d["tid"], d["tparam"], 0, 0, 1000, 0x10000, 1, d["tname"])):
+            t.emit(P.li32(3 + i, v))
+        t.emit(P.addi(11, 0, SYS_THREAD_CREATE), P.sc())
+        t.emit(P.li32(3, d["tid"] + 4), P.lwz(3, 3, 0), P.addi(11, 0, SYS_THREAD_START), P.sc())
+        wait(0x8, 0, 2)                                   # blocks until the worker sets 0x8
+        t.emit(P.li32(3, d["tid"] + 4), P.lwz(3, 3, 0), P.li32(4, d["tret"]),
+               P.addi(11, 0, SYS_THREAD_JOIN), P.sc())
+        call("cellSpursEventFlagDetachLv2EventQueue", d["ef"])
         call("cellSpursFinalize", d["spurs"])
         dump(d["rcs"], 4 * len(calls))
         dump(d["counter"], 48)
         dump(d["tline"], 16)
+        dump(d["efmasks"], 12)
+        dump(d["tret"], 8)
 
         puts(d["end"], len(END))
         t.emit(P.addi(3, 0, 0), P.addi(11, 0, SYS_PROCESS_EXIT), P.sc(), P.b(0))
         emit_routines(t, d)
+        # ef_worker: sleep 20 ms, set bit 0x8, exit with the call's return code
+        t.label("ef_worker")
+        t.emit(P.stdu(1, 1, -256))
+        t.emit(P.li32(3, 20000), P.addi(11, 0, SYS_TIMER_USLEEP), P.sc())
+        t.emit(P.li32(3, d["ef"]), P.addi(4, 0, 0x8))
+        t.bl("imp_cellSpursEventFlagSet")
+        t.emit(P.ld(2, 1, 40), P.addi(11, 0, SYS_THREAD_EXIT), P.sc(), P.b(0))
         IMPORTS.emit(t, d)
         return t
 

@@ -2088,10 +2088,11 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
 
     __atomic_sub_fetch(&s_ef_ppu_waiters, 1, __ATOMIC_SEQ_CST);
     ef_wait_stats(ea, ef_t0.QuadPart);
-    /* Hand back the observed bits; consume the received ones on AUTO clear. */
-    vm_write16(bits_ea, current);
+    /* Hand back the bits that satisfied the wait (current & pattern, as
+     * libsre does -- not every set bit); consume them on AUTO clear. */
     u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
                                                        : (u16)(current & pattern);
+    vm_write16(bits_ea, received);
     { static int _n = 0; if (_n++ < 40)
         fprintf(stderr, "[cellSpurs] EventFlagWait WAKE tid=%lu flagEA=0x%08X "
                 "pattern=0x%04X got=0x%04X (waits=%u)\n",

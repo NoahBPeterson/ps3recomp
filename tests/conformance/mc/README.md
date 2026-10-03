@@ -68,7 +68,13 @@ is Sony's SPURS kernel; ps3recomp answers with its HLE `libs/spurs`.
   r3 = 0). The PPU waits for all four (a shutdown request discards tasks that
   have not started), shuts the taskset down and joins it.
 
+- **event flag**: an ANY2ANY, auto-clear SPURS event flag driven from the PPU:
+  attach an lv2 queue, set / OR-wait / AND-wait / clear, then a blocking wait
+  satisfied by a second PPU thread's `cellSpursEventFlagSet`; detach.
+
 ps3recomp runs unlifted policy modules and tasks on its SPU interpreter.
+Not covered yet: the SPU side of event flags and LF queues, and job chains
+(their SPU halves are SDK library code a test would have to reproduce).
 
 ```
 python3 tests/conformance/mc/run_mc_conform.py --suite spurs --work /tmp/spursconf

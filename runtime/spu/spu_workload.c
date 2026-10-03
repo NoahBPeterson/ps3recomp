@@ -403,6 +403,7 @@ static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
     ts_unlock();
 }
 
+static int spu_task_dispatch_claimed(uint32_t, uint32_t, const uint8_t*, uint32_t, uint32_t);
 static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
 {
     extern uint8_t* vm_base;
@@ -434,8 +435,8 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
                         "(after task %u exited)\n", t, taskset_ea, elf, done_task);
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
-        ts_unlock();                      /* the interpreter path marks running itself */
-        spu_task_dispatch(taskset_ea, t, vm_base + elf, (uint32_t)sz, ctx);
+        ts_unlock();                      /* claimed above (run bit set under the lock) */
+        spu_task_dispatch_claimed(taskset_ea, t, vm_base + elf, (uint32_t)sz, ctx);
         ts_lock();
     }
     ts_unlock();
@@ -1379,15 +1380,32 @@ int spu_task_dispatch_interp(uint32_t taskset_ea, uint32_t taskid,
     return 1;
 }
 
-int spu_task_dispatch(uint32_t taskset_ea, uint32_t taskid, const uint8_t* image,
-                      uint32_t image_size, uint32_t context_ea)
+/* Start an already-claimed task (its running bit is set). */
+static int spu_task_dispatch_claimed(uint32_t taskset_ea, uint32_t taskid, const uint8_t* image,
+                                     uint32_t image_size, uint32_t context_ea)
 {
     int image_id = 0;
-    /* Running from now, not from when the host thread gets going: until then
-     * a sibling task's exit (spu_taskset_task_exited) saw this task enabled,
-     * ready and not running, and started it a second time. */
-    spu_taskset_mark(taskset_ea, taskid, 1);
     if (spu_workload_find_img(spu_workload_fingerprint(image, image_size), &image_id))
         return spu_workload_dispatch_async(image, image_size, context_ea);
     return spu_task_dispatch_interp(taskset_ea, taskid, image, image_size);
+}
+
+/* Claim (running bit clear -> set, under the taskset lock) and start. Two
+ * starters race for a freshly created task: cellSpursCreateTask, and a
+ * sibling's exit (spu_taskset_task_exited), which starts any enabled, ready,
+ * not-running task. Only the one that claims it launches it; without the claim
+ * a task occasionally ran twice. */
+int spu_task_dispatch(uint32_t taskset_ea, uint32_t taskid, const uint8_t* image,
+                      uint32_t image_size, uint32_t context_ea)
+{
+    if (taskset_ea && taskid < 128) {
+        int claimed = 0;
+        ts_lock();
+        uint8_t* r = ts_running(taskset_ea);
+        uint8_t m = (uint8_t)(0x80u >> (taskid & 7));
+        if (r && !(r[taskid / 8] & m)) { r[taskid / 8] |= m; claimed = 1; }
+        ts_unlock();
+        if (!claimed) return 1;                    /* someone else started it */
+    }
+    return spu_task_dispatch_claimed(taskset_ea, taskid, image, image_size, context_ea);
 }
