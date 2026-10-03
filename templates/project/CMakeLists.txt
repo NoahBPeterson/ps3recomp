@@ -230,6 +230,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(${PROJECT_NAME} PRIVATE
         -Wall -Wextra -Wno-unused-parameter
         -fno-strict-aliasing
+        # The lift spells PPC arithmetic as signed C arithmetic, which must wrap;
+        # without this, clang exploits overflow UB (e.g. folds "x*x < 0" to false).
+        -fwrapv
     )
 elseif(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE
