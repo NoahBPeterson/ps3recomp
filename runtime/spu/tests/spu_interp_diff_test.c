@@ -54,6 +54,7 @@ void spu_wrch(spu_context* c, uint32_t ch, u128 v) { (void)c; g_ch_last = ch; g_
 uint32_t spu_rchcnt(spu_context* c, uint32_t ch) { (void)c; g_ch_last = ch; g_ch_n++; return g_ch_cnt; }
 int g_spu_ls_watch_n, g_spu_ls_probe, g_wws_read_probe, g_wws_code_probe, g_spu_smc_watch, g_spu_ls_dbg;
 spu_lifted_fn spu_lifted_lookup(const spu_context* c, uint32_t a) { (void)c;(void)a; return 0; }
+int (*g_spu_lv2_stop_hook)(spu_context*) = 0;   /* no lv2: stops end the step */
 void spu_spurs_taskset_syscall(spu_context* c) { (void)c; }
 void spu_ls_watch_slow(uint32_t l, int w, const uint8_t* p, uint32_t pc, uint32_t lr) { (void)l;(void)w;(void)p;(void)pc;(void)lr; }
 

@@ -66,10 +66,13 @@ class SpuAsm:
     def cgti(self, rt, ra, i): self.ri10(0x4C, rt, ra, i)
     def clgti(self, rt, ra, i): self.ri10(0x5C, rt, ra, i)
     def shli(self, rt, ra, i): self.ri7(0x07B, rt, ra, i)
+    def rotmi(self, rt, ra, n): self.ri7(0x079, rt, ra, -n)     # logical shift right by n
+    def andi(self, rt, ra, i): self.ri10(0x14, rt, ra, i)
 
     # quadword shuffles
     def rotqbyi(self, rt, ra, i): self.ri7(0x1FC, rt, ra, i)
     def shlqbyi(self, rt, ra, i): self.ri7(0x1FF, rt, ra, i)
+    def rotqby(self, rt, ra, rb): self.rr(0x1DC, rt, ra, rb)
 
     # loads / stores
     def lqd(self, rt, ra, d):  self.ri10(0x34, rt, ra, d >> 4)
