@@ -293,10 +293,11 @@ static inline double ppu_fmadd_core(double a, double c, double b, int neg_b, int
     if (r != r) return ppu_fp_default_qnan();
     return neg_res ? -r : r;
 }
-/* Round-to-single of a NaN keeps the full double payload (quieted). */
+/* Round to single: the result must be representable in single format, NaNs
+ * included -- their payload is truncated to the single fraction (as RPCS3). */
 static inline double ppu_fp_single(double r)
 {
-    return (r != r) ? r : (double)(float)r;
+    return (double)(float)r;
 }
 static inline double ppu_frsp(double b)
 {
@@ -2100,10 +2101,11 @@ class PPULifter:
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
             rn = 0 if mn_base.endswith("z") else 1
-            return (f"{{ uint32_t iv = ppu_f2i32(ctx->fpr[{frb}], {rn}); uint64_t tmp; "
-                    f"memcpy(&tmp, &ctx->fpr[{frd}], 8); "
-                    f"tmp = (tmp & 0xFFFFFFFF00000000ULL) | iv; "
-                    f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
+            # The whole doubleword is written: the word result sign-extended (the
+            # high word is undefined by the ISA; RPCS3 sign-extends). Keeping
+            # FRT's old high word made a converted 2^52 look untouched.
+            return (f"{{ int64_t iv = (int32_t)ppu_f2i32(ctx->fpr[{frb}], {rn}); "
+                    f"memcpy(&ctx->fpr[{frd}], &iv, 8); }}")
 
         if mn_base in ("fctid", "fctidz"):
             frd = _reg_idx(ops[0])

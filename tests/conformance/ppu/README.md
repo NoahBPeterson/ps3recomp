@@ -34,10 +34,24 @@ is not expressible and is not tested.
 
 ## Known oracle limitations (masked or normalized in compare.py)
 
+Every allowance is counted and printed at the end of a run.
+
 - **FPSCR**: RPCS3 does not model it (mtfsf drops RN and the sticky bits; it
-  keeps FPCC). Ignored by default (`--ignore r1,fpscr`); FP status needs an
-  independent IEEE reference.
+  keeps FPCC). Ignored by default (`--ignore r1,fpscr`). The FPSCR-only ops
+  (mffs, mtfsf., mtfsfi., mtfsb0./1., mcrfs) stay FAILING until an independent
+  FPSCR reference exists: neither side models FP status today.
+- **CR1 of FP record forms**: the ISA sets CR1 = FPSCR[FX FEX VX OX]; RPCS3
+  writes the result's FPCC. Masked (pending the FPSCR reference).
+- **NaN operand priority**: PowerISA propagates the first NaN of FRA, FRB, FRC
+  (quieted), signalling or not; RPCS3 inherits the host rule (an SNaN wins).
+  Accepted only when ps3recomp produced exactly the ISA's NaN.
+- **FMA-family NaN sign**: RPCS3 negates operands with host arithmetic, which
+  flips a propagated NaN's sign; the ISA says QNaNs propagate unchanged.
+- **fres / frsqrte**: estimates. RPCS3 reproduces the PPE's tables, ps3recomp
+  computes exactly; accepted within the ISA bounds (1/256, 1/32).
 - **VSCR**: RPCS3 reads/writes it in big-endian word 0 of the vector; the ISA
   says word 3 (VRB bits 96:127). The harness feeds both words and compares
   RPCS3's word 0 with ps3recomp's word 3.
+- **stwcx./stdcx.**: a store-conditional may fail spuriously; RPCS3's
+  reservation model sometimes does. Oracle-failed / ours-succeeded is allowed.
 - Undefined results (lve*x non-addressed lanes, mftb) are masked per case.
