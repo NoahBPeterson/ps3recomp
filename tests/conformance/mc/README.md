@@ -27,6 +27,11 @@ side creates thread groups from three SPU images assembled by `spu_asm.py`:
   a `sys_cond` ping-pong with a worker writes an alternating log; an event
   flag AND-wait with clear wakes only once both bits are set. Raw syscalls 52
   / 53 create and start the threads; they exit through syscall 41.
+- **recv**: the PPU sends three events through a local event port to an SPU
+  queue bound to the thread (`sys_spu_thread_bind_queue`); the SPU receives
+  them with `sys_spu_thread_receive_event` (spuq in SPU_WrOutMbox, `stop
+  0x110`, then status and data1-3 from the inbound mailbox). The group's
+  RUN-event queue reports the start.
 - **mfc2**: atomic status after GETLLAR (4), PUTLLC held (0), PUTLLC with no
   reservation (1), PUTLLUC (2); immediate tag status; a GETL whose middle
   element has stall-and-notify (RdListStallStat, WrListStallAck).

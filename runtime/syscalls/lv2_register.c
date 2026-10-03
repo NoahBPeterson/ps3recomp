@@ -356,6 +356,10 @@ typedef struct {
      * into this queue with source = SYS_SPU_THREAD_GROUP_EVENT (0x100..) so
      * PPU code blocked on sys_event_queue_receive wakes up. */
     uint32_t event_queue_id;
+    /* Queue connected for SYS_SPU_THREAD_GROUP_EVENT_RUN (et 1): lv2 sends
+     * {0xFFFFFFFF53505500, group id, 0, 0} to it when the group starts (as
+     * RPCS3; checked by tests/conformance/mc). Nothing is sent at join. */
+    uint32_t run_queue_id;
     uint32_t user_event_ports[64];
 } spu_group_t;
 
@@ -936,6 +940,7 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
 }
 
 /* sys_spu_thread_group_start(id) */
+extern int sys_event_queue_push_by_id(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
 static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
 {
     uint32_t id = (uint32_t)ctx->gpr[3];
@@ -947,6 +952,8 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
      * clean one or it would report the previous run's exit forever. */
     g->cause       = 0;
     g->exit_status = 0;
+    if (g->run_queue_id)
+        sys_event_queue_push_by_id(g->run_queue_id, 0xFFFFFFFF53505500ull, (uint64_t)id, 0, 0);
 
     /* DIAG (YDKJ_INSTDUMP): dump the CellSpurs instance at group_start time, to
      * see whether libsre has populated it BEFORE the SPU kernel threads spawn.
@@ -1276,18 +1283,6 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
         g->state       = SPU_GROUP_STATE_STOPPED;
     }
 
-    /* Notify any connected event queue. Real PS3 sends a SYS_SPU_THREAD_GROUP
-     * event with type-specific data; we collapse to a "group stopped" tag
-     * (data1 = group_id, data2 = exit_status, data3 = cause). PPU code
-     * blocked in sys_event_queue_receive on this queue wakes up here. */
-    if (g->event_queue_id) {
-        sys_event_queue_push_by_id(g->event_queue_id,
-                                   (uint64_t)g->id,
-                                   (uint64_t)(int64_t)g->exit_status,
-                                   (uint64_t)g->cause,
-                                   0);
-    }
-
     vm_write_be32(cause_ea,  g->cause);
     vm_write_be32(status_ea, (uint32_t)g->exit_status);
 
@@ -1571,8 +1566,9 @@ static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
         return -1;
     }
     g->event_queue_id = queue_id;
-    fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X\n",
-            group_id, queue_id);
+    if ((uint32_t)ctx->gpr[5] == 1) g->run_queue_id = queue_id;   /* SYS_SPU_THREAD_GROUP_EVENT_RUN */
+    fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X et=%u\n",
+            group_id, queue_id, (uint32_t)ctx->gpr[5]);
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
@@ -1673,7 +1669,7 @@ static int64_t sys_spu_thread_group_disconnect_event_handler(ppu_context* ctx)
 {
     uint32_t group_id = (uint32_t)ctx->gpr[3];
     spu_group_t* g = spu_find_group(group_id);
-    if (g) g->event_queue_id = 0;
+    if (g) { g->event_queue_id = 0; if ((uint32_t)ctx->gpr[4] == 1) g->run_queue_id = 0; }
     fprintf(stderr, "[SPU] group_disconnect_event group=0x%X\n", group_id);
     fflush(stderr);
     ctx->gpr[3] = 0;
