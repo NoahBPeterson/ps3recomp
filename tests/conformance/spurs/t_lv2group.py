@@ -5,7 +5,9 @@ is not running"):
   A. a waiter thread joins before the group's first start;
   B. a waiter joins after the previous run was already joined (a dedicated
      join thread: start/join alternate across threads);
-  C. a second join while the waiter is joining.
+  C. a second join while the waiter is joining;
+  D. a one-thread group whose thread is at index 5 (lv2 takes any index
+     0..7), started while another group's thread exists.
 
 The SPU program ends the group with sys_spu_thread_group_exit, using a value
 the PPU stores before each start as the status, so a join that reports the
@@ -90,5 +92,17 @@ def body(T):
     T.wait_word(flag["B"], 1)
     T.record_mem("B: waiter's join {rc, cause, status}", res["B"], 12)
     T.join_thread(tid, tret)
+
+    # ---- D: a one-thread group with its thread at index 5 -----------------------------
+    ids5 = T.alloc("ids5", 16, 16)
+    T.syscall(SYS["spu_group_create"], ids5, 1, 100, gattr, rc="D: group_create (1 thread)")
+    T.syscall(SYS["spu_thread_initialize"], ids5 + 4, ("mem", ids5), 5, img, tattr, targ,
+              rc="D: thread_initialize index 5")
+    T.store_word(val, 0x555)
+    T.syscall(SYS["spu_group_start"], ("mem", ids5), rc="D: group_start")
+    T.store_word(join, 0xEEEEEEEE); T.store_word(join + 4, 0xEEEEEEEE)
+    T.syscall(SYS["spu_group_join"], ("mem", ids5), join, join + 4, rc="D: group_join")
+    T.record_mem("D: join {cause, status}", join, 8)
+    T.syscall(SYS["spu_group_destroy"], ("mem", ids5), rc="D: group_destroy")
 
     T.syscall(SYS["spu_group_destroy"], ("mem", ids), rc="group_destroy")

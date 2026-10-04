@@ -795,7 +795,7 @@ static void spu_group_thread_done(uint32_t group_id, uint32_t gen, int group_exi
 /* Reap host threads of earlier runs that have finished. */
 static void spu_group_reap(spu_group_t* g)
 {
-    for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
+    for (int i = 0; i < 8; i++) {               /* slots are thread indices 0..7 */
         if (!(g->init_mask & (1u << i))) continue;
         uint32_t idx = g->thread_indices[i];
         if (idx >= MAX_SPU_THREADS) continue;
@@ -1114,7 +1114,10 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
     int spawned = 0;
     int instant = 0;
     int nofb    = 0;   /* subset of `instant` that had no fallback at all */
-    for (uint32_t i = 0; i < g->num_threads && i < 8; i++) {
+    /* A thread sits at its own index (0..7), not packed below num_threads: lv2
+     * lets a one-thread group use index 5, as inFamous's Bink group does. */
+    for (uint32_t i = 0; i < 8; i++) {
+        if (!(g->init_mask & (1u << i))) continue;
         uint32_t idx = g->thread_indices[i];
         if (idx >= MAX_SPU_THREADS) continue;
         spu_thread_t* t = &s_spu_threads[idx];
@@ -1408,7 +1411,7 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
     if (g->state == SPU_GROUP_STATE_RUNNING) LV2_RET(ctx, CELL_EBUSY);
     spu_group_reap(g);
     {
-        for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
+        for (int i = 0; i < 8; i++) {
             uint32_t idx = g->thread_indices[i];
             if ((g->init_mask & (1u << i)) && idx < MAX_SPU_THREADS) {
                 spu_thread_t* t = &s_spu_threads[idx];
@@ -2689,6 +2692,8 @@ int lv2_try_syscall(ppu_context* ctx)
     /* YDKJ diag: full event-syscall trace (#128..141) during SPURS init to find
      * why libsre asserts ESRCH in event_helper.c. Snapshot args BEFORE handler. */
     uint32_t _a3 = (uint32_t)ctx->gpr[3], _a4 = (uint32_t)ctx->gpr[4], _a5 = (uint32_t)ctx->gpr[5];
+    uint32_t _a6 = (uint32_t)ctx->gpr[6], _a7 = (uint32_t)ctx->gpr[7], _a8 = (uint32_t)ctx->gpr[8],
+             _a9 = (uint32_t)ctx->gpr[9];
     ctx->gpr[3] = (uint64_t)h(ctx);
     /* LV2_ERRDBG=1: every syscall that returns non-OK, deduped by (number,
      * result). A guest that asserts on a result once per frame is easier to
@@ -2699,8 +2704,9 @@ int lv2_try_syscall(ppu_context* ctx)
           uint64_t k = ((uint64_t)num << 32) | (uint32_t)ctx->gpr[3];
           int f = 0; for (int i = 0; i < ns; i++) if (seen[i] == k) f = 1;
           if (!f && ns < 64) { seen[ns++] = k;
-              fprintf(stderr, "[lv2err] syscall %u(r3=0x%08X r4=0x%08X r5=0x%08X)"
-                              " -> 0x%08X lr=0x%08X%c",
-                      num, _a3, _a4, _a5, (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr, 10); } } }
+              fprintf(stderr, "[lv2err] syscall %u(r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X"
+                              " r7=0x%08X r8=0x%08X r9=0x%08X) -> 0x%08X lr=0x%08X%c",
+                      num, _a3, _a4, _a5, _a6, _a7, _a8, _a9, (uint32_t)ctx->gpr[3],
+                      (uint32_t)ctx->lr, 10); } } }
     return 1;
 }

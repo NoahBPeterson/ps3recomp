@@ -47,6 +47,8 @@
 #include <unistd.h>
 #endif
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+extern "C" uint32_t g_ps3_sdk_version;    /* sys_process_get_sdk_version */
+extern "C" int32_t  g_ppu_primary_prio;   /* main thread priority (sys_ppu_thread.c) */
 
 /* Resolve the GUEST function on the host stack (closest lifted entry below
  * each frame) -- the same trick the [BLOCK] profiler uses. */
@@ -3473,6 +3475,21 @@ extern "C" uint32_t ppu_load_elf(const char* path)
             g_tls_memsz  = (uint32_t)be64(ph + 40);
             fprintf(stderr, "[ppu] PT_TLS template vaddr=0x%08X filesz=0x%X memsz=0x%X\n",
                     g_tls_vaddr, g_tls_filesz, g_tls_memsz);
+            continue;
+        }
+        if (p_type == 0x60000001 /*PT_PROC_PARAM*/) {
+            /* sys_process_param_t: {size, magic 0x13BCC5F6, version, sdk_version,
+             * primary_prio, primary_stacksize, malloc_pagesize, ppc_seg}. lv2 reports
+             * sdk_version through sys_process_get_sdk_version (libsre picks behaviour
+             * by it) and runs the main thread at primary_prio. */
+            uint64_t off = be64(ph + 8), fs = be64(ph + 32);
+            if (fs >= 0x14 && off + fs <= fsz && be32(file + off + 4) == 0x13BCC5F6u) {
+                g_ps3_sdk_version = be32(file + off + 12);
+                const int32_t prio = (int32_t)be32(file + off + 16);
+                if (prio >= -512 && prio < 3072) g_ppu_primary_prio = prio;
+                fprintf(stderr, "[ppu] PROC_PARAM sdk_version=0x%08X primary_prio=%d\n",
+                        g_ps3_sdk_version, prio);
+            }
             continue;
         }
         if (p_type != 1 /*PT_LOAD*/) continue;
