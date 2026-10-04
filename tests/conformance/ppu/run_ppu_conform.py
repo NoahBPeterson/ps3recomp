@@ -67,6 +67,12 @@ def oracle_config(work):
 def run_oracle(rpcs3, elf, work, timeout, marker=b"PPUCONF END"):
     tty = os.path.join(RPCS3_CACHE, "TTY.log")
     cfg = oracle_config(work)
+    # The previous run's TTY.log ends with the marker too: remove it, or the
+    # wait below can match it before RPCS3 has started a new one.
+    try:
+        os.remove(tty)
+    except FileNotFoundError:
+        pass
     p = subprocess.Popen([rpcs3, "--headless", "--config", cfg, elf],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     t0 = time.time()
