@@ -26,7 +26,7 @@ option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 # ---------------------------------------------------------------------------
 
 # HLE library sources
-file(GLOB_RECURSE HLE_SOURCES
+file(GLOB_RECURSE HLE_SOURCES CONFIGURE_DEPENDS
     "libs/system/*.c"
     "libs/filesystem/*.c"
     "libs/input/*.c"
@@ -56,7 +56,7 @@ endif()
 list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_msl.cpp")
 
 # Runtime core (syscalls, PPU, SPU, memory)
-file(GLOB_RECURSE RUNTIME_SOURCES
+file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
     "runtime/*.c"
     "runtime/*.cpp"
 )

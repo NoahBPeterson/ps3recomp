@@ -50,6 +50,55 @@ uint32_t prx_resolve_export(uint32_t nid)
 
 uint32_t prx_export_registry_count(void) { return s_export_reg_n; }
 
+static void prx_export_unregister(uint32_t nid, uint32_t guest_addr)
+{
+    for (uint32_t i = 0; i < s_export_reg_n; i++) {
+        if (s_export_reg[i].nid == nid && s_export_reg[i].guest_addr == guest_addr) {
+            s_export_reg[i] = s_export_reg[--s_export_reg_n];
+            return;
+        }
+    }
+}
+
+int prx_place_module(const prx_module* m, prx_register_fn reg)
+{
+    if (!m || !m->image || !m->image_size || !vm_base) return 0;
+    memcpy(vm_base + m->base, m->image, m->image_size);
+    if (reg)
+        for (uint64_t i = 0; i < m->func_count; i++)
+            if (m->funcs[i].func) reg((uint32_t)m->funcs[i].addr, m->funcs[i].func);
+    return 1;
+}
+
+void prx_publish_exports(const prx_module* m)
+{
+    for (uint32_t i = 0; m && m->exports && i < m->export_count; i++)
+        if (m->exports[i].nid) prx_export_register(m->exports[i].nid, m->base + m->exports[i].vaddr);
+}
+
+void prx_withdraw_exports(const prx_module* m)
+{
+    for (uint32_t i = 0; m && m->exports && i < m->export_count; i++)
+        if (m->exports[i].nid) prx_export_unregister(m->exports[i].nid, m->base + m->exports[i].vaddr);
+}
+
+/* ---- statically lifted modules, by file name ----------------------------- */
+#define PRX_STATIC_CAP 32
+static const prx_static_module* s_static[PRX_STATIC_CAP];
+static uint32_t                 s_static_n = 0;
+
+void prx_static_register(const prx_static_module* m)
+{
+    if (m && s_static_n < PRX_STATIC_CAP) s_static[s_static_n++] = m;
+}
+
+const prx_static_module* prx_static_find(const char* file)
+{
+    for (uint32_t i = 0; file && i < s_static_n; i++)
+        if (strcmp(s_static[i]->file, file) == 0) return s_static[i];
+    return NULL;
+}
+
 prx_load_result prx_load_module(const prx_module* m, prx_register_fn reg)
 {
     prx_load_result r;
