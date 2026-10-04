@@ -68,6 +68,18 @@ spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_ou
  * the workload sync header) and its command lists contain cross-lane barrier
  * commands, so a workload configured for N SPUs must be dispatched once per
  * spu_num or the un-run lanes deadlock every barrier. */
+/* Enter the policy module resident at LS 0xA00 of `ctx` (an SPU running the
+ * SPURS kernel, libs/spurs/spurs_kernel.c) with the kernel's entry registers,
+ * and run it until it branches to exitToKernel. entry == NULL interprets it.
+ * The module's selectWorkload calls go to g_spurs_kernel_select. Returns 0 on
+ * a proper exit to the kernel, -1 otherwise. */
+int spu_pm_enter(spu_context* ctx, spu_lifted_entry_fn entry, int image_id,
+                 uint64_t arg, uint64_t pm_ea, uint32_t poll_status);
+/* The kernel's selectWorkload for the SPU `ctx` runs on: isPoll as the module
+ * passed it in r3; returns {wid << 32 | pollStatus} for r3's preferred
+ * doubleword. Set by the SPURS kernel. */
+extern uint64_t (*g_spurs_kernel_select)(spu_context* ctx, uint32_t is_poll);
+
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,
                           uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
