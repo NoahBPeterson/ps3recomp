@@ -3711,6 +3711,14 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
         s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
 }
 
+extern "C" uint32_t sys_ppu_thread_alloc_stack(uint32_t size) __attribute__((weak));
+static uint32_t ppu_callback_stack(void)
+{
+    enum { CB_STACK = 0x40000 };
+    const uint32_t top = sys_ppu_thread_alloc_stack ? sys_ppu_thread_alloc_stack(CB_STACK) : 0;
+    return top ? (top - 0x100) & ~0xFu : 0xCFFE0000u;   /* no allocator linked: the old fixed stack */
+}
+
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
@@ -3735,10 +3743,11 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                 vm_read32(opd_addr + 8), vm_read32(opd_addr + 12));
         return 0; }
 
-    /* Private scratch stack high in the guest stack region, distinct from the
-     * main + ppu_thread stacks. One callback at a time per caller thread. */
+    /* Private callback stack per host thread, from the guest stack region:
+     * one shared address let two host threads delivering callbacks at once
+     * (a SPURS handler thread and a sysutil callback) run on the same stack. */
     static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
+    if (!s_cb_sp) s_cb_sp = ppu_callback_stack();
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -3783,7 +3792,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
 
     static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
+    if (!s_cb_sp) s_cb_sp = ppu_callback_stack();
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));

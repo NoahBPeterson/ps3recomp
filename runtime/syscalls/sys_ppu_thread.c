@@ -75,6 +75,17 @@ static void table_unlock(void)
 #endif
 }
 
+/* A guest stack for a host thread that runs guest code outside any guest
+ * thread (callbacks into guest code: ppu_guest_call). Returns the usable top,
+ * or 0. Taken from the same region as thread stacks, under the same lock. */
+uint32_t sys_ppu_thread_alloc_stack(uint32_t size)
+{
+    table_lock();
+    uint32_t base = vm_stack_allocate(&g_vm_stack_alloc, size);
+    table_unlock();
+    return base ? base + size : 0;
+}
+
 /* Find a free slot. Returns index or -1. Must be called under lock. */
 static int find_free_slot(void)
 {
