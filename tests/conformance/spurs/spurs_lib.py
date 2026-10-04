@@ -62,14 +62,16 @@ def module_of(fn):
 
 class Data:
     def __init__(self, base):
-        self.base, self.items, self.off, self.addr = base, [], 0, {}
+        self.base, self.items, self.off, self.addr, self.sizes = base, [], 0, {}, {}
 
     def take(self, name, size, align=16, init=b""):
         if name in self.addr:
+            assert (size, align) == self.sizes[name], "alloc name reused: " + name
             return self.addr[name]
         self.off = (self.off + align - 1) & ~(align - 1)
         self.items.append((name, self.off, size, bytes(init)))
         self.addr[name] = self.base + self.off
+        self.sizes[name] = (size, align)
         self.off += max(size, 1)
         return self.addr[name]
 
