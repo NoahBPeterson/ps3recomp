@@ -105,6 +105,14 @@ static ppu_thread_info* find_thread(uint64_t thread_id)
     return t;
 }
 
+/* A thread's priority, for the kernel's PRIORITY-protocol sleep queues;
+ * INT_MIN if there is no such thread. */
+int32_t ppu_thread_priority_of(uint64_t thread_id)
+{
+    ppu_thread_info* t = find_thread(thread_id);
+    return t ? t->priority : INT32_MIN;
+}
+
 /* ---------------------------------------------------------------------------
  * Host thread entry point
  * -----------------------------------------------------------------------*/
@@ -130,6 +138,14 @@ static void* ppu_host_thread_proc(void* param)
      * invalidation (ppu_loader.cpp) -- so a concurrent stwcx breaks this thread's
      * reservation and prevents ABA corruption of the guest's lock-free lists. */
     { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
+
+#ifndef _WIN32
+    /* A thread made by _sys_ppu_thread_create runs only once
+     * sys_ppu_thread_start says so (on Windows it is created suspended). */
+    pthread_mutex_lock(&info->finish_mutex);
+    while (info->held) pthread_cond_wait(&info->finish_cond, &info->finish_mutex);
+    pthread_mutex_unlock(&info->finish_mutex);
+#endif
 
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
             (unsigned long long)info->ctx.thread_id,
@@ -332,6 +348,12 @@ void ppu_prof_stamp(void* vctx, unsigned lr)
         t->prof_pc = lr;
 }
 
+/* Set by _sys_ppu_thread_create around its call into sys_ppu_thread_create:
+ * the new thread's TLS pointer (r13) and whether it waits for
+ * sys_ppu_thread_start. */
+static __thread uint64_t s_create_tls;
+static __thread int      s_create_held;
+
 int64_t sys_ppu_thread_create(ppu_context* ctx)
 {
     uint32_t tid_out_addr = LV2_ARG_PTR(ctx, 0);
@@ -373,6 +395,8 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
 
     uint64_t thread_id = (uint64_t)(slot + 1);
     t->ctx.thread_id = thread_id;
+    t->ctx.gpr[13]   = s_create_tls;
+    t->held          = s_create_held;
 
     t->state      = PPU_THREAD_STATE_RUNNING;
     t->priority   = priority;
@@ -429,19 +453,6 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         #undef RB
       } }
 
-    /* Diagnostic (YDKJ_NOHDLR): suppress libsre's SPURS handler threads (entry in
-     * the libsre image range) -- they assert that the SPU side isn't operational
-     * and crash. Skipping them lets the main thread (already past
-     * cellSpursInitialize) keep running, to see how far it gets. The thread is
-     * "created" (tid returned) but never spawned. */
-    if (getenv("YDKJ_NOHDLR") && entry >= 0x30000000 && entry < 0x30040000) {
-        fprintf(stderr, "[SYS]   (suppressed libsre handler thread entry=0x%08llX)\n",
-                (unsigned long long)entry);
-        t->state = PPU_THREAD_STATE_RUNNING; /* leave it parked */
-        table_unlock();
-        return CELL_OK;
-    }
-
     /* Create the host thread. Give it a large RESERVED stack: each recompiled
      * guest call is a real host call, so deep guest call chains nest deeply on
      * the host stack and overflow the 1 MB default. Reserve 256 MB (committed
@@ -451,7 +462,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     /* Gate only guest worker threads (game .text entry), never libsre/system threads. */
     unsigned _initflag = STACK_SIZE_PARAM_IS_A_RESERVATION;
     int _gate_this = (g_gate_on > 0 && entry >= 0x10000 && entry < 0x10000000);
-    if (_gate_this) _initflag |= CREATE_SUSPENDED;
+    if (_gate_this || t->held) _initflag |= CREATE_SUSPENDED;
     t->host_thread = (HANDLE)_beginthreadex(NULL, 256u * 1024 * 1024,
                                   (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
                                   _initflag, (unsigned*)&t->host_tid);
@@ -461,7 +472,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
-    if (_gate_this && g_gate_n < 256) g_gate_pending[g_gate_n++] = t->host_thread;
+    if (_gate_this && !t->held && g_gate_n < 256) g_gate_pending[g_gate_n++] = t->host_thread;
     /* The guest's top priorities (0 is highest, 3071 lowest) are its audio and
      * I/O pollers. At normal host priority they wake late under a busy frame:
      * The Simpsons Arcade Game's music thread (prio 0) polls the audio read
@@ -519,9 +530,9 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
  * The raw lv2 ABI: r3 = &tid (u64), r4 = &{u32 entry OPD, u32 tls}, r5 = arg,
  * r6 = unk, r7 = prio, r8 = stack size, r9 = flags, r10 = name. Translated to
  * the sys_ppu_thread_create argument order above.
- * ponytail: the thread starts here, not at syscall 53 (a no-op); liblv2 always
- * calls start right after create, so only code that inspects a created but
- * unstarted thread can tell.
+ * As in lv2, the thread gets r13 = the param block's TLS pointer and does not
+ * run until sys_ppu_thread_start: liblv2 records the new thread in its own
+ * thread list between the two calls.
  * -----------------------------------------------------------------------*/
 static int64_t sys_ppu_thread_create_raw(ppu_context* ctx)
 {
@@ -530,17 +541,42 @@ static int64_t sys_ppu_thread_create_raw(ppu_context* ctx)
     const uint8_t* p = (const uint8_t*)vm_to_host(param);
     uint32_t entry = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
     if (!entry) return (int64_t)(int32_t)CELL_EFAULT;
+    /* lv2's checks (RPCS3 _sys_ppu_thread_create), for a process without
+     * debug/root permission: priority 0..3071; joinable + interrupt is EPERM. */
+    const int32_t prio = (int32_t)ctx->gpr[7];
+    if (prio < 0 || prio > 3071) return (int64_t)(int32_t)CELL_EINVAL;
+    if ((ctx->gpr[9] & 3) == 3) return (int64_t)(int32_t)CELL_EPERM;
+    uint32_t tls = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) | ((uint32_t)p[6] << 8) | p[7];
     uint64_t r[7] = { ctx->gpr[3], entry, ctx->gpr[5], ctx->gpr[7], ctx->gpr[8], ctx->gpr[9], ctx->gpr[10] };
     uint64_t save[7];
     for (int i = 0; i < 7; i++) { save[i] = ctx->gpr[3 + i]; ctx->gpr[3 + i] = r[i]; }
+    s_create_tls = tls;
+    s_create_held = 1;
     int64_t rc = sys_ppu_thread_create(ctx);
+    s_create_tls = 0;
+    s_create_held = 0;
     for (int i = 1; i < 7; i++) ctx->gpr[3 + i] = save[i];
     return rc;
 }
 
+/* sys_ppu_thread_start(id): ESRCH for no such thread, EBUSY if it was
+ * already started (or never held: created through the HLE path). */
 static int64_t sys_ppu_thread_start(ppu_context* ctx)
 {
-    (void)ctx;
+    table_lock();
+    ppu_thread_info* t = find_thread(LV2_ARG_U64(ctx, 0));
+    if (!t) { table_unlock(); return (int64_t)(int32_t)CELL_ESRCH; }
+    if (!t->held) { table_unlock(); return (int64_t)(int32_t)CELL_EBUSY; }
+#ifdef _WIN32
+    t->held = 0;
+    ResumeThread(t->host_thread);
+#else
+    pthread_mutex_lock(&t->finish_mutex);
+    t->held = 0;
+    pthread_cond_broadcast(&t->finish_cond);
+    pthread_mutex_unlock(&t->finish_mutex);
+#endif
+    table_unlock();
     return CELL_OK;
 }
 

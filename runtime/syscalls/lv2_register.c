@@ -374,6 +374,8 @@ typedef struct {
      * RPCS3; checked by tests/conformance/mc). Nothing is sent at join. */
     uint32_t run_queue_id;
     uint32_t user_event_ports[64];
+    int32_t  type;               /* SYS_SPU_THREAD_GROUP_TYPE_* */
+    int      has_sched;          /* context-switched (not NON_CONTEXT) */
 } spu_group_t;
 
 static spu_group_t  s_spu_groups[MAX_SPU_GROUPS];
@@ -500,16 +502,47 @@ static int64_t sys_ss_get_open_psid_handler(ppu_context* ctx)
     return 0;
 }
 
-/* sys_spu_initialize(nspu, nrawspu) — one-shot global init */
+/* Evaluates v once: it is often a call whose arguments are read from r3. */
+#define LV2_RET(ctx, v) do { const int32_t lv2_ret_ = (int32_t)(v); \
+    (ctx)->gpr[3] = (uint64_t)(int64_t)lv2_ret_; return lv2_ret_; } while (0)
+
+/* SPU limits (RPCS3's spu_limits_t): of the six SPUs a process may use,
+ * max_raw are raw SPUs and max_spu the rest. Context-switched groups share
+ * SPUs, so they count as the largest of them; non-context groups occupy
+ * theirs; a cooperate-with-system group is one shared SPU plus num-1
+ * occupied ones, and there may be only one. */
+static uint32_t s_spu_max_spu = 6, s_spu_max_raw = 0;
+
+static int spu_limits_busy(uint32_t spu_limit, uint32_t raw_limit,
+                           uint32_t physical, uint32_t controllable, uint32_t system_coop)
+{
+    for (int i = 0; i < MAX_SPU_GROUPS; i++) {
+        const spu_group_t* g = &s_spu_groups[i];
+        if (!g->in_use) continue;
+        if (g->type & 0x20) {
+            system_coop++;
+            if (controllable < 1) controllable = 1;
+            physical += g->num_threads - 1;
+        } else if (g->has_sched) {
+            if (controllable < g->num_threads) controllable = g->num_threads;
+        } else {
+            physical += g->num_threads;
+        }
+    }
+    return spu_limit + raw_limit > 6 || physical >= spu_limit || controllable > spu_limit ||
+           system_coop > 1;
+}
+
+/* sys_spu_initialize(max_usable_spu, max_raw_spu) */
 static int64_t sys_spu_initialize_handler(ppu_context* ctx)
 {
-    uint32_t nspu    = (uint32_t)ctx->gpr[3];
-    uint32_t nrawspu = (uint32_t)ctx->gpr[4];
-    fprintf(stderr, "[SPU] initialize(nspu=%u, nrawspu=%u)\n", nspu, nrawspu);
-    fflush(stderr);
+    const uint32_t max_raw = (uint32_t)ctx->gpr[4];
+    if (max_raw > 5) LV2_RET(ctx, CELL_EINVAL);
+    if (spu_limits_busy(6 - max_raw, max_raw, 0, 0, 0)) LV2_RET(ctx, CELL_EBUSY);
+    s_spu_max_raw = max_raw;
+    s_spu_max_spu = 6 - max_raw;
     s_spu_initialized = 1;
-    ctx->gpr[3] = 0;
-    return 0;
+    LV2_RET(ctx, CELL_OK);
 }
 
 /* sys_spu_thread_group_create(out_id_ea, num, prio, attr_ea)
@@ -530,24 +563,52 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
     uint32_t attr_ea  = (uint32_t)ctx->gpr[6];
     fprintf(stderr, "[SPU] thread_group_create(num=%u prio=%d)\n", num, prio);
 
-    spu_group_t* g = spu_alloc_group();
-    if (!g) {
-        fprintf(stderr, "[SPU] group_create: out of groups\n");
-        fflush(stderr);
-        ctx->gpr[3] = (uint64_t)(int64_t)-1; /* EAGAIN-ish */
-        return -1;
+    /* lv2's checks (RPCS3 sys_spu_thread_group_create), for a process
+     * without root permission. Memory containers are not modelled: a
+     * MEMORY_FROM_CONTAINER group is accepted without charging one. */
+    const uint32_t nsize   = vm_read_be32(attr_ea + 0);
+    uint32_t       name_ea = vm_read_be32(attr_ea + 4);
+    const int32_t  gtype   = (int32_t)vm_read_be32(attr_ea + 8);
+    if (nsize > 0x80 || !num) LV2_RET(ctx, CELL_EINVAL);
+    uint32_t max_threads = 6, min_threads = 1;
+    int needs_root = 0, sched = 1;
+    switch (gtype) {
+    case 0x0: case 0x4: case 0x18:
+        break;
+    case 0x20: case 0x22: case 0x24: case 0x26:
+        needs_root = gtype == 0x22 || gtype == 0x26;
+        min_threads = 2;
+        break;
+    case 0x2: case 0x6: case 0xA: case 0x102: case 0x106: case 0x10A:
+    case 0x202: case 0x206: case 0x20A: case 0x902: case 0x906:
+    case 0xA02: case 0xA06: case 0xC02: case 0xC06:
+        if (gtype & 0x700) max_threads = 1;
+        needs_root = 1;
+        break;
+    default:
+        LV2_RET(ctx, CELL_EINVAL);
     }
-    if (num > 8) num = 8;
-    g->num_threads = num;
+    const int coop = (gtype & 0x20) != 0;
+    if (!coop && (gtype & 0x8)) sched = 0;
+    if (num < min_threads || num > max_threads || needs_root ||
+        (sched && !coop && (prio > 255 || prio < 16)))
+        LV2_RET(ctx, CELL_EINVAL);
+    {
+        const uint32_t physical = coop ? num - 1 : sched ? 0 : num;
+        const uint32_t controllable = coop ? 1 : sched ? num : 0;
+        if (s_spu_max_spu + s_spu_max_raw > 6 || physical > s_spu_max_spu || controllable > s_spu_max_spu)
+            LV2_RET(ctx, CELL_EINVAL);
+        if (spu_limits_busy(s_spu_max_spu, s_spu_max_raw, physical, controllable,
+                            controllable && physical ? 1u : 0u))
+            LV2_RET(ctx, CELL_EBUSY);
+    }
 
-    int32_t  gtype   = 0;
-    uint32_t name_ea = 0;
-    if (attr_ea) {
-        uint32_t nsize = vm_read_be32(attr_ea + 0);
-        name_ea        = vm_read_be32(attr_ea + 4);
-        gtype          = (int32_t)vm_read_be32(attr_ea + 8);
-        if (!nsize) name_ea = 0;
-    }
+    spu_group_t* g = spu_alloc_group();
+    if (!g) LV2_RET(ctx, CELL_EAGAIN);
+    g->num_threads = num;
+    g->type        = gtype;
+    g->has_sched   = sched;
+    if (!nsize) name_ea = 0;
     if (name_ea && vm_base) {
         const char* src = (const char*)(vm_base + name_ea);
         size_t i = 0;
@@ -561,13 +622,11 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
     fprintf(stderr, "[SPU] group_create -> id=0x%X num=%u prio=%d type=0x%X name=%.31s\n",
             g->id, num, prio, gtype, g->name);
     fflush(stderr);
-    ctx->gpr[3] = 0;
-    return 0;
+    LV2_RET(ctx, CELL_OK);
 }
 
 
 /* sys_spu_thread_initialize(out_tid_ea, group_id, thread_num, img_ea, attr_ea, args_ea) */
-#define LV2_RET(ctx, v) do { (ctx)->gpr[3] = (uint64_t)(int64_t)(int32_t)(v); return (int32_t)(v); } while (0)
 
 /* sys_spu_thread_initialize(thread*, group, spu_num, img*, attr*, arg*): the
  * kernel's checks (RPCS3's lv2 is the reference for the kernel), then the
@@ -1534,14 +1593,29 @@ static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
 
 /* User-event ports are independent of group lifecycle event connections. */
 static SRWLOCK s_spu_port_lock = SRWLOCK_INIT;
+/* sys_spu_thread_group_disconnect_event_all_threads(id, spup) -- 252 */
+static int64_t sys_spu_thread_group_disconnect_event_all_threads_handler(ppu_context* ctx)
+{
+    const uint32_t port = (uint32_t)ctx->gpr[4];
+    if (port > 63) LV2_RET(ctx, CELL_EINVAL);
+    spu_group_t* g = spu_find_group((uint32_t)ctx->gpr[3]);
+    if (!g) LV2_RET(ctx, CELL_ESRCH);
+    AcquireSRWLockExclusive(&s_spu_port_lock);
+    g->user_event_ports[port] = 0;
+    ReleaseSRWLockExclusive(&s_spu_port_lock);
+    LV2_RET(ctx, CELL_OK);
+}
+
 static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_context* ctx)
 {
+    extern int sys_event_queue_exists(uint32_t queue_id);
     spu_group_t* g = spu_find_group((uint32_t)ctx->gpr[3]);
     uint64_t requested = ctx->gpr[5];
     uint32_t output = (uint32_t)ctx->gpr[6];
     uint32_t result = CELL_OK;
-    if (!g) result = CELL_ESRCH;
-    else if (!requested) result = CELL_EINVAL;
+    if (!requested) result = CELL_EINVAL;
+    else if (!g || !sys_event_queue_exists((uint32_t)ctx->gpr[4])) result = CELL_ESRCH;
+    else if (g->state == SPU_GROUP_STATE_NOT_INITIALIZED) result = CELL_ESTAT;
     else if (!output) result = CELL_EFAULT;
     else {
         result = CELL_EISCONN;
@@ -2340,10 +2414,29 @@ static int64_t sys_usbd_receive_event_handler(ppu_context* ctx)
     return CELL_OK;
 }
 
+/* Numbers retail lv2 does not implement (DEX/debug-only or unassigned; RPCS3's
+ * uns_func entries): the kernel answers ENOSYS. liblv2 probes at least one of
+ * them (462) at process start and takes a different path on success, so
+ * answering these CELL_OK like the generic unimplemented fallback misleads it. */
+static const uint16_t s_lv2_unused_syscalls[] = {
+    6, 15, 20, 32, 42, 59, 79, 162, 164, 168, 183, 189, 195, 217, 218, 219, 241,
+    255, 261, 270, 280, 290, 316, 347, 366, 371, 399, 416, 420, 430, 440, 459,
+    462, 469, 477, 491, 515, 526, 576, 629, 632, 660, 697, 698, 727, 730, 740,
+    750, 760, 770, 780, 790, 848, 854, 886, 898, 958, 973, 990, 999, 1008, 1020,
+};
+static int64_t sys_unused_enosys(ppu_context* ctx) { (void)ctx; return (int32_t)CELL_ENOSYS; }
+
+void lv2_prx_register_syscalls(lv2_syscall_table* tbl);   /* lv2_prx.c */
+void sys_lwsync_register(lv2_syscall_table* tbl);         /* sys_lwsync.c */
+
 void lv2_register_all_syscalls(lv2_syscall_table* tbl)
 {
     /* Initialize the table with unimplemented stubs first */
     lv2_syscall_table_init(tbl);
+    for (size_t i = 0; i < sizeof s_lv2_unused_syscalls / sizeof s_lv2_unused_syscalls[0]; i++)
+        lv2_syscall_register(tbl, s_lv2_unused_syscalls[i], sys_unused_enosys);
+    lv2_prx_register_syscalls(tbl);
+    sys_lwsync_register(tbl);
 
     /* Process control */
     lv2_syscall_register(tbl, SYS_PROCESS_GETPID, sys_process_getpid_handler);
@@ -2448,6 +2541,7 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SPU_MB,  sys_spu_thread_write_spu_mb_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_bind_queue_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_unbind_queue_handler);
+    lv2_syscall_register(tbl, 252, sys_spu_thread_group_disconnect_event_all_threads_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_all_threads_handler);
 }
 
