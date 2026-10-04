@@ -40,31 +40,21 @@ sees ours.
 load time to a base lv2 picks, with the lifted code reading addresses through a per-
 instance base instead of baking them in. Not worth doing until a title needs it.
 
-## Joining an SPU thread group that is not running returns at once
+## Terminating an SPU thread group does not stop its SPU code
 
-**What.** On lv2, `sys_spu_thread_group_join` on an initialized group whose last run has
-already been joined (or that was never started) blocks until some other thread starts
-the group and that run ends. Here it returns immediately with the group's previous cause
-and status (`runtime/syscalls/lv2_register.c`, group_join handler, marked KNOWN
-DIVERGENCE).
+**What.** `sys_spu_thread_group_terminate` ends the run (cause TERMINATED, the group back
+to INITIALIZED, a joiner woken), but an SPU thread still executing on its host thread is
+not stopped; it runs until it stops by itself. lv2 stops every thread of the group.
+`sys_spu_thread_group_exit` from one SPU thread likewise ends the run without stopping
+the group's other threads.
 
-**What it would look like.** Any design where the thread that waits for a group is not
-the thread that starts it, and the waiter can get there first:
+**What it would look like.** After a terminate or group exit, a still-running SPU thread
+keeps issuing DMA and channel operations: memory changes after the PPU believes the group
+stopped, or events arrive on a connected queue. A restart of the group while the old host
+thread runs puts two copies of the thread on the same local store.
 
-- A dedicated join thread: `for (;;) { join(g); consume(results); }` while the main
-  thread calls `start(g)` once per frame. On the console the join parks until the next
-  run finishes. Here every join after the first returns at once with the last run's
-  cause, so the loop spins, consuming the same results again and again, or reading output
-  buffers while the SPUs are still writing them.
-- A waiter created before the start: thread A initializes the group, creates thread B to
-  wait on it, then starts it. If B is scheduled first, the console blocks B until the run
-  completes; here B returns ALL_THREADS_EXIT/0 before the SPUs ran a single instruction,
-  and whatever B does next (reading results, destroying the group) happens too early.
-
-libsre does not do either: its handler thread starts and joins the kernel group itself.
-
-**Fixing it.** Give the group a "run finished, not yet joined" flag and a wait queue:
-join consumes the flag if it is set, otherwise sleeps until a run ends. Start clears it.
+**Fixing it.** A stop request the SPU interpreter and the lifted SPU code check (at
+channel operations and branches), so the host thread unwinds out of the SPU program.
 
 ## Raw SPU count is not part of the SPU limits
 

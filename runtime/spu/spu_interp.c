@@ -361,6 +361,9 @@ uint32_t g_spu_interp_last_pc = 0;
 /* Exit status of the last spu_run_interp_job on this host thread (stop 0x102). */
 SPU_THREAD_LOCAL int     g_spu_interp_exit_valid  = 0;
 SPU_THREAD_LOCAL int32_t g_spu_interp_exit_status = 0;
+/* ...and of a sys_spu_thread_group_exit (stop 0x101): the group's status. */
+SPU_THREAD_LOCAL int     g_spu_interp_group_exit_valid  = 0;
+SPU_THREAD_LOCAL int32_t g_spu_interp_group_exit_status = 0;
 uint64_t g_spu_interp_steps   = 0;
 
 /* Call-trace ring buffer for diagnosing SPU asserts (env SPU_CALLTRACE). */
