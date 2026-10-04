@@ -57,6 +57,8 @@ def module_of(fn):
         return "cellLibprof"
     if "Spurs" in fn:
         return "cellSpurs"
+    if "cellSync" in fn:
+        return "cellSync"
     return "sysPrxForUser"
 
 

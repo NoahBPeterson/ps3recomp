@@ -76,3 +76,20 @@ are not charged to any container.
 amount left) behaves differently.
 
 **Fixing it.** Model lv2 memory containers (sys_memory_container_*) and charge them.
+
+## lv2 object ids are not in lv2's format
+
+**What.** lv2 gives every kernel object an id whose top byte is the object type and whose
+low bits count up in steps (event queues 0x8D00xxxx, event ports 0x0E00xxxx, mutexes
+0x85..., lwcond 0x97..., and so on; RPCS3 reproduces this). Most of ours are table slots
+plus one (`sys_event.c`: an event queue is `slot + 1`); PRX modules (0x23...) and SPU
+images (0x22...) already use the typed form.
+
+**What it would look like.** A title or library that looks inside an id: tests its type
+byte, uses it as an index, or compares it with a constant. Nothing seen does, but libsre
+stores the ids in its structures (an LFQueue after attach, an event flag), so a dump of
+them differs from the console; the LFQueue and event-flag suites mask those words.
+
+**Fixing it.** One id allocator shared by the lv2 object tables that hands out
+`type_base | index << step` and maps an id back to its slot, with the type checked on
+lookup (a wrong-type id is ESRCH, as on lv2).
