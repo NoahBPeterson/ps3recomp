@@ -1391,6 +1391,37 @@ static void* thread_dump_main(void* arg)
     }
     return NULL;
 }
+
+/* PS3_MEMDUMP_AT=<ea>:<len>:<sec>:<file>[,...]: <sec> seconds after start,
+ * write <len> bytes of guest memory at <ea> to <file> (raw). For state that
+ * has to be read in the middle of a stall -- a SPURS instance, a job queue --
+ * where no frame-based trigger ever fires. */
+typedef struct { uint32_t ea, len, sec; char file[256]; } memdump_req;
+static void* memdump_main(void* arg)
+{
+    extern uint8_t* vm_base;
+    memdump_req* r = (memdump_req*)arg;
+    sleep(r->sec);
+    FILE* f = fopen(r->file, "wb");
+    if (f) { fwrite(vm_base + r->ea, 1, r->len, f); fclose(f); }
+    fprintf(stderr, "[memdump] 0x%08X+0x%X at %us -> %s%s\n", r->ea, r->len, r->sec, r->file,
+            f ? "" : " (open failed)");
+    free(r);
+    return NULL;
+}
+static void memdump_start(const char* spec)
+{
+    char buf[2048];
+    strncpy(buf, spec, sizeof buf - 1); buf[sizeof buf - 1] = 0;
+    for (char* tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+        memdump_req* r = (memdump_req*)calloc(1, sizeof *r);
+        if (!r) return;
+        if (sscanf(tok, "%x:%x:%u:%255s", &r->ea, &r->len, &r->sec, r->file) != 4 ||
+            (uint64_t)r->ea + r->len > 0x100000000ull) { free(r); continue; }
+        pthread_t th;
+        if (pthread_create(&th, NULL, memdump_main, r) == 0) pthread_detach(th); else free(r);
+    }
+}
 #endif
 
 void sys_ppu_thread_init(lv2_syscall_table* tbl)
@@ -1405,6 +1436,7 @@ void sys_ppu_thread_init(lv2_syscall_table* tbl)
       if (e && atoi(e) > 0) { pthread_t th;
           pthread_create(&th, NULL, thread_dump_main, (void*)(uintptr_t)atoi(e));
           pthread_detach(th); } }
+    { const char* e = getenv("PS3_MEMDUMP_AT"); if (e && *e) memdump_start(e); }
 #endif
 
 #ifdef _WIN32
