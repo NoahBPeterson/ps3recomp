@@ -3826,6 +3826,8 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     return ctx.gpr[3];
 }
 
+extern "C" uint32_t lv2_prx_boot_liblv2(void);   /* runtime/syscalls/lv2_prx.c */
+
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
     /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
@@ -3835,6 +3837,16 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     setvbuf(stdout, NULL, _IONBF, 0);
 
     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
+
+    /* With liblv2 lifted into the build, the process starts the way lv2 starts
+     * it: liblv2's module_start is the main thread's entry, with the ELF's
+     * entry in r11 (RPCS3's ppu_load_exec). liblv2 then sets up the process --
+     * heap, TLS, the default modules through _sys_prx_load_module_list -- and
+     * calls the ELF entry itself. */
+    const uint32_t elf_entry_opd = entry_opd;
+    const uint32_t liblv2_start = lv2_prx_boot_liblv2();
+    if (liblv2_start) entry_opd = liblv2_start;
+
     uint32_t code = 0, toc = 0;
     ppu_opd_resolve(entry_opd, &code, &toc);
     ppu_fn fn = ppu_lookup(code);
@@ -3872,7 +3884,9 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     /* Main-thread TLS: copy the PT_TLS template into the TLS image (zeroing the
      * BSS tail) and point r13 at TP. The CRT accesses thread-locals relative to
      * r13; without this they hit address ~0 and corrupt the boot. */
-    if (g_tls_memsz && (PPU_TLS_IMG + g_tls_memsz < (ppu_vm_size ? ppu_vm_size : 0x11000000u))) {
+    if (liblv2_start) {
+        ctx.gpr[11] = elf_entry_opd;   /* liblv2 calls the ELF entry; it sets up TLS (r13) */
+    } else if (g_tls_memsz && (PPU_TLS_IMG + g_tls_memsz < (ppu_vm_size ? ppu_vm_size : 0x11000000u))) {
         memcpy(vm_base + PPU_TLS_IMG, vm_base + g_tls_vaddr, g_tls_filesz);
         if (g_tls_memsz > g_tls_filesz)
             memset(vm_base + PPU_TLS_IMG + g_tls_filesz, 0, g_tls_memsz - g_tls_filesz);
@@ -3943,6 +3957,8 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
          * an empty boot device before deadlocking on a data.toc it never loaded. */
         ctx.gpr[3] = argc_n;                        /* argc */
         ctx.gpr[4] = argv_base;                     /* argv */
+        ctx.gpr[5] = argv_base + (argc_n + 1u) * 8u; /* envp (empty) */
+        ctx.gpr[6] = 0;                             /* envc */
         /* Read back: demand-committed pages can swallow a write, and a silently
          * empty argv is hard to recognise from the guest side. */
         for (uint32_t a = 0; a < argc_n; a++) {

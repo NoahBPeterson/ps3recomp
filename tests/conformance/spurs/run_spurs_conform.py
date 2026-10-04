@@ -6,8 +6,14 @@ Each test module t_*.py builds one PPU program (spurs_lib.build) that records
 labelled values; RPCS3 runs it headless (the oracle), ps3recomp lifts and runs
 it, and the transcripts are compared record by record.
 
+With --lle DIR, ps3recomp runs the firmware's own liblv2 and libsre instead
+of its HLE for them: DIR holds those modules as tools/lift_firmware_module.py
+writes them (one subdirectory each). The process then starts in liblv2, which
+loads libsre through lv2's PRX syscalls, as on the console -- so the suites
+compare Sony's code running on our lv2 and SPU runtime against RPCS3.
+
 usage: run_spurs_conform.py --work DIR [--only t_core,t_workload] [--skip-oracle]
-       [--repeat N] [--rpcs3 PATH]
+       [--repeat N] [--rpcs3 PATH] [--lle DIR]
 """
 import argparse
 import glob
@@ -65,6 +71,7 @@ def main():
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 8)
+    ap.add_argument("--lle", help="directory of lifted firmware modules (see above)")
     a = ap.parse_args()
     work = os.path.abspath(a.work)
     os.makedirs(work, exist_ok=True)
@@ -72,7 +79,8 @@ def main():
     if a.only:
         tests = [t for t in tests if t in a.only.split(",")]
     py = sys.executable
-    rec, bld = os.path.join(work, "recompiled"), os.path.join(work, "build")
+    rec = os.path.join(work, "recompiled")
+    bld = os.path.join(work, "build_lle" if a.lle else "build")
     summary = []
     for name in tests:
         tdir = os.path.join(work, name)
@@ -101,6 +109,12 @@ def main():
                "--hle-stubs", os.path.join(load, name + ".imports.json"),
                "-o", rec], stdout=subprocess.DEVNULL).returncode:
             summary.append((name, "LIFT FAILED")); continue
+        if a.lle:
+            for mod in sorted(os.listdir(a.lle)):
+                mdir = os.path.join(a.lle, mod)
+                for f in os.listdir(mdir) if os.path.isdir(mdir) else []:
+                    if f.endswith((".cpp", ".c", ".h")):
+                        shutil.copy(os.path.join(mdir, f), rec)
         if not os.path.exists(os.path.join(bld, "build.ninja")):
             sh(["cmake", "-S", os.path.join(ROOT, "templates", "project"), "-B", bld, "-G", "Ninja",
                 "-DCMAKE_BUILD_TYPE=Release", "-DRECOMP_DIR=" + rec], stdout=subprocess.DEVNULL)
@@ -119,6 +133,10 @@ def main():
                 except subprocess.TimeoutExpired:
                     pass
             got = transcript(ours)
+            if a.lle and b'loaded module "/dev_flash/sys/external/libsre.sprx"' not in \
+                    open(os.path.join(tdir, "ours%d.stderr.txt" % k), "rb").read():
+                print("   ours: libsre was not loaded (the run used the HLE): not counted")
+                got = None
             if got is None:
                 results.append(None); continue
             results.append(compare(lines, want, got))
