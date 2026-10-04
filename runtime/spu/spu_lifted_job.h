@@ -90,11 +90,22 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
     {
         extern SPU_THREAD_LOCAL int g_spu_interp_exit_valid;
         extern SPU_THREAD_LOCAL int32_t g_spu_interp_exit_status;
+        extern SPU_THREAD_LOCAL int g_spu_interp_group_exit_valid;
+        extern SPU_THREAD_LOCAL int32_t g_spu_interp_group_exit_status;
         g_spu_interp_exit_valid = 0;
+        g_spu_interp_group_exit_valid = 0;
         if (ctx.status == SPU_STATUS_STOPPED_BY_STOP && ctx.stop_code == 0x102u &&
             spu_channel_has_data(&ctx.ch_out_mbox)) {
             g_spu_interp_exit_valid  = 1;
             g_spu_interp_exit_status = (int32_t)ctx.ch_out_mbox.value;
+            ctx.ch_out_mbox.count = 0;
+        }
+        /* sys_spu_thread_group_exit: stop 0x101, the group's status in the
+         * same mailbox. */
+        if (ctx.status == SPU_STATUS_STOPPED_BY_STOP && ctx.stop_code == 0x101u &&
+            spu_channel_has_data(&ctx.ch_out_mbox)) {
+            g_spu_interp_group_exit_valid  = 1;
+            g_spu_interp_group_exit_status = (int32_t)ctx.ch_out_mbox.value;
             ctx.ch_out_mbox.count = 0;
         }
     }

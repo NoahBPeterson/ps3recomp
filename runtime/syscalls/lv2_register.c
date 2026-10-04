@@ -251,8 +251,8 @@ static int64_t sys_tty_read(ppu_context* ctx)
 /* The lv2 run states (RPCS3's lv2 is the reference for the kernel): a group is
  * NOT_INITIALIZED until every one of its threads has been initialized, then
  * INITIALIZED -- startable, joinable, destroyable -- and returns there once a
- * run is over, so it can be started again. STOPPED here is a run that is over
- * and not yet joined; start and destroy treat it as INITIALIZED. */
+ * run is over -- when its last thread stops, joined or not -- so it can be
+ * started again; the run's result waits for one join (join_state). */
 #define SPU_GROUP_STATE_NOT_INITIALIZED 0
 #define SPU_GROUP_STATE_INITIALIZED  1
 #define SPU_GROUP_STATE_READY        2
@@ -301,6 +301,8 @@ typedef struct {
      * block for every thread in a group, rewriting it between calls -- reading
      * it lazily hands every thread the last thread's values. */
     uint64_t args[4];
+    uint32_t run_gen;        /* the group run this thread's host thread belongs to */
+    int      host_live;      /* a host thread exists and has not been reaped */
     uint32_t img_ea;         /* sys_spu_image descriptor EA it was initialized with */
     /* The image, COPIED at initialize as lv2 does: the descriptor (and a USER
      * image's segment list) may be freed or reused once the thread exists. */
@@ -375,6 +377,17 @@ typedef struct {
     uint32_t run_queue_id;
     uint32_t user_event_ports[64];
     int32_t  type;               /* SYS_SPU_THREAD_GROUP_TYPE_* */
+    /* The run in progress and its end, as lv2 keeps them: a run ends when its
+     * last thread stops (or on group exit / terminate), whether or not anyone
+     * is joining; the group is then INITIALIZED again and the result waits in
+     * join_state for one join to take it. */
+    uint32_t run_gen;            /* bumped when a run ends */
+    uint32_t running;            /* threads of the current run still going */
+    uint32_t join_state;         /* cause of a finished run nobody joined yet */
+    int      has_waiter;         /* a thread is blocked in group_join */
+    int      waiter_done;
+    uint32_t waiter_cause;
+    int32_t  waiter_status;
     int      has_sched;          /* context-switched (not NON_CONTEXT) */
 } spu_group_t;
 
@@ -732,6 +745,74 @@ static void spu_spawn_host_thread(spu_thread_handle_t* out,
 }
 #endif
 
+static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea, uint32_t args_size, void* user);
+
+/* One lock and condition for every group's run state (start, thread
+ * completion, join, terminate). */
+static SRWLOCK            s_grp_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_grp_cv   = CONDITION_VARIABLE_INIT;
+
+/* The run is over (lock held): settle cause and status, return the group to
+ * INITIALIZED, and hand the result to a blocked joiner or keep it for the
+ * next join. */
+static void spu_group_run_end_locked(spu_group_t* g)
+{
+    if (g->cause != SPU_GROUP_CAUSE_GROUP_EXIT && g->cause != SPU_GROUP_CAUSE_TERMINATED) {
+        g->cause       = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
+        g->exit_status = 0;
+    }
+    g->running = 0;
+    g->run_gen++;
+    g->state = SPU_GROUP_STATE_INITIALIZED;
+    if (g->has_waiter) {
+        g->waiter_cause  = g->cause;
+        g->waiter_status = g->exit_status;
+        g->waiter_done   = 1;
+        g->join_state    = 0;
+    } else {
+        g->join_state = g->cause;
+    }
+    WakeAllConditionVariable(&s_grp_cv);
+}
+
+/* A thread of the run `gen` has stopped; a group exit it made ends the run. */
+static void spu_group_thread_done(uint32_t group_id, uint32_t gen, int group_exit, int32_t gstatus)
+{
+    AcquireSRWLockExclusive(&s_grp_lock);
+    spu_group_t* g = spu_find_group(group_id);
+    if (g && g->state == SPU_GROUP_STATE_RUNNING && gen == g->run_gen) {
+        if (group_exit) {
+            g->cause       = SPU_GROUP_CAUSE_GROUP_EXIT;
+            g->exit_status = gstatus;
+            spu_group_run_end_locked(g);
+        } else if (--g->running == 0) {
+            spu_group_run_end_locked(g);
+        }
+    }
+    ReleaseSRWLockExclusive(&s_grp_lock);
+}
+
+/* Reap host threads of earlier runs that have finished. */
+static void spu_group_reap(spu_group_t* g)
+{
+    for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
+        if (!(g->init_mask & (1u << i))) continue;
+        uint32_t idx = g->thread_indices[i];
+        if (idx >= MAX_SPU_THREADS) continue;
+        spu_thread_t* t = &s_spu_threads[idx];
+        if (!t->host_live || t->running) continue;
+#ifdef _WIN32
+        if (t->host_thread) { WaitForSingleObject(t->host_thread, INFINITE); CloseHandle(t->host_thread); }
+        t->host_thread = NULL;
+#else
+        pthread_join(t->host_thread, NULL);
+        pthread_mutex_destroy(&t->finish_event.mu);
+        pthread_cond_destroy(&t->finish_event.cv);
+#endif
+        t->host_live = 0;
+    }
+}
+
 /* Host-thread entry for a thread running its image's own lifted SPU code.
  *
  * Everything SPU here is in runtime/spu/spu_lifted_thread.c; this is the part
@@ -750,27 +831,20 @@ static void* spu_exec_thread_proc(void* arg)
     spu_lifted_thread_result r;
     spu_lifted_thread_run(t->sctx, &r);
     t->exit_status = r.exit_status;
-    if (r.group_exit) {
-        spu_group_t* g = spu_find_group(t->group_id);
-        if (g) {
-            g->exit_status = r.group_status;
-            /* Say the group exited on its own request. group_join used to
-             * overwrite the cause unconditionally, which made a guest-initiated
-             * sys_spu_thread_group_exit indistinguishable from every thread
-             * simply running out. */
-            g->cause = SPU_GROUP_CAUSE_GROUP_EXIT;
-        }
-    }
 #ifdef _WIN32
     t->running = 0;
     SetEvent(t->finish_event);
-    return 0;
 #else
     pthread_mutex_lock(&t->finish_event.mu);
     t->running = 0;
     t->finish_event.done = 1;
     pthread_cond_broadcast(&t->finish_event.cv);
     pthread_mutex_unlock(&t->finish_event.mu);
+#endif
+    spu_group_thread_done(t->group_id, t->run_gen, r.group_exit, r.group_status);
+#ifdef _WIN32
+    return 0;
+#else
     return NULL;
 #endif
 }
@@ -802,17 +876,27 @@ static void* spu_fallback_thread_proc(void* arg)
         fprintf(stderr, "[SPU-DONE-EVT] tid=0x%X rc=0x%X -> queue=%u\n",
                 t->tid, rc, t->connected_queue);
     }
-    /* Mark complete and signal anyone waiting in group_join. */
+    /* Mark complete, then let the group see the thread stop. */
+    {
+        extern SPU_THREAD_LOCAL int g_spu_interp_group_exit_valid;
+        extern SPU_THREAD_LOCAL int32_t g_spu_interp_group_exit_status;
+        const int gx = t->fb_handler == spu_interp_fallback && g_spu_interp_group_exit_valid;
+        const int32_t gs = g_spu_interp_group_exit_status;
 #ifdef _WIN32
-    t->running = 0;
-    SetEvent(t->finish_event);
+        t->running = 0;
+        SetEvent(t->finish_event);
+#else
+        pthread_mutex_lock(&t->finish_event.mu);
+        t->running = 0;
+        t->finish_event.done = 1;
+        pthread_cond_broadcast(&t->finish_event.cv);
+        pthread_mutex_unlock(&t->finish_event.mu);
+#endif
+        spu_group_thread_done(t->group_id, t->run_gen, gx, gs);
+    }
+#ifdef _WIN32
     return 0;
 #else
-    pthread_mutex_lock(&t->finish_event.mu);
-    t->running = 0;
-    t->finish_event.done = 1;
-    pthread_cond_broadcast(&t->finish_event.cv);
-    pthread_mutex_unlock(&t->finish_event.mu);
     return NULL;
 #endif
 }
@@ -958,14 +1042,23 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
     uint32_t id = (uint32_t)ctx->gpr[3];
     spu_group_t* g = spu_find_group(id);
     if (!g) LV2_RET(ctx, CELL_ESRCH);
-    if (g->state != SPU_GROUP_STATE_INITIALIZED && g->state != SPU_GROUP_STATE_STOPPED)
+    spu_group_reap(g);
+    AcquireSRWLockExclusive(&s_grp_lock);
+    if (g->state != SPU_GROUP_STATE_INITIALIZED) {
+        ReleaseSRWLockExclusive(&s_grp_lock);
         LV2_RET(ctx, CELL_ESTAT);
-    g->state = SPU_GROUP_STATE_RUNNING;
-    /* This run has produced no cause yet. group_join now preserves a cause a
-     * thread reported, so a group id started a second time has to begin with a
-     * clean one or it would report the previous run's exit forever. */
+    }
+    /* A new run: no cause yet, an unjoined result of the previous run is
+     * dropped (lv2 clears join_state at start), and `running` holds a guard
+     * reference until every thread is launched, so one that finishes at once
+     * cannot end the run before its siblings have started. */
+    g->state       = SPU_GROUP_STATE_RUNNING;
     g->cause       = 0;
     g->exit_status = 0;
+    g->join_state  = 0;
+    g->running     = 1;
+    const uint32_t gen = g->run_gen;
+    ReleaseSRWLockExclusive(&s_grp_lock);
     if (g->run_queue_id)
         sys_event_queue_push_by_id(g->run_queue_id, 0xFFFFFFFF53505500ull, (uint64_t)id, 0, 0);
 
@@ -1045,6 +1138,9 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 for (int a = 0; a < 4; a++) d.args[a] = t->args[a];
                 spu_lifted_thread_setup(t->sctx, &d);
                 t->running = 1;
+                t->run_gen = gen;
+                t->host_live = 1;
+                AcquireSRWLockExclusive(&s_grp_lock); g->running++; ReleaseSRWLockExclusive(&s_grp_lock);
 #ifdef _WIN32
                 if (!t->finish_event)
                     t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -1159,11 +1255,24 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
          * mailbox word: one run consumed it, the other polled an empty box and
          * parked, and which got it varied run to run. */
         if (fb == spu_interp_fallback && !getenv("RD_SPU_INTERP_ASYNC")) {
+            extern SPU_THREAD_LOCAL int g_spu_interp_group_exit_valid;
+            extern SPU_THREAD_LOCAL int32_t g_spu_interp_group_exit_status;
             t->exit_status = fb(t->tid, t->args_ea, t->args_size, user);
             t->running = 0;
+            if (g_spu_interp_group_exit_valid) {
+                AcquireSRWLockExclusive(&s_grp_lock);
+                if (g->state == SPU_GROUP_STATE_RUNNING && g->run_gen == gen) {
+                    g->cause       = SPU_GROUP_CAUSE_GROUP_EXIT;
+                    g->exit_status = g_spu_interp_group_exit_status;
+                }
+                ReleaseSRWLockExclusive(&s_grp_lock);
+            }
             instant++;
             continue;
         }
+        t->run_gen = gen;
+        t->host_live = 1;
+        AcquireSRWLockExclusive(&s_grp_lock); g->running++; ReleaseSRWLockExclusive(&s_grp_lock);
 #ifdef _WIN32
         /* Manual-reset event so multiple group_join callers all see "set" */
         if (!t->finish_event)
@@ -1209,10 +1318,13 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         spawned++;
     }
 
+    /* Drop the guard; if every thread already finished (or none was
+     * launched), the run ends here. */
+    AcquireSRWLockExclusive(&s_grp_lock);
+    if (g->state == SPU_GROUP_STATE_RUNNING && g->run_gen == gen && --g->running == 0)
+        spu_group_run_end_locked(g);
+    ReleaseSRWLockExclusive(&s_grp_lock);
     if (spawned == 0) {
-        g->state = SPU_GROUP_STATE_STOPPED;
-        g->cause = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
-        g->exit_status = 0;
         /* `instant` counts BOTH no-fallback threads and threads that ran to
          * completion synchronously (the interpreter path). Reporting "no
          * fallback" whenever spawned==0 hid a perfectly working interpreted
@@ -1228,75 +1340,50 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
     return 0;
 }
 
-/* sys_spu_thread_group_join(id, *cause, *status) */
+/* sys_spu_thread_group_join(id, *cause, *status)
+ *
+ * As lv2: ESTAT before every thread is initialized; EBUSY while another
+ * thread is joining; a run that ended and was not joined yet is returned at
+ * once (and only once); otherwise the caller sleeps until the current -- or,
+ * for a group that is not running, the next -- run ends. */
 static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
 {
     uint32_t id         = (uint32_t)ctx->gpr[3];
     uint32_t cause_ea   = (uint32_t)ctx->gpr[4];
     uint32_t status_ea  = (uint32_t)ctx->gpr[5];
 
+    AcquireSRWLockExclusive(&s_grp_lock);
     spu_group_t* g = spu_find_group(id);
-    if (!g) LV2_RET(ctx, CELL_ESRCH);
-    if (g->state == SPU_GROUP_STATE_NOT_INITIALIZED) LV2_RET(ctx, CELL_ESTAT);
-    /* KNOWN DIVERGENCE: joining an initialized group that has not been started
-     * (and has no finished run left unjoined) blocks in lv2 until some other
-     * thread starts it and the run ends. This returns at once with the
-     * group's last cause instead. */
-
-    /* Wait for any host-thread fallbacks to finish, then collect the
-     * worst exit status. Real SPU group_join is a blocking syscall —
-     * games rely on it to know all SPU work is done before reading
-     * back results. */
-    if (g->state == SPU_GROUP_STATE_RUNNING) {
-        for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
-            uint32_t idx = g->thread_indices[i];
-            if (idx >= MAX_SPU_THREADS) continue;
-            spu_thread_t* t = &s_spu_threads[idx];
-            if (!t->in_use) continue;
-            if (t->running) {
-#ifdef _WIN32
-                if (t->finish_event)
-                    WaitForSingleObject(t->finish_event, INFINITE);
-                if (t->host_thread) {
-                    CloseHandle(t->host_thread);
-                    t->host_thread = NULL;
-                }
-#else
-                pthread_mutex_lock(&t->finish_event.mu);
-                while (!t->finish_event.done)
-                    pthread_cond_wait(&t->finish_event.cv, &t->finish_event.mu);
-                pthread_mutex_unlock(&t->finish_event.mu);
-                pthread_join(t->host_thread, NULL);
-                pthread_mutex_destroy(&t->finish_event.mu);
-                pthread_cond_destroy(&t->finish_event.cv);
-#endif
-            }
-        }
-        /* ALL_THREADS_EXIT is only the DEFAULT. A thread that stopped on
-         * the SPU-side sys_spu_thread_group_exit already recorded GROUP_EXIT
-         * and the status it asked for, and a terminate recorded TERMINATED;
-         * overwriting either made a group the guest deliberately exited
-         * indistinguishable from one whose threads merely ran out. Cause 0 is
-         * the unset sentinel (GROUP_EXIT=1, ALL_THREADS_EXIT=2, TERMINATED=4).
-         * The status is the GROUP's: what sys_spu_thread_group_exit or a
-         * terminate asked for, and 0 when the threads simply all exited (each
-         * thread's own status is sys_spu_thread_get_exit_status's business). */
-        if (g->cause != SPU_GROUP_CAUSE_GROUP_EXIT &&
-            g->cause != SPU_GROUP_CAUSE_TERMINATED) {
-            g->cause       = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
-            g->exit_status = 0;
-        }
+    if (!g) { ReleaseSRWLockExclusive(&s_grp_lock); LV2_RET(ctx, CELL_ESRCH); }
+    if (g->state == SPU_GROUP_STATE_NOT_INITIALIZED) {
+        ReleaseSRWLockExclusive(&s_grp_lock);
+        LV2_RET(ctx, CELL_ESTAT);
     }
-    g->state = SPU_GROUP_STATE_INITIALIZED;
+    if (g->has_waiter) { ReleaseSRWLockExclusive(&s_grp_lock); LV2_RET(ctx, CELL_EBUSY); }
+    uint32_t cause;
+    int32_t  status;
+    if (g->state == SPU_GROUP_STATE_INITIALIZED && g->join_state) {
+        cause  = g->join_state;
+        status = g->exit_status;
+        g->join_state = 0;
+    } else {
+        g->has_waiter  = 1;
+        g->waiter_done = 0;
+        while (!g->waiter_done)
+            SleepConditionVariableSRW(&s_grp_cv, &s_grp_lock, INFINITE, 0);
+        g->has_waiter = 0;
+        cause  = g->waiter_cause;
+        status = g->waiter_status;
+    }
+    ReleaseSRWLockExclusive(&s_grp_lock);
+    spu_group_reap(g);
 
-    vm_write_be32(cause_ea,  g->cause);
-    vm_write_be32(status_ea, (uint32_t)g->exit_status);
-
+    if (cause_ea)  vm_write_be32(cause_ea,  cause);
+    if (status_ea) vm_write_be32(status_ea, (uint32_t)status);
     fprintf(stderr, "[SPU] group_join id=0x%X cause=%u status=%d (event_queue=0x%X)\n",
-            id, g->cause, g->exit_status, g->event_queue_id);
+            id, cause, status, g->event_queue_id);
     fflush(stderr);
-    ctx->gpr[3] = 0;
-    return 0;
+    LV2_RET(ctx, CELL_OK);
 }
 
 /* sys_spu_thread_group_destroy(id) */
@@ -1317,16 +1404,9 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
     }
     spu_group_t* g = spu_find_group(id);
     if (!g) LV2_RET(ctx, CELL_ESRCH);
-    /* EBUSY while a thread is still running. A RUNNING group whose threads
-     * have all stopped is, to lv2, already back to INITIALIZED (this state
-     * only changes at join), so it can be destroyed unjoined. */
-    if (g->state == SPU_GROUP_STATE_RUNNING) {
-        for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
-            uint32_t idx = g->thread_indices[i];
-            if ((g->init_mask & (1u << i)) && idx < MAX_SPU_THREADS && s_spu_threads[idx].running)
-                LV2_RET(ctx, CELL_EBUSY);
-        }
-    }
+    /* EBUSY while a run is in progress (lv2: state above INITIALIZED). */
+    if (g->state == SPU_GROUP_STATE_RUNNING) LV2_RET(ctx, CELL_EBUSY);
+    spu_group_reap(g);
     {
         for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
             uint32_t idx = g->thread_indices[i];
@@ -1359,16 +1439,22 @@ static int64_t sys_spu_thread_group_terminate_handler(ppu_context* ctx)
 {
     uint32_t id     = (uint32_t)ctx->gpr[3];
     int32_t  status = (int32_t)ctx->gpr[4];
+    AcquireSRWLockExclusive(&s_grp_lock);
     spu_group_t* g = spu_find_group(id);
-    if (g) {
-        g->state = SPU_GROUP_STATE_STOPPED;
-        g->cause = SPU_GROUP_CAUSE_TERMINATED;
-        g->exit_status = status;
+    if (!g) { ReleaseSRWLockExclusive(&s_grp_lock); LV2_RET(ctx, CELL_ESRCH); }
+    if (g->state != SPU_GROUP_STATE_RUNNING) {
+        ReleaseSRWLockExclusive(&s_grp_lock);
+        LV2_RET(ctx, CELL_ESTAT);
     }
+    /* KNOWN DIFFERENCE (docs/KNOWN_DIFFERENCES.md): the run ends here, but a
+     * host thread still executing SPU code is not stopped. */
+    g->cause       = SPU_GROUP_CAUSE_TERMINATED;
+    g->exit_status = status;
+    spu_group_run_end_locked(g);
+    ReleaseSRWLockExclusive(&s_grp_lock);
     fprintf(stderr, "[SPU] group_terminate id=0x%X status=%d\n", id, status);
     fflush(stderr);
-    ctx->gpr[3] = 0;
-    return 0;
+    LV2_RET(ctx, CELL_OK);
 }
 
 /* sys_spu_thread_get_exit_status(tid, *status)
