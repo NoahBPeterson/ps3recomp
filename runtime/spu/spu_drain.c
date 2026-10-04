@@ -28,7 +28,7 @@ SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 /* PM flow trace (SPURS_PM_FLOW=1): record every cross-function transfer of ONE
  * policy-module run (the ctx spurs_policy.c arms) so the post-claim decision
  * path can be reconstructed offline. Written by the drain-loop hook below;
- * armed/dumped by spu_run_policy_module. */
+ * armed and dumped by a diagnostic caller. */
 uint32_t          g_pm_flow_buf[8192];
 volatile unsigned g_pm_flow_n = 0;
 void* volatile    g_pm_flow_ctx = 0;
