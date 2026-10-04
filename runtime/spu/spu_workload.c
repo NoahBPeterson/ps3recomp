@@ -688,44 +688,6 @@ static void spu_async_run(spu_async_job* j)
                     }
                     fflush(stderr);
                 }
-                if (getenv("LBP_REAL_POLICY") && j->taskset_ea) {
-                    extern int spurs_run_taskset_policy_probe(uint32_t,uint32_t,uint32_t,
-                                                              uint64_t,uint32_t,uint8_t*,uint32_t);
-                    /* spurs EA from the taskset header lo32 @ +0x64 (be64 @0x60). */
-                    uint32_t ts = j->taskset_ea;
-                    uint32_t spurs_ea = 0;
-                    if (vm_base) { const uint8_t* t = vm_base + ts;
-                        spurs_ea = RDBE32(t, 0x64);
-                        /* Why did the policy exit without dispatching? Dump the task
-                         * bitsets it reads (task N = bit 127-N; task 2 = bit 125). */
-                        fprintf(stderr, "[taskset-bits] RUNNING=%08X%08X READY=%08X%08X ENABLED=%08X%08X SIGNALLED=%08X%08X WAITING=%08X%08X\n",
-                                RDBE32(t,0x00),RDBE32(t,0x04), RDBE32(t,0x10),RDBE32(t,0x14),
-                                RDBE32(t,0x30),RDBE32(t,0x34), RDBE32(t,0x40),RDBE32(t,0x44),
-                                RDBE32(t,0x50),RDBE32(t,0x54)); }
-                    uint8_t real2700[0x180];
-                    int st = spurs_run_taskset_policy_probe(ts, j->taskid, spurs_ea,
-                                                            (uint64_t)ts, 3, real2700, sizeof real2700);
-                    fprintf(stderr, "[real-pm] status=0x%X -- LS 0x2700 diff (build_context vs real policy):\n", st);
-                    for (uint32_t o = 0; o < sizeof real2700; o += 4) {
-                        uint32_t bc = ((uint32_t)ls[0x2700+o]<<24)|((uint32_t)ls[0x2700+o+1]<<16)|
-                                      ((uint32_t)ls[0x2700+o+2]<<8)|ls[0x2700+o+3];
-                        uint32_t rp = ((uint32_t)real2700[o]<<24)|((uint32_t)real2700[o+1]<<16)|
-                                      ((uint32_t)real2700[o+2]<<8)|real2700[o+3];
-                        if (bc != rp)
-                            fprintf(stderr, "   0x%04X: build=%08X real=%08X\n", 0x2700+o, bc, rp);
-                    }
-                    /* EMPIRICAL TEST (LBP_POLICY_CTX): overlay the REAL policy's
-                     * SpursTasksetContext onto binkspu's LS 0x2700, replacing the C
-                     * reimpl, then let binkspu run with it. If the movie plane fills
-                     * (not green) the policy's fuller ctx is the fix (H1); if still
-                     * green, the frame-output gate is Bink-layer (H2). Keeps the
-                     * build_context 0x100 kernel ctx (moduleId "TK") intact. */
-                    if (getenv("LBP_POLICY_CTX")) {
-                        memcpy(ls + 0x2700, real2700, sizeof real2700);
-                        fprintf(stderr, "[real-pm] OVERLAID policy ctx onto binkspu LS 0x2700 (LBP_POLICY_CTX)\n");
-                    }
-                    fflush(stderr);
-                }
                 #undef RDBE32
             }
             spu_serial_acquire();       /* one SPU task runs at a time (LBP_SPU_SERIAL) */
