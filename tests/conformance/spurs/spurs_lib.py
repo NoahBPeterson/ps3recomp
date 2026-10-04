@@ -42,7 +42,9 @@ TAG = b"SPURSTEST"
 # lv2 syscalls used by the harness
 SYS = dict(process_exit=3, usleep=141, thread_create=52, thread_start=53, thread_join=44,
            thread_exit=41, thread_yield=43, equeue_create=128, equeue_receive=130,
-           equeue_destroy=129, tty_write=403)
+           equeue_destroy=129, tty_write=403, spu_group_create=170, spu_group_destroy=171,
+           spu_thread_initialize=172, spu_group_start=173, spu_group_join=178,
+           spu_get_exit_status=165)
 
 # common error codes, for readable expectations in comments
 CELL_OK = 0
@@ -51,6 +53,8 @@ CELL_OK = 0
 def module_of(fn):
     if fn.startswith("cellSysmodule"):
         return "cellSysmodule"
+    if fn.startswith("cellUserTrace"):
+        return "cellLibprof"
     if "Spurs" in fn:
         return "cellSpurs"
     return "sysPrxForUser"
@@ -170,7 +174,7 @@ class Test:
         self.emit(P.li32(11, self["res"] + off), P.stw(reg, 11, 0))
         self.records.append((label, off, 4, ()))
 
-    def record_mem(self, label, addr, size, ignore=()):
+    def record_mem(self, label, addr, size, ignore=(), deref=False):
         """Snapshot `size` bytes (multiple of 4) at addr into the result area now.
         ignore: (offset, length) byte ranges that legitimately differ between
         implementations (kernel-assigned ids, host pointers) and are not compared."""
@@ -178,8 +182,11 @@ class Test:
         off = self.res_off
         self.res_off = (self.res_off + size + 15) & ~15
         loop = self.uniq("cp")
-        self.emit(P.li32(9, addr - 4), P.li32(10, self["res"] + off - 4), P.li32(12, size // 4),
-                  P.mtspr(9, 12))
+        if deref:   # addr holds a guest pointer: snapshot what it points at
+            self.emit(P.li32(9, addr), P.lwz(9, 9, 0), P.addi(9, 9, -4))
+        else:
+            self.emit(P.li32(9, addr - 4))
+        self.emit(P.li32(10, self["res"] + off - 4), P.li32(12, size // 4), P.mtspr(9, 12))
         self.t.label(loop)
         self.emit(P.D(33, 12, 9, 4),          # lwzu r12,4(r9)
                   P.D(37, 12, 10, 4))         # stwu r12,4(r10)
@@ -218,12 +225,13 @@ class Test:
                   P.D(26, 9, 9, 1))                                      # xori r9,r9,1
         self.record_reg(9, label)
 
-    def func(self, name, emit_fn):
+    def func(self, name, emit_fn, ret=0):
         """Define an ordinary PPU function `name` (callable through its OPD at
-        T.opd_of(name), e.g. as a hook); emit_fn(T) emits its body. Returns 0."""
+        T.opd_of(name), e.g. as a hook); emit_fn(T) emits its body. Returns
+        `ret`."""
         if name not in self.funcs:
             self.funcs.append(name)
-        self.threads.append((name, emit_fn, "func"))
+        self.threads.append((name, emit_fn, ("func", ret)))
 
     def opd_of(self, name):
         if name not in self.funcs:
@@ -356,10 +364,10 @@ def build(test_mod, out_path):
         emit_routines(t, T.D)
         for name, fn, kind in T.threads:
             t.label(name)
-            if kind == "func":
+            if kind[0] == "func":
                 T.emit(P.mfspr(0, 8), P.std(0, 1, 16), P.stdu(1, 1, -256), P.std(2, 1, 40))
                 fn(T)
-                T.emit(P.addi(1, 1, 256), P.ld(0, 1, 16), P.mtspr(8, 0), P.addi(3, 0, 0), P.blr())
+                T.emit(P.addi(1, 1, 256), P.ld(0, 1, 16), P.mtspr(8, 0), P.addi(3, 0, kind[1]), P.blr())
                 continue
             T.emit(P.stdu(1, 1, -256))
             fn(T)
