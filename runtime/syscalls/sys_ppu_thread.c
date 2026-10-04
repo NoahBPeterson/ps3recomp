@@ -249,6 +249,10 @@ void ydkj_release_pending_threads(void) {}
  * for main before any sys_ppu_thread_create so every thread has a unique
  * nonzero id and the special cases die.
  * -----------------------------------------------------------------------*/
+/* The main thread's priority: the title's sys_process_param_t.primary_prio
+ * (the loader sets it from PT_PROC_PARAM), else lv2's default, 1001. */
+int32_t g_ppu_primary_prio = 1001;
+
 uint64_t ppu_thread_register_main(void)
 {
     table_lock();
@@ -258,6 +262,7 @@ uint64_t ppu_thread_register_main(void)
         t->ctx.thread_id = 1;
         t->state    = PPU_THREAD_STATE_RUNNING;
         t->joinable = 0;                    /* nobody joins the main thread */
+        t->priority = g_ppu_primary_prio;
         strncpy(t->name, "main", sizeof(t->name) - 1);
 #ifdef _WIN32
         t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
