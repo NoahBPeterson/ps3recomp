@@ -400,6 +400,9 @@ typedef struct spu_context {
      * manager then ran its buffer loop a second time on the job's registers
      * and died in its own assert (the song-freeze). */
     uint32_t drain_ret_pc;
+    /* The SPURS kernel instance running on this SPU (libs/spurs/spurs_kernel.c),
+     * or NULL: a policy module's selectWorkload call is answered by it. */
+    void* spurs_vspu;
 } spu_context;
 
 /* The SPURS kernel's own service entry points, which it plants as

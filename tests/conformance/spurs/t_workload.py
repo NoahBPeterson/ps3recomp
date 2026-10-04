@@ -9,12 +9,10 @@ from spurs_lib import SDK_VERSION, P, S
 PM_BASE = 0xA00
 WL = dict(count=0, inside=4, saw2=8, spin=12, st_ready=16, st_signal=20, st_flag=24, snap=128)
 SNAP_SPUNUM = 16 + 8          # snapshot = r4 quad, then LS 0x1C0..0x1EF; spuNum is LS 0x1C8
-# Instance bytes the SPU kernel itself keeps, which move with SPU timing (when
-# each SPU next wakes and services the system workload), not with the API:
-# 0x72 sysSrvMessage and 0x73 spuIdling (per-SPU bits), 0x90..0x9F wklStatus1
-# (which SPUs have taken each workload), 0xBD sysSrvMsgUpdateWorkload. The
-# HLE has no SPU-side kernel to keep them; everything else is compared.
-INST_IGNORE = ((0x72, 2), (0x90, 16), (0xBD, 1))
+# Instance snapshots are taken once the SPUs have settled (each has serviced
+# the system-service messages the last change raised and gone idle:
+# T.settle), so the SPU kernel's own bytes -- sysSrvMessage, spuIdling,
+# wklStatus1, sysSrvMsgUpdateWorkload -- are compared like the rest.
 
 
 def pm_code():
@@ -73,6 +71,7 @@ def pm_code():
     a.wrch(S.MFC_LSA, 10); a.wrch(S.MFC_EAH, 127); a.wrch(S.MFC_EAL, 11)
     a.il(50, S.GETLLAR); a.wrch(S.MFC_Cmd, 50); a.rdch(50, S.MFC_RdAtomicStat)
     a.lqd(41, 10, 0); a.rotqbyi(43, 41, 4)
+    a.rotqbyi(49, 41, 12); a.brz(49, "done")                   # the PPU released it
     a.cgti(44, 43, 1); a.brnz(44, "saw")
     a.ai(42, 42, -1); a.br("spin")
     a.label("saw")
@@ -134,12 +133,14 @@ def body(T):
     T.call(A, spurs, wid, pm, npm, wl, prio, 2, 1, rc="AddWorkload min > max")
     T.call(A, spurs, wid, pm, npm, wl, prio, 9, 9, rc="AddWorkload min 9")
     T.call(A, spurs, wid, pm, npm, wl, prio_bad, 1, 1, rc="AddWorkload priority 16")
-    T.record_mem("instance 0x00-0xBF after rejected adds", spurs, 0xC0, ignore=INST_IGNORE)
+    T.settle(spurs, 2)
+    T.record_mem("instance 0x00-0xFF after rejected adds", spurs, 0x100)
 
     # ---- a real workload ---------------------------------------------------------
     T.call(A, spurs, wid, pm, npm, wl, prio, 1, 2, rc="AddWorkload")
     T.record_mem("wid", wid, 4)
-    T.record_mem("instance 0x00-0xBF after add", spurs, 0xC0, ignore=INST_IGNORE)
+    T.settle(spurs, 2)
+    T.record_mem("instance 0x00-0xFF after add", spurs, 0x100)
     T.record_mem("wklInfo1[0..7]", spurs + 0xB00, 256)
     info("fresh wid 0", ("mem", wid))
     T.call("cellSpursGetWorkloadData", spurs, out, ("mem", wid), rc="GetWorkloadData")
@@ -212,7 +213,8 @@ def body(T):
     statuses("readyCount phase")
     T.record_mem("PM snapshot (r4, LS 0x1C0..0x1EF)", wl + WL["snap"], 64,
                  ignore=((SNAP_SPUNUM, 4),))   # which SPU took it varies
-    T.record_mem("instance 0x00-0xBF after readyCount phase", spurs, 0xC0, ignore=INST_IGNORE)
+    T.settle(spurs, 2)
+    T.record_mem("instance 0x00-0xFF after readyCount phase", spurs, 0x100)
 
     # ---- signal: one wake-up per signal ---------------------------------------------------
     reset()
@@ -222,7 +224,8 @@ def body(T):
     quiesce()
     T.record_mem("dispatches for one signal", wl + WL["count"], 4)
     statuses("signal phase")
-    T.record_mem("wklSignal after dispatch", spurs + 0x70, 4, ignore=((2, 2),))
+    T.settle(spurs, 2)
+    T.record_mem("wklSignal after dispatch", spurs + 0x70, 4)
     info("after signal", w)
 
     # ---- workload flag ------------------------------------------------------------------
@@ -232,16 +235,19 @@ def body(T):
     T.call(F, spurs, w, 1, rc="FlagReceiver set again")
     T.call(F, spurs, ("mem", wid1), 1, rc="FlagReceiver set by another wid")
     T.call(F, spurs, ("mem", wid1), 0, rc="FlagReceiver clear by non-owner")
-    T.record_mem("wklFlag area after receiver set", spurs + 0x60, 32, ignore=((0x12, 2),))
+    T.settle(spurs, 2)
+    T.record_mem("wklFlag area after receiver set", spurs + 0x60, 32)
     T.store_word(spurs + 0x6C, 0)                          # raise the flag
     T.wait_word(wl + WL["count"], 1, cond="geu", tries=1000)
     T.sleep_us(50000)
     quiesce()
     T.record_mem("dispatches for the flag", wl + WL["count"], 4)
     statuses("flag phase")
-    T.record_mem("wklFlag area after the flag", spurs + 0x60, 32, ignore=((0x12, 2),))
+    T.settle(spurs, 2)
+    T.record_mem("wklFlag area after the flag", spurs + 0x60, 32)
     T.call(F, spurs, w, 0, rc="FlagReceiver clear")
-    T.record_mem("wklFlag area after receiver clear", spurs + 0x60, 32, ignore=((0x12, 2),))
+    T.settle(spurs, 2)
+    T.record_mem("wklFlag area after receiver clear", spurs + 0x60, 32)
 
     # ---- concurrency: how many SPUs run the workload at once ------------------------------
     reset(spin=20000)
@@ -268,21 +274,43 @@ def body(T):
     reset()
 
     # ---- life cycle ------------------------------------------------------------------------
+    # The workload is kept on an SPU (its module spins) while it is shut down,
+    # so the shutdown cannot complete until the module is released: a waiter
+    # on another thread arrives before completion, deterministically.
+    wrc, tid, tret = T.alloc("wait_rc", 16), T.alloc("waiter_tid", 16), T.alloc("waiter_ret", 16)
+
+    def waiter(T):
+        T.call("cellSpursWaitForWorkloadShutdown", spurs, ("mem", wid), rc=False)
+        T.emit(P.li32(9, wrc), P.stw(3, 9, 0))
+    T.thread("waiter", waiter)
     T.call("cellSpursRemoveWorkload", spurs, w, rc="RemoveWorkload while runnable")
+    reset(spin=0x7FFFFFFF)
+    T.call("cellSpursReadyCountStore", spurs, w, 1, rc=False)
+    T.wait_word(wl + WL["inside"], 1)
     T.call("cellSpursShutdownWorkload", spurs, w, rc="ShutdownWorkload")
     T.call("cellSpursShutdownWorkload", spurs, w, rc="ShutdownWorkload again")
     T.call("cellSpursReadyCountStore", spurs, w, 1, rc="ReadyCountStore after shutdown")
     T.call("cellSpursSendWorkloadSignal", spurs, w, rc="SendWorkloadSignal after shutdown")
     T.call("cellSpursGetWorkloadData", spurs, out, w, rc="GetWorkloadData after shutdown")
-    info("after shutdown", w)
-    T.record_mem("instance 0x00-0xBF after shutdown", spurs, 0xC0, ignore=INST_IGNORE)
-    T.call("cellSpursWaitForWorkloadShutdown", spurs, w, rc="WaitForWorkloadShutdown")
+    info("after shutdown, module still running", w)
+    T.store_word(wrc, 0xEEEEEEEE)
+    T.start_thread("waiter", 0, tid)
+    T.sleep_us(50000)
+    T.record_mem("wklState1 while shutting down, waiter blocked", spurs + 0x80, 16)
+    T.record_mem("wklEvent1 while shutting down, waiter blocked", spurs + 0xA0, 16)
+    T.record_mem("Wait still blocked", wrc, 4)
+    T.store_word(wl + WL["spin"], 0)                 # release the module
+    T.join_thread(tid, tret)
+    T.record_mem("WaitForWorkloadShutdown (waited for completion)", wrc, 4)
+    T.settle(spurs, 2)
+    T.record_mem("instance 0x00-0xFF after shutdown", spurs, 0x100)
     T.call("cellSpursWaitForWorkloadShutdown", spurs, w, rc="WaitForWorkloadShutdown again")
     T.call("cellSpursRemoveWorkload", spurs, w, rc="RemoveWorkload")
     T.call("cellSpursRemoveWorkload", spurs, w, rc="RemoveWorkload again")
     T.call("cellSpursShutdownWorkload", spurs, w, rc="ShutdownWorkload after remove")
     T.call("cellSpursGetWorkloadInfo", spurs, w, out, rc="GetWorkloadInfo after remove")
-    T.record_mem("instance 0x00-0xBF after remove", spurs, 0xC0, ignore=INST_IGNORE)
+    T.settle(spurs, 2)
+    T.record_mem("instance 0x00-0xFF after remove", spurs, 0x100)
     T.record_mem("wklInfo1[0..7] after remove", spurs + 0xB00, 256)
     # the attribute workload: its completion hook
     w1 = ("mem", wid1)
@@ -308,10 +336,15 @@ def body(T):
     T.call("cellSpursWaitForWorkloadShutdown", spurs2, ("mem", w2b), rc="spurs2 WaitForWorkloadShutdown")
     T.call("cellSpursRemoveWorkload", spurs2, ("mem", w2b), rc="spurs2 RemoveWorkload")
     T.call("cellSpursFinalize", spurs2, rc="spurs2 Finalize")
+    # tear down: every shutdown completes before its Wait (no waiter marks)
     for k in range(16):
         x = ("mem", wid) if k == 0 else ("mem", ids + 4 * k)
         T.call("cellSpursShutdownWorkload", spurs, x, rc=False)
+    T.settle(spurs, 2)
+    for k in range(16):
+        x = ("mem", wid) if k == 0 else ("mem", ids + 4 * k)
         T.call("cellSpursWaitForWorkloadShutdown", spurs, x, rc=False)
         T.call("cellSpursRemoveWorkload", spurs, x, rc="RemoveWorkload #%d" % k)
-    T.record_mem("instance 0x00-0xBF at the end", spurs, 0xC0, ignore=INST_IGNORE)
+    T.settle(spurs, 2)
+    T.record_mem("instance 0x00-0xFF at the end", spurs, 0x100)
     T.call("cellSpursFinalize", spurs, rc="Finalize")

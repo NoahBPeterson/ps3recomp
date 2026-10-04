@@ -2130,9 +2130,22 @@ void spu_indirect_branch(spu_context* ctx)
             spu_halt(ctx);
             return;
         }
+        extern uint64_t (*g_spurs_kernel_select)(spu_context*, uint32_t);
+        if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS && ctx->spurs_vspu && g_spurs_kernel_select) {
+            /* selectWorkload, called by the module (cellSpursModulePollStatus):
+             * the kernel of this SPU answers {wid, pollStatus}. */
+            ++g_spurs_pm_polls;
+            const uint64_t r = g_spurs_kernel_select(ctx, ctx->gpr[3]._u32[0]);
+            ctx->gpr[3]._u32[0] = (uint32_t)(r >> 32);
+            ctx->gpr[3]._u32[1] = (uint32_t)r;
+            ctx->gpr[3]._u32[2] = 0;
+            ctx->gpr[3]._u32[3] = 0;
+            ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+            return;
+        }
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
-            /* cellSpursModulePoll: report "no contention — keep running".
-             * (One virtual SPU per workload here, so nothing ever preempts.) */
+            /* Legacy runner (spu_run_policy_module): no kernel behind it;
+             * report "no contention -- keep running". */
             unsigned n = ++g_spurs_pm_polls;
             static unsigned s_logged;   /* the counter restarts every PM run */
             if ((n <= 4 || (n % 4096) == 0) && s_logged++ < 64)

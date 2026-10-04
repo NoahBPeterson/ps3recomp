@@ -230,6 +230,15 @@ class Test:
             self.funcs.append(name)
         return self["opd"] + 8 * self.funcs.index(name)
 
+    def settle(self, spurs, nspus):
+        """Wait until every SPU of the instance is idling in the SPURS system
+        service with no message pending (spuIdling all set, sysSrvMessage
+        bits clear): the instance is then at rest, whatever the timing of
+        either implementation."""
+        m = (1 << nspus) - 1
+        self.wait_word(spurs + 0x70, m, mask=(m << 8) | m)
+        self.sleep_us(20000)
+
     def sleep_us(self, usec):
         self.syscall(SYS["usleep"], usec)
 
