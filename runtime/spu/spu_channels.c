@@ -2111,7 +2111,7 @@ void spu_indirect_branch(spu_context* ctx)
      * these two reserved addresses as exitToKernelAddr / selectWorkloadAddr in
      * the SpursKernelContext (spurs_policy.c). */
     if (ctx->policy_mode) {
-        extern SPU_THREAD_LOCAL unsigned g_spurs_pm_polls, g_spurs_pm_exited;
+        extern SPU_THREAD_LOCAL unsigned g_spurs_pm_exited;
         if (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
             /* Module exit: the workload returned to the kernel (drained/yield).
              * Print gated: fires once per policy run = thousands/sec. */
@@ -2119,8 +2119,8 @@ void spu_indirect_branch(spu_context* ctx)
             { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_PM_TRACE") ? 1 : 0;
               if (s_t) { static unsigned long _n = 0; unsigned long n = ++_n;
                 if (n <= 64 || (n & 0xFFF) == 0)
-                    fprintf(stderr, "[spurs-pm] exit-to-kernel#%lu (r3=0x%08X polls=%u)\n",
-                            n, ctx->gpr[3]._u32[0], g_spurs_pm_polls); } }
+                    fprintf(stderr, "[spurs-pm] exit-to-kernel#%lu (r3=0x%08X)\n",
+                            n, ctx->gpr[3]._u32[0]); } }
             ctx->status = SPU_STATUS_STOPPED_BY_STOP;
             spu_halt(ctx);
             return;
@@ -2129,24 +2129,11 @@ void spu_indirect_branch(spu_context* ctx)
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS && ctx->spurs_vspu && g_spurs_kernel_select) {
             /* selectWorkload, called by the module (cellSpursModulePollStatus):
              * the kernel of this SPU answers {wid, pollStatus}. */
-            ++g_spurs_pm_polls;
             const uint64_t r = g_spurs_kernel_select(ctx, ctx->gpr[3]._u32[0]);
             ctx->gpr[3]._u32[0] = (uint32_t)(r >> 32);
             ctx->gpr[3]._u32[1] = (uint32_t)r;
             ctx->gpr[3]._u32[2] = 0;
             ctx->gpr[3]._u32[3] = 0;
-            ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
-            return;
-        }
-        if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
-            /* Legacy runner (spu_run_policy_module): no kernel behind it;
-             * report "no contention -- keep running". */
-            unsigned n = ++g_spurs_pm_polls;
-            static unsigned s_logged;   /* the counter restarts every PM run */
-            if ((n <= 4 || (n % 4096) == 0) && s_logged++ < 64)
-                fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
-                        n, ctx->gpr[3]._u32[0]);
-            ctx->gpr[3] = spu_make_preferred_u32(0);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }
