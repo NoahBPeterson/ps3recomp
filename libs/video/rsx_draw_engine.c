@@ -1922,12 +1922,12 @@ static void eng_present(u32 buffer_id)
           if (g.surfaces[i].offset == off) { g.be->present(g.be->user, g.surfaces[i].handle); goto presented; } }
     g.be->present(g.be->user, g.surfaces[target].handle);
 presented:;
-    /* PS3RECOMP_ENG_FPSLOG=1: world frames (>1000 draws) per 10 s. */
-    { static int on = -1; static u32 wf; static time_t t0;
+    /* PS3RECOMP_ENG_FPSLOG=1: presents and world frames (>1000 draws) per 10 s. */
+    { static int on = -1; static u32 wf, pf; static time_t t0;
       if (on < 0) on = getenv("PS3RECOMP_ENG_FPSLOG") ? 1 : 0;
-      if (on) { if (g.guest_draws > 1000) wf++;
+      if (on) { pf++; if (g.guest_draws > 1000) wf++;
           time_t now = time(NULL); if (!t0) t0 = now;
-          if (now - t0 >= 10) { fprintf(stderr, "[rsx fps] %u world frames in %lds (%.2f fps)\n", wf, (long)(now - t0), wf / (double)(now - t0)); wf = 0; t0 = now; } } }
+          if (now - t0 >= 10) { fprintf(stderr, "[rsx fps] %u world frames, %u presents in %lds (%.2f fps)\n", wf, pf, (long)(now - t0), pf / (double)(now - t0)); wf = 0; pf = 0; t0 = now; } } }
     /* PS3RECOMP_ENG_MEMDUMP=<hexEA>:<hexLen>:<worldframe>[:file]: at that world
      * frame, write the guest range as hex words, 16 bytes per line -- the same
      * format as the RPCS3 oracle's RPCS3_LP_DUMP, so the two diff directly. */

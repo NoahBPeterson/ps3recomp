@@ -1146,6 +1146,16 @@ def main() -> None:
                         "0x10F8,0x808) to add as boundaries -- for indirect-branch "
                         "targets that --auto-functions can't detect statically. "
                         "Splits the containing auto-detected function at each addr.")
+    p.add_argument("--return-entries", action="store_true",
+                   help="Also make the return address of every call (brsl, "
+                        "brasl, bisl, bisled) an entry point. Code that is "
+                        "resumed rather than returned to needs it: a SPURS task "
+                        "calls the policy module's syscall entry, the policy "
+                        "saves the task and exits to the kernel (abandoning the "
+                        "host frames), and later resumes the task by branching "
+                        "to that return address. Splits existing functions only "
+                        "(never seeds a gap), and the splits do not start new "
+                        "--merge-chunks groups, so straight-line speed is kept.")
     p.add_argument("--code-end", type=lambda x: int(x, 0), default=0,
                    help="Address where executable code ends and an embedded "
                         "rodata/const tail begins. Drops any auto-detected "
@@ -1214,6 +1224,28 @@ def main() -> None:
         else:
             # No boundary info: treat the whole image as one function.
             bounds = [(base, base + len(data))]
+
+    # Call return addresses as entries (--return-entries): split the bound that
+    # contains each one. Not merge-group seeds -- see the option's help.
+    if args.return_entries:
+        hi = args.code_end or (base + len(data))
+        rets = sorted({i.addr + 4 for i in disassemble_spu(data, base)
+                       if i.mnemonic in ("brsl", "brasl", "bisl", "bisled")
+                       and i.addr + 4 < hi})
+        newb = []
+        for (s0, e0) in sorted(set(bounds)):
+            cuts = [a for a in rets if s0 < a < e0]
+            prev = s0
+            for a in cuts:
+                newb.append((prev, a)); prev = a
+            newb.append((prev, e0))
+        by_start = {}
+        for s0, e0 in newb:
+            if s0 not in by_start or e0 < by_start[s0]:
+                by_start[s0] = e0
+        sys.stderr.write("[spu_lifter] return entries: %d call return address(es), %d -> %d bound(s)\n"
+                         % (len(rets), len(bounds), len(by_start)))
+        bounds = sorted(by_start.items())
 
     # Add extra function entry points (indirect-branch targets auto-detect misses)
     # by splitting whichever bound contains each address.

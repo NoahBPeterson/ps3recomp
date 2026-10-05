@@ -67,6 +67,8 @@ void spu_indirect_branch_mt(spu_context* ctx)
             }
         if (!owned && ctx->resident_ovl) fn = spu_lookup(pc, ctx->resident_ovl);
         if (!owned && !fn) fn = spu_lookup(pc, ctx->image_id);
+        for (unsigned slot = 0; slot < 4 && !fn; ++slot)   /* resident module code outside its image */
+            if (ctx->resident_code[slot].image_id) fn = spu_lookup(pc, ctx->resident_code[slot].image_id);
         if (fn) {
             ctx->pc = pc;
             __attribute__((musttail)) return fn(ctx);
