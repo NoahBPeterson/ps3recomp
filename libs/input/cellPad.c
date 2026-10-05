@@ -1068,7 +1068,7 @@ s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info_guest)
           vm_write32((unsigned long long)ea + _o, *(u32*)((char*)info + _o)); }
 
     { static int _n = 0;
-      if (_n++ < 2)
+      if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 2)
           printf("[cellPad] PeriphGetInfo(max=%u now=%u) -> STANDARD class\n",
                  info->max_connect, connected); }
     return CELL_OK;

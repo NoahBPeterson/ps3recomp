@@ -40,21 +40,20 @@ sees ours.
 load time to a base lv2 picks, with the lifted code reading addresses through a per-
 instance base instead of baking them in. Not worth doing until a title needs it.
 
-## Terminating an SPU thread group does not stop its SPU code
+## Terminating an SPU thread group stops SPU code only at a visible point
 
-**What.** `sys_spu_thread_group_terminate` ends the run (cause TERMINATED, the group back
-to INITIALIZED, a joiner woken), but an SPU thread still executing on its host thread is
-not stopped; it runs until it stops by itself. lv2 stops every thread of the group.
-`sys_spu_thread_group_exit` from one SPU thread likewise ends the run without stopping
-the group's other threads.
+**What.** `sys_spu_thread_group_terminate`, a `sys_spu_thread_group_exit` from one thread,
+and `sys_spu_thread_group_destroy` ask every running thread of the group to stop, and
+terminate and destroy wait (up to 5 s) until they have. A thread sees the request at its
+next blocking channel read, interpreter step, or lifted cross-function transfer. A lifted
+loop that never leaves its function and never touches a channel does not see it; lv2 stops
+the SPU wherever it is.
 
-**What it would look like.** After a terminate or group exit, a still-running SPU thread
-keeps issuing DMA and channel operations: memory changes after the PPU believes the group
-stopped, or events arrive on a connected queue. A restart of the group while the old host
-thread runs puts two copies of the thread on the same local store.
+**What it would look like.** `[SPU] group_terminate ...: a thread did not stop within 5 s`
+or `group_destroy ...: still running after 5 s -- leaking its context` in the log, then a
+thread that keeps running (and DMAing) after the PPU believes the group stopped.
 
-**Fixing it.** A stop request the SPU interpreter and the lifted SPU code check (at
-channel operations and branches), so the host thread unwinds out of the SPU program.
+**Fixing it.** Have the lifter poll the stop request on loop back-edges as well.
 
 ## Raw SPU count is not part of the SPU limits
 

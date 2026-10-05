@@ -195,6 +195,10 @@ typedef struct spu_context {
 
     /* SPU status (running, stopped, etc.) */
     uint32_t status;
+    /* Set by another thread (sys_spu_thread_group_terminate) to stop this SPU:
+     * checked by blocking channel waits, interpreter steps and lifted
+     * trampoline transfers, which then leave the SPU stopped. */
+    uint32_t stop_request;
     #define SPU_STATUS_STOPPED      0x0
     #define SPU_STATUS_RUNNING      0x1
     #define SPU_STATUS_STOPPED_BY_STOP  0x2
@@ -610,7 +614,7 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
         const char* h = getenv("SPU_SMC_HI"); hi = h ? (uint32_t)strtoul(h,0,0) : 0x3700; }
       if (s >= 0 && (uint32_t)ctx->image_id == img && lsa >= lo && lsa < hi) {
           static int _n = 0;
-          if (_n++ < 48)
+          if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 48)
               fprintf(stderr, "[spu-SMC] img=%d WROTE CODE @0x%05X (pc=0x%05X) = %02X%02X%02X%02X\n",
                       ctx->image_id, lsa, (uint32_t)ctx->pc & SPU_LS_MASK,
                       p[0], p[1], p[2], p[3]);
@@ -692,6 +696,14 @@ static inline u128 spu_make_preferred_u32(uint32_t val)
  * -----------------------------------------------------------------------*/
 /* `value` stays the head, and `count` the number of entries, so the many places
  * that read those two fields directly keep working unchanged. */
+/* SPU event status: raised by other threads (a PPU store breaking a
+ * reservation, an MFC list stall) while the SPU reads and acknowledges it.
+ * Atomic at every access, so a raise can neither be lost to the SPU's
+ * acknowledge nor be seen half-done. */
+#define spu_ev_get(c)        __atomic_load_n(&(c)->event_status, __ATOMIC_ACQUIRE)
+#define spu_ev_raise(c, b)   ((void)__atomic_fetch_or(&(c)->event_status, (uint32_t)(b), __ATOMIC_RELEASE))
+#define spu_ev_ack(c, b)     ((void)__atomic_fetch_and(&(c)->event_status, ~(uint32_t)(b), __ATOMIC_ACQ_REL))
+
 static inline void spu_channel_lock(spu_channel* ch)
 {
     while (__atomic_exchange_n(&ch->lock, 1u, __ATOMIC_ACQUIRE)) {
@@ -950,7 +962,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             yz_lockstep_tick(ctx);                             \
             spu_task_launch_check((ctx), (void*)_tf);          \
             if ((ctx)->int_enable &&                            \
-                ((ctx)->event_status & (ctx)->event_mask))      \
+                (spu_ev_get((ctx)) & (ctx)->event_mask))      \
                 _tf = spu_take_interrupt((ctx), _tf);          \
             spu_pchist_tick(ctx);                              \
             g_spu_pch[g_spu_pch_n++ & 7u] =                    \

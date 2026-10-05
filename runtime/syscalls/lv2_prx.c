@@ -103,7 +103,7 @@ static int64_t prx_load(uint32_t path_ea, uint64_t flags)
     if (!p) { ReleaseSRWLockExclusive(&s_lock); return (int32_t)CELL_ENOMEM; }
     memset(p, 0, sizeof *p);
     p->in_use = 1;
-    p->id     = 0x23000000u | (s_next_id++ << 8);
+    p->id     = 0x23000000u | (__atomic_fetch_add(&s_next_id, 1, __ATOMIC_RELAXED) << 8);
     p->state  = ST_INITIALIZED;
     p->m      = m;
     snprintf(p->path, sizeof p->path, "%s", path);
@@ -411,7 +411,7 @@ uint32_t lv2_prx_boot_liblv2(void)
     lv2_prx* p = &s_prx[0];
     memset(p, 0, sizeof *p);
     p->in_use = 1;
-    p->id     = 0x23000000u | (s_next_id++ << 8);
+    p->id     = 0x23000000u | (__atomic_fetch_add(&s_next_id, 1, __ATOMIC_RELAXED) << 8);
     p->state  = ST_STARTED;
     p->m      = m;
     snprintf(p->path, sizeof p->path, "/dev_flash/sys/external/liblv2.sprx");

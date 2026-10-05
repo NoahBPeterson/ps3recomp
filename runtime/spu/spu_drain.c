@@ -83,7 +83,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     if (!s_no_ls0 && ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
         !ctx->policy_mode && ctx->image_id > 0) {
         static int _n = 0;
-        if (_n++ < 8)
+        if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8)
             fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
                     ctx->image_id);
         if (s_et >= 0 && ctx->image_id == s_et) {
@@ -108,7 +108,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
           if (s_from >= 0 && !s_armed &&
               ((uint32_t)ctx->pc & SPU_LS_MASK) == (uint32_t)s_from) s_armed = 1;
           static int n = 0;
-          if ((s_from < 0 || s_armed) && n++ < 40) {
+          if ((s_from < 0 || s_armed) && __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 40) {
               fprintf(stderr, "[step] pc=0x%05X r1=0x%05X r2=0x%08X r3=0x%08X r4=0x%08X\n",
                       (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[1]._u32[0],
                       ctx->gpr[2]._u32[0], ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
@@ -144,7 +144,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
         marked++;
     }
     static int _n = 0;
-    if (marked && _n++ < 12)
+    if (marked && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 12)
         fprintf(stderr, "[pm-jobdrain] ring-full spin: marked %d pending records done\n", marked);
 }
 
@@ -252,7 +252,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                 if (f && ctx->host_depth > f->depth) {
                     { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
                       static int _n = 0;
-                      if (s_it && _n++ < 200)
+                      if (s_it && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 200)
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to taking frame depth %u (srr0=0x%05X)\n",
                                   ctx->host_depth, f->depth, ctx->pc & SPU_LS_MASK); }
                     SPU_LONGJMP(f->env, 1);
@@ -263,7 +263,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                      * srr0 with the host stack empty, which is that frame. */
                     { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
                       static int _n = 0;
-                      if (s_it && _n++ < 200)
+                      if (s_it && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 200)
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to the driver (srr0=0x%05X)\n",
                                   ctx->host_depth, ctx->pc & SPU_LS_MASK); }
                     extern void spu_restart_dispatch(spu_context*);
@@ -296,23 +296,23 @@ void (*spu_take_interrupt(spu_context* ctx,
         target = (((w >> 7) & 0xFFFF) << 2) & SPU_LS_MASK;
     } else {
         static int _w = 0;
-        if (_w++ < 4)
+        if (__atomic_fetch_add(&_w, 1, __ATOMIC_RELAXED) < 4)
             fprintf(stderr, "[spu-int] pending (st=0x%X mask=0x%X) but LS0 word "
                     "0x%08X is no branch -- not taken\n",
-                    ctx->event_status, ctx->event_mask, w);
+                    spu_ev_get(ctx), ctx->event_mask, w);
         return tf;
     }
     ctx->srr0 = ctx->pc;             /* resume point for iret */
     ctx->int_enable = 0;
     spu_irq_regs_save(ctx);          /* hardware contract: handler preserves regs */
     { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
-      if (s_it) { static int _n = 0; if (_n++ < 200)
+      if (s_it) { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 200)
         fprintf(stderr, "[irq] TAKE srr0=0x%05X depth=%d r13=%08X r15=%08X\n",
                 ctx->srr0 & SPU_LS_MASK, ctx->host_depth,
                 ctx->gpr[13]._u32[0], ctx->gpr[15]._u32[0]); } }
     ctx->pc = target & SPU_LS_MASK;
     { static int _n = 0;
-      if (_n++ < 16) {
+      if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 16) {
           /* WWS Load->Run diagnosis: the job-manager interrupt handler advances
            * g_WwsJob_loadJobState kReadCommands(1)->kExecuteCommands(2) only if
            * (a) the ch25 stall mask has tag 0 (kLoadJob_readCommands) AND
@@ -322,7 +322,7 @@ void (*spu_take_interrupt(spu_context* ctx,
           fprintf(stderr, "[spu-int] TAKEN img=%d events=0x%X&0x%X vector->0x%05X "
                   "(srr0=0x%05X) stallstat=0x%X parked=0x%X loadJobState@12A0=%02X%02X%02X%02X "
                   "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n", ctx->image_id,
-                  ctx->event_status, ctx->event_mask, ctx->pc, ctx->srr0,
+                  spu_ev_get(ctx), ctx->event_mask, ctx->pc, ctx->srr0,
                   ctx->list_stall_stat, ctx->list_stall_mask,
                   js[0],js[1],js[2],js[3], js[4],js[5],js[6],js[7],
                   js[8],js[9],js[10],js[11], js[12],js[13],js[14],js[15]); } }
@@ -415,7 +415,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
             yz_lockstep_tick(ctx);
             spu_task_launch_check(ctx, (void*)fn);
-            if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
+            if (ctx->int_enable && (spu_ev_get(ctx) & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */
                     /* Interrupt taken here: this loop is the frame the iret
@@ -458,7 +458,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             for (unsigned slot = 0; slot < 4 && !fn; ++slot)   /* resident module code outside its image */
                 if (ctx->resident_code[slot].image_id) fn = spu_lookup(pc, ctx->resident_code[slot].image_id);
             if (fn) {
-                { static int _n = 0; if (_n++ < 8)
+                { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8)
                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
                             (unsigned)(return_pc & SPU_LS_MASK), pc, ctx->image_id, ctx->host_depth,
                             (int)ctx->resident_ovl); }
