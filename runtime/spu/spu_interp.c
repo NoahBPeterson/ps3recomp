@@ -450,6 +450,10 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
             }
         }
         if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
+        /* SPU_TRACE_INTERP=1: emit the same per-instruction PC trace a --trace lift
+         * does (spu_trace_pc), so an interpreted run diffs against a lifted one. */
+        { static int s_ti = -1; if (s_ti < 0) s_ti = getenv("SPU_TRACE_INTERP") ? 1 : 0;
+          if (s_ti) { extern void spu_trace_pc(spu_context*, uint32_t); spu_trace_pc(ctx, ctx->pc); } }
         steps++;
         /* SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
          * dumps its ring. Force a one-shot dump after N steps to see where it loops. */

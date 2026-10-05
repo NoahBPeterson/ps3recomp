@@ -455,6 +455,8 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                 }
             if (!owned && ctx->resident_ovl) fn = spu_lookup(pc, ctx->resident_ovl);
             if (!owned && !fn) fn = spu_lookup(pc, ctx->image_id);
+            for (unsigned slot = 0; slot < 4 && !fn; ++slot)   /* resident module code outside its image */
+                if (ctx->resident_code[slot].image_id) fn = spu_lookup(pc, ctx->resident_code[slot].image_id);
             if (fn) {
                 { static int _n = 0; if (_n++ < 8)
                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",

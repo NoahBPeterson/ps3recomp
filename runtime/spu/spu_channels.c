@@ -191,6 +191,21 @@ void spu_dbg_e60(spu_context* ctx)
  * service. Env YDKJ_STOP_NOHALT restores the old (looping) behavior for A/B. */
 int (*g_spu_lv2_stop_hook)(spu_context*) = 0;
 
+/* sys_spu_thread_exit (stop 0x102) and sys_spu_thread_group_exit (stop 0x101)
+ * end the SPU program: nothing resumes after them. Returning from the lifted
+ * function that executed the stop would let its caller carry on (a SPURS
+ * kernel's module calls its exit service several calls deep), so unwind to the
+ * thread's landing pad instead; the runner reads status/stop_code there. Other
+ * unserviced stops keep the return-to-caller behaviour. */
+void spu_stop_exit_check(spu_context* ctx)
+{
+    if (ctx->status == SPU_STATUS_STOPPED_BY_STOP &&
+        (ctx->stop_code == 0x101u || ctx->stop_code == 0x102u) && s_spu_halt_armed) {
+        s_spu_halt_armed = 0;
+        SPU_LONGJMP(s_spu_halt_env, 1);
+    }
+}
+
 void spu_stop(spu_context* ctx)
 {
     /* A lifted `stop` sets status and RETURNS to its caller -- for a SPURS
@@ -210,6 +225,7 @@ void spu_stop(spu_context* ctx)
         ctx->status = SPU_STATUS_RUNNING;
         return;
     }
+    spu_stop_exit_check(ctx);
     if (s_halt) spu_halt(ctx);
 }
 
@@ -261,11 +277,17 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     case 1:
         halted = 1;
         g_spu_trampoline_fn = 0;
+        ctx->irq_frame = 0;     /* the drain loops that held them are gone */
         break;
     case 2:
         /* A one-way guest stack reset invalidates every lifted host caller.
-         * Re-enter its target with the same guest state on the driver stack. */
+         * Re-enter its target with the same guest state on the driver stack.
+         * An interrupt frame armed by one of the abandoned drain loops is
+         * gone with it: an iret still owed resumes from this driver (the
+         * no-frame case of spu_irq_regs_maybe_restore), never through a
+         * jmp_buf in a dead frame. */
         ctx->host_depth = 0;
+        ctx->irq_frame = 0;
         g_spu_trampoline_fn = 0;
         spu_indirect_branch(ctx);
         SPU_DRAIN(ctx);
@@ -913,10 +935,13 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
  * spu_ch_wake -- never fabricating a value. Under SPU_LOCKSTEP the wait
  * releases the run token first (block_begin) so a peer SPU that must post the
  * awaited data is never blocked on this ctx. A 10 ms re-poll is the missed-wake
- * safety net. Opt-in (env SPU_CH_BLOCK=1), default OFF while the producers
- * (mailbox/signal writes, MFC tag-status event raise) are being wired -- until
- * then blocking a read whose producer is missing would hang, so default stays
- * legacy non-blocking with zero regression, exactly like the lockstep gate.
+ * safety net. Default ON: the producers (mailbox/signal writes, the MFC
+ * tag-status and lock-line-lost event raises) all wake, and a read that returns
+ * instead of stalling is not what the SPU does -- the SPURS kernel idles in
+ * `rdch SPU_RdEventStat` waiting for its lock line to change, and returning at
+ * once turned every idle kernel into a getllar busy-loop through the lock-line
+ * lock that starved the SPUs and PPU threads doing work. SPU_CH_BLOCK=0 restores
+ * the legacy non-blocking read.
  * ===========================================================================*/
 /* Set by runtime/spu/spu_raw.c once a raw SPU exists. A raw SPU runs on its own
  * host thread against a PPU that pokes its mailboxes by MMIO, so an empty
@@ -927,7 +952,7 @@ int g_spu_force_ch_block = 0;
 static int yz_ch_block(void)
 {
     static int v = -1;
-    if (v < 0) v = getenv("SPU_CH_BLOCK") ? 1 : 0;
+    if (v < 0) { const char* e = getenv("SPU_CH_BLOCK"); v = !(e && e[0] == '0'); }
     return v || g_spu_force_ch_block;
 }
 
@@ -1490,7 +1515,12 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
                 return (spu_lifted_fn)spu_lookup(lsa, img);
         }
     }
-    return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
+    spu_lifted_fn f = (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
+    if (ctx)   /* a resident module's code outside its image (see spu_indirect_branch) */
+        for (unsigned slot = 0; slot < 4 && !f; ++slot)
+            if (ctx->resident_code[slot].image_id)
+                f = (spu_lifted_fn)spu_lookup(lsa, ctx->resident_code[slot].image_id);
+    return f;
 }
 
 /* ---- Swappable code overlays (see spu_context.resident_ovl) --------------
@@ -1498,7 +1528,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
  * the image id its lifted functions were registered under. The MFC GET path
  * marks that overlay resident in the streaming context; dispatch retries a
  * primary-image miss against the resident overlay's registry. */
-typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span; } spu_ovl_src;
+typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span; uint32_t lift_lsa; } spu_ovl_src;
 /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
  * the same job code buffer at LS 0x4000, dispatched by content signature). */
 #define SPU_OVL_SRC_MAX 128
@@ -1522,6 +1552,22 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
     if (!span || span > SPU_LS_SIZE || s_ovl_src_count >= SPU_OVL_SRC_MAX) return;
     spu_overlay_register_source(content_ea, image_id);
     s_ovl_src[s_ovl_src_count - 1].span = span;
+}
+
+/* A code region whose lift is valid only at one local-store address (every
+ * lift is: branch targets are absolute). Besides a GET from content_ea itself,
+ * any GET that puts the region's own bytes at that address makes it resident --
+ * an SPU image loaded by firmware code (the SPURS taskset policy module
+ * DMAs a task ELF's segment in pieces, and restores a yielded task's local
+ * store from its context save area) reaches the address by more than one
+ * route, and the bytes, not the route, are what make the lift valid. */
+void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t span, int image_id)
+{
+    if (lsa + span > SPU_LS_SIZE) return;
+    spu_overlay_register_region(content_ea, span, image_id);
+    if (s_ovl_src_count && s_ovl_src[s_ovl_src_count - 1].image_id == image_id &&
+        s_ovl_src[s_ovl_src_count - 1].src_ea == content_ea)
+        s_ovl_src[s_ovl_src_count - 1].lift_lsa = lsa;
 }
 
 /* Register one-way runtime entries that replace the guest call stack.
@@ -1674,6 +1720,20 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
+    /* SPU_GET_RANGE=<lo>:<hi> (hex EAs): log each distinct GET (ea, LS, size) from
+     * that range -- e.g. a firmware module's image, to find the code bodies its
+     * SPU side streams into local store. */
+    { static int s_on = -1; static uint32_t s_lo, s_hi;
+      if (s_on < 0) { const char* e = getenv("SPU_GET_RANGE");
+          s_on = e && sscanf(e, "%x:%x", &s_lo, &s_hi) == 2; }
+      if (s_on && ea >= s_lo && ea < s_hi) {
+          static uint64_t s_seen[512]; static unsigned s_n;
+          uint64_t k = ((uint64_t)ea << 32) | ((uint64_t)lsa << 14) | (size & 0x3FFF);
+          int seen = 0;
+          for (unsigned i = 0; i < s_n; i++) if (s_seen[i] == k) { seen = 1; break; }
+          if (!seen && s_n < 512) { s_seen[s_n++] = k;
+              fprintf(stderr, "[spu-get] img=%d pc=0x%05X ea=0x%08X -> LS 0x%05X size=0x%X\n",
+                      ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ea, lsa, size); } } }
     spu_ovl_dump(ctx, ea, lsa, ls, size);
     for (unsigned slot = 0; slot < 4; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
@@ -1681,6 +1741,19 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         uint32_t end = base + ctx->resident_code[slot].size;
         if (lsa < end && lsa + size > base &&
             (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base))) {
+            /* A module image interleaves code with buffers it fills at run time
+             * (zeros in the image: the WWS policy module's 0xD00..0xDFF). A GET
+             * into such a buffer is the module working, not new code: keep the
+             * lift unless the overwritten part held something in the image. */
+            const uint32_t lo = lsa > base ? lsa : base;
+            const uint32_t hi = (lsa + size) < end ? (lsa + size) : end;
+            const uint8_t* orig = vm_base + ctx->resident_code[slot].source_ea + (lo - base);
+            uint32_t k = 0;
+            while (k < hi - lo && !orig[k]) k++;
+            if (k == hi - lo) continue;
+            /* Rewriting the span with its own bytes (a context restore, a
+             * reload of the same image) leaves the lift valid. */
+            if (!memcmp(ls + (lo - lsa), orig, hi - lo)) continue;
             { static int _n = 0; if (_n++ < 12)
                 fprintf(stderr, "[spu-ovl] img=%d code span image %d evicted by GET ea=0x%08X -> LS 0x%05X size=%u\n",
                         ctx->image_id, ctx->resident_code[slot].image_id, ea, lsa, size); }
@@ -1691,6 +1764,25 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         const spu_ovl_src* o = &s_ovl_src[i];
         int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
                              : (o->src_ea == ea);
+        if (o->lift_lsa) {
+            /* Fixed-address lift: resident when its own bytes land at its address. */
+            const uint32_t lo = lsa > o->lift_lsa ? lsa : o->lift_lsa;
+            const uint32_t hi = (lsa + size) < (o->lift_lsa + o->span) ? (lsa + size) : (o->lift_lsa + o->span);
+            hit = lo < hi && (hi - lo >= 128 || hi - lo == size) &&
+                  !memcmp(ls + (lo - lsa), vm_base + o->src_ea + (lo - o->lift_lsa), hi - lo);
+            if (hit) {   /* zeros match any cleared buffer: demand real content */
+                const uint8_t* q = ls + (lo - lsa); uint32_t k = 0;
+                while (k < hi - lo && !q[k]) k++;
+                hit = k < hi - lo;
+            }
+            if (!hit) continue;
+            int have = 0;
+            for (unsigned slot = 0; slot < 4; ++slot)
+                if (ctx->resident_code[slot].image_id == o->image_id &&
+                    ctx->resident_code[slot].lsa == o->lift_lsa) have = 1;
+            if (have) continue;
+            lsa = o->lift_lsa; ea = o->src_ea;
+        }
         if (hit) {
             if (o->span) {
                 if (lsa + o->span > SPU_LS_SIZE) return;
@@ -2160,7 +2252,18 @@ void spu_indirect_branch(spu_context* ctx)
         int lifted = spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->image_id) ||
             (ctx->resident_task && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_task)) ||
             (ctx->resident_ovl  && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_ovl));
-        int standalone = !ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS && !lifted;
+        for (unsigned slot = 0; slot < 4 && !lifted; ++slot)
+            if (ctx->resident_code[slot].image_id &&
+                SPURS_TASKSET_PM_SYSCALL_LS - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
+                lifted = 1;
+        /* Real policy code in local store (Sony's taskset module, DMA'd in by
+         * the firmware's SPURS kernel) is never "standalone", lifted or not:
+         * the task must enter it, not our HLE of it. */
+        const uint32_t at = ((uint32_t)ctx->ls[SPURS_TASKSET_PM_SYSCALL_LS] << 24) |
+                            ((uint32_t)ctx->ls[SPURS_TASKSET_PM_SYSCALL_LS + 1] << 16) |
+                            ((uint32_t)ctx->ls[SPURS_TASKSET_PM_SYSCALL_LS + 2] << 8) |
+                            ctx->ls[SPURS_TASKSET_PM_SYSCALL_LS + 3];
+        int standalone = !ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS && !lifted && at == 0;
         if (ctx->image_id == 22 || standalone ||
             (ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS)) {
             spu_spurs_taskset_syscall(ctx);
@@ -2271,6 +2374,12 @@ void spu_indirect_branch(spu_context* ctx)
      * may also be registered (historical junk lifts) and must lose. */
     if (!code_owner && !fn && ctx->resident_ovl) fn = spu_lookup(ctx->pc, ctx->resident_ovl);
     if (!code_owner && !fn) fn = spu_lookup(ctx->pc, ctx->image_id);
+    /* A resident module's code outside its own image: the save/restore stub the
+     * WWS policy module writes at the top of local store (LS 0x3FEC0) and calls
+     * from its interrupt path. Its lift belongs to the module's image. */
+    for (unsigned slot = 0; slot < 4 && !fn; ++slot)
+        if (ctx->resident_code[slot].image_id)
+            fn = spu_lookup(ctx->pc, ctx->resident_code[slot].image_id);
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
      * return landed on LS 0, which is the job's OWN entry, and it ran a second
@@ -2357,18 +2466,20 @@ void spu_indirect_branch(spu_context* ctx)
               } }
             fflush(stderr);
         }
-        /* SPU_INTERP_UNLIFTED=1: if real code is present at the target, run it
-         * through the interpreter instead of ending the job. No lift can exist
-         * for a module the title loads at runtime -- You Don't Know Jack's FMOD
-         * mixer relocates a DSP plugin into local store and calls it -- and the
+        /* If real code is present at the target, run it through the interpreter
+         * instead of ending the job: the SPU executes whatever local store holds.
+         * No lift can exist for code written at runtime -- You Don't Know Jack's
+         * FMOD mixer relocates a DSP plugin into local store and calls it; the
+         * WWS job manager writes a register-save stub near the top of LS and
+         * branches to it after a stall-and-notify interrupt -- and the
          * interpreter rejoins the compiled path as soon as it reaches a lifted
-         * address, which is what the plugin's return does. Opt-in so titles
-         * that reach here on a genuinely bad pc keep the loud stop. */
+         * address. A zero word (stop 0, never written) keeps the loud stop.
+         * SPU_INTERP_UNLIFTED=0 restores the stop for any unlifted target. */
         { uint32_t p = ctx->pc & SPU_LS_MASK;
           uint32_t w0 = ((uint32_t)ctx->ls[p] << 24) | ((uint32_t)ctx->ls[p+1] << 16) |
                         ((uint32_t)ctx->ls[p+2] << 8) | ctx->ls[p+3];
           static int s_iu = -1;
-          if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = e ? 1 : 0; }
+          if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = !(e && e[0] == '0'); }
           if (s_iu && w0) {
               static int _n = 0;
               if (_n++ < 8)
@@ -2648,6 +2759,9 @@ void spu_indirect_branch(spu_context* ctx)
      * image and calls it). Interpret the live LS bytes; on success the next
      * branch re-enters lifted code via the trampoline. */
     if (spu_smc_microstep(ctx)) {
+        /* The interpreter may have stopped the SPU for good (thread or group
+         * exit): treat it exactly as a lifted stop would be treated. */
+        spu_stop_exit_check(ctx);
         /* The interpreter stops where lifted code takes over again: a lifted entry
          * or the drain's return point. The drain return is picked up by the
          * waiting spu_drain_call. A lifted entry must be DISPATCHED here: nothing
@@ -2818,7 +2932,10 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
         fflush(s_trace_fp);
         return;
     }
-    fprintf(s_trace_fp, "%05X\n", pc & SPU_LS_MASK);
+    /* SPU_TRACE_TID=1: prefix the SPU thread id, to split concurrent threads. */
+    { static int s_tid = -1; if (s_tid < 0) s_tid = getenv("SPU_TRACE_TID") ? 1 : 0;
+      if (s_tid) fprintf(s_trace_fp, "%X %05X\n", (unsigned)ctx->spu_id, pc & SPU_LS_MASK);
+      else       fprintf(s_trace_fp, "%05X\n", pc & SPU_LS_MASK); }
 }
 
 void spu_trace_rt(spu_context* ctx, uint32_t rt)

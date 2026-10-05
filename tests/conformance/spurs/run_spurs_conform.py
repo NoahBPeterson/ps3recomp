@@ -72,6 +72,8 @@ def main():
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 8)
     ap.add_argument("--lle", help="directory of lifted firmware modules (see above)")
+    ap.add_argument("--lle-spu", help="with --lle: tools/lift_firmware_spu.py output, so libsre's "
+                                      "SPU side (SPURS kernel, modules) runs lifted, not interpreted")
     a = ap.parse_args()
     work = os.path.abspath(a.work)
     os.makedirs(work, exist_ok=True)
@@ -80,7 +82,7 @@ def main():
         tests = [t for t in tests if t in a.only.split(",")]
     py = sys.executable
     rec = os.path.join(work, "recompiled")
-    bld = os.path.join(work, "build_lle" if a.lle else "build")
+    bld = os.path.join(work, ("build_lle_spu" if a.lle_spu else "build_lle") if a.lle else "build")
     summary = []
     for name in tests:
         tdir = os.path.join(work, name)
@@ -115,9 +117,11 @@ def main():
                 for f in os.listdir(mdir) if os.path.isdir(mdir) else []:
                     if f.endswith((".cpp", ".c", ".h")):
                         shutil.copy(os.path.join(mdir, f), rec)
-        if not os.path.exists(os.path.join(bld, "build.ninja")):
+        if not os.path.exists(os.path.join(bld, "build.ninja")) or a.lle:
             sh(["cmake", "-S", os.path.join(ROOT, "templates", "project"), "-B", bld, "-G", "Ninja",
-                "-DCMAKE_BUILD_TYPE=Release", "-DRECOMP_DIR=" + rec], stdout=subprocess.DEVNULL)
+                "-DCMAKE_BUILD_TYPE=Release", "-DRECOMP_DIR=" + rec,
+                "-DFIRMWARE_SPU_DIR=" + (os.path.abspath(a.lle_spu) if a.lle_spu else "")],
+               stdout=subprocess.DEVNULL)
         r = sh(["cmake", "--build", bld, "-j", str(a.jobs)], capture_output=True, text=True)
         if r.returncode:
             print("\n".join(l for l in (r.stdout + r.stderr).split("\n") if " error" in l)[:3000])

@@ -128,6 +128,9 @@ void     vm_write64(uint64_t addr, uint64_t val);
  * threads -- a plain conditional write races and corrupts under real concurrency. */
 int      ppu_stwcx32(uint64_t addr, uint32_t expected, uint32_t val);
 int      ppu_stdcx64(uint64_t addr, uint64_t expected, uint64_t val);
+/* lwarx/ldarx: note the 128-byte reservation granule (line-granular reservations
+ * on lines shared with SPUs; see ppu_loader.cpp). */
+void     ppu_resv_line_note(uint64_t addr);
 #ifdef __cplusplus
 }
 #endif
@@ -2417,7 +2420,8 @@ class PPULifter:
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
                     f"ctx->gpr[{rd}] = vm_read32(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; "
+                    f"ppu_resv_line_note(ea); }}")
 
         if mn == "stwcx" or mn == "stwcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -2437,7 +2441,8 @@ class PPULifter:
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
                     f"ctx->gpr[{rd}] = vm_read64(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; "
+                    f"ppu_resv_line_note(ea); }}")
 
         if mn == "stdcx" or mn == "stdcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])

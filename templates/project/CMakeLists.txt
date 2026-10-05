@@ -160,6 +160,22 @@ if(PORT_ENABLE_SPU)
     endif()
 endif()
 
+# Lifted SPU side of firmware modules (tools/lift_firmware_spu.py): libsre's SPURS
+# kernel and the code bodies it streams into local store, so they run lifted
+# instead of on the SPU interpreter when the firmware's own libsre is used.
+set(FIRMWARE_SPU_DIR "" CACHE PATH
+    "Directory of lifted firmware SPU code (<dir>/<image>/spu_recomp.c + *_spu_register.c)")
+if(PORT_ENABLE_SPU AND FIRMWARE_SPU_DIR)
+    file(GLOB FIRMWARE_SPU CONFIGURE_DEPENDS
+         "${FIRMWARE_SPU_DIR}/*/spu_recomp.c" "${FIRMWARE_SPU_DIR}/*_spu_register.c")
+    list(LENGTH FIRMWARE_SPU FIRMWARE_SPU_COUNT)
+    message(STATUS "Firmware SPU:    ${FIRMWARE_SPU_COUNT} file(s) from ${FIRMWARE_SPU_DIR}")
+    list(APPEND SPU_SOURCES ${FIRMWARE_SPU})
+    if(NOT "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c" IN_LIST SPU_SOURCES)
+        list(APPEND SPU_SOURCES "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
+    endif()
+endif()
+
 add_executable(${PROJECT_NAME}
     main.cpp
     stubs.cpp
