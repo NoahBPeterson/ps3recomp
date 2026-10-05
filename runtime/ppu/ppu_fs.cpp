@@ -14,6 +14,7 @@
  * through vm_base in big-endian.
  */
 #ifndef _WIN32
+#include <atomic>
 #include <execinfo.h>
 #endif
 #include "ppu_recomp.h"      /* ppu_context */
@@ -98,7 +99,7 @@ static void host_path(char* out, size_t cap, const char* guest)
      * /dev_hdd0/game/<title>/), mirroring the PS3/RPCS3 layout: base data on
      * /dev_bdvd (disc), update data on /dev_hdd0. Set PS3_HDD0_ROOT to the host
      * dir that /dev_hdd0 maps into (the one containing game/<title>/). */
-    static const char* hdd0_root = nullptr; static int hdd0_init = 0;
+    static const char* hdd0_root = nullptr; static std::atomic<int> hdd0_init = 0;
     if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
     if (hdd0_root && strncmp(guest, "/dev_hdd0/", 10) == 0) {
         snprintf(out, cap, "%s/%s", hdd0_root, guest + 10);
@@ -391,20 +392,20 @@ static void cellFsRead(ppu_context* ctx)
      * a second, so it cannot be watched to its end -- truncating the stream makes
      * the demuxer see EOF and the movie finish, which is what advances the title
      * to whatever follows the intro. Deliberately a testing knob, not a fix. */
-    { static int efd = -2; static long elim = 0;
+    { static std::atomic<int> efd = -2; static std::atomic<long> elim = 0;
       if (efd == -2) { const char* e = getenv("PS3_FSLOG_EOF");
           if (e) { efd = atoi(e); const char* c = strchr(e, 44); elim = c ? atol(c + 1) : 0; }
           else efd = -1; }
       if (efd >= 0 && fd == efd && elim > 0 && fpos_before >= elim) {
           static int once = 0;
-          if (!once++) fprintf(stderr, "[fs] PS3_FSLOG_EOF: fd=%d truncated at %ld bytes\n", fd, elim);
+          if (!once++) fprintf(stderr, "[fs] PS3_FSLOG_EOF: fd=%d truncated at %ld bytes\n", fd, (long)elim);
           n = 0;
       } }
     if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] READ usm fd=%d nbytes=%llu -> %zu magic=%02X%02X%02X%02X pos=%ld lr=0x%08X\n", fd, (unsigned long long)nbytes, n, vm_base[buf], vm_base[buf+1], vm_base[buf+2], vm_base[buf+3], fpos_before, (uint32_t)ctx->lr);
     /* PS3_FSLOG_READS=<fd>: log every read on one descriptor. PS3_FSLOG caps at 20
      * lines and they are all spent before a movie ever opens, so it cannot
      * answer "is the streamer reading the .avi". */
-    { static int wfd = -2;
+    { static std::atomic<int> wfd = -2;
       if (wfd == -2) { const char* e = getenv("PS3_FSLOG_READS"); wfd = e ? atoi(e) : -1; }
       if (wfd >= 0 && fd == wfd)
           fprintf(stderr, "[fsread] fd=%d want=%llu got=%zu pos=%ld\n",
@@ -508,7 +509,7 @@ static void cellFsWrite(ppu_context* ctx)
  * granularity. */
 static void fs_report_block_size(ppu_context* ctx, uint32_t sec_ptr, uint32_t blk_ptr)
 {
-    static uint64_t bs = 0;
+    static std::atomic<uint64_t> bs = 0;
     if (!bs) {
         const char* e = getenv("PS3_FS_BLOCK_SIZE");
         bs = (e && *e) ? (uint64_t)strtoull(e, nullptr, 0) : 4096ull;

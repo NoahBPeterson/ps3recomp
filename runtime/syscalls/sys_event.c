@@ -284,7 +284,7 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
 }
 
 /* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
-static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
+static _Atomic int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
 
 int64_t sys_event_queue_receive(ppu_context* ctx)
 {
@@ -331,7 +331,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * which is a boot-time answer; when a title runs for a while and then stops
      * doing something, the question is where it is parked at the END, and the
      * last dump in the log answers that. */
-    { static int every = -1;
+    { static _Atomic int every = -1;
       if (every < 0) { const char* e = getenv("WAITBT_EVERY"); every = e ? atoi(e) : 0; }
       if (every > 0) {
           static unsigned n[8][8] = {{0}};
@@ -423,7 +423,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * blocks forever) so the loader thread proceeds. Tests whether the game's
      * render/draw code is reachable once the completion waits are satisfied. */
     if ((s_ydkj_hle_draw < 0 ? (s_ydkj_hle_draw = getenv("YDKJ_HLE_DRAW") ? 1 : 0) : s_ydkj_hle_draw) && queue_id == 1 && timeout_us == 0 && q->count == 0) {
-        static int s_n1 = 0;
+        static _Atomic int s_n1 = 0;
         if (s_n1 < 256) { s_n1++;
             if (event_addr != 0) {
                 uint64_t* out = (uint64_t*)vm_to_host(event_addr);
@@ -591,7 +591,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * PS3_EVT_RECV=<queue id> follows a different one; PS3_EVT_RECV=all follows
      * every queue. Default stays queue 1 so existing logs read the same. */
     {
-        static int _sel = -2;
+        static _Atomic int _sel = -2;
         if (_sel == -2) { const char* e = getenv("PS3_EVT_RECV");
                           _sel = !e ? 1 : (strcmp(e, "all") == 0 ? -1 : atoi(e)); }
     if (_sel == -1 || (int)queue_id == _sel) {
@@ -704,7 +704,7 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
      * means nothing produced the event (the guest's, or a missing HLE
      * producer). Those need opposite fixes, and nothing else distinguishes
      * them. */
-    { static int s_es = -1;
+    { static _Atomic int s_es = -1;
       if (s_es < 0) { const char* e = getenv("PS3_EVQSTAT");
                       s_es = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_es) { static unsigned long long np[SYS_EVENT_QUEUE_MAX + 1], n;
@@ -968,7 +968,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
     uint64_t data1   = LV2_ARG_U64(ctx, 1);
     uint64_t data2   = LV2_ARG_U64(ctx, 2);
     uint64_t data3   = LV2_ARG_U64(ctx, 3);
-    static int s_send_stack = -1; if (s_send_stack < 0) s_send_stack = getenv("PS3_EVT_SEND_STACK") != NULL;
+    static _Atomic int s_send_stack = -1; if (s_send_stack < 0) s_send_stack = getenv("PS3_EVT_SEND_STACK") != NULL;
     if (s_send_stack) { static unsigned char seen[8]={0}; unsigned pk=port_id&7;
         if(!seen[pk]){ seen[pk]=1; extern void ppu_dump_guest_stack(ppu_context*,const char*);
             char tag[40]; snprintf(tag,sizeof tag,"port_send producer port=%u",port_id); ppu_dump_guest_stack(ctx,tag); } }
@@ -1207,7 +1207,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
      * NEVER-CREATED flag -> ESRCH each time. Test whether returning CELL_OK
      * (as if the flag were set) breaks the spin and lets the game progress into
      * real render code. Diagnostic only; identifies whether the spin is the gate. */
-    { static int s_f = -1; if (s_f < 0) s_f = getenv("PS3_EVF_OK_IF_MISSING") ? 1 : 0;
+    { static _Atomic int s_f = -1; if (s_f < 0) s_f = getenv("PS3_EVF_OK_IF_MISSING") ? 1 : 0;
       if (s_f && !g_sys_event_flags[flag_id-1].active) {
         static int _n=0; if(__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED)<4) fprintf(stderr,"[evt] PS3_EVF_OK_IF_MISSING: flag=%u -> return CELL_OK (break spin)\n", flag_id);
         if (result_addr != 0) { write_be32(result_addr, (uint32_t)(bitpat>>32)); write_be32(result_addr+4, (uint32_t)bitpat); }
@@ -1246,7 +1246,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
      * so boot stalls on a black screen. Force-satisfy the wait (set the awaited
      * bits) to see if the game advances into its real render/content code. Blunt;
      * identifies the gate. */
-    { static int s_fe = -1; if (s_fe < 0) s_fe = getenv("PS3_EVF_FORCE") ? 1 : 0;
+    { static _Atomic int s_fe = -1; if (s_fe < 0) s_fe = getenv("PS3_EVF_FORCE") ? 1 : 0;
       if (s_fe && f->active && !flag_check(f->pattern, bitpat, mode)) {
         static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 20)
             fprintf(stderr, "[evt] PS3_EVF_FORCE: force-satisfy flag=%u bits=0x%llX mode=%u\n",

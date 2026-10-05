@@ -240,7 +240,7 @@ static void* ppu_host_thread_proc(void* param)
 #ifdef _WIN32
 static HANDLE g_gate_pending[256];
 static int    g_gate_n = 0;
-static int    g_gate_on = -1;
+static _Atomic int    g_gate_on = -1;
 void ydkj_release_pending_threads(void)
 {
     if (g_gate_on <= 0) return;
@@ -637,7 +637,7 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     /* Hardware never returns from this. Unwind to the thread proc so the guest
      * cannot keep running past its own exit. */
     {
-        static int allow = -1;
+        static _Atomic int allow = -1;
         if (allow < 0) allow = getenv("PS3_NO_THREAD_EXIT_UNWIND") ? 0 : 1;
         if (allow && s_exit_armed) { s_exit_armed = 0; longjmp(s_exit_jmp, 1); }
     }
@@ -803,7 +803,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
      * derivation is wrong or the struct is never initialised. Read r30 out of
      * the live context instead of deriving it: no TOC arithmetic, no
      * assumption about which callback is running. */
-    { static int sw = -1;
+    { static _Atomic int sw = -1;
       if (sw < 0) sw = getenv("PS1_SPINWAIT") ? 1 : 0;
       if (sw) {
           static unsigned long n;
@@ -833,7 +833,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
      * emulator retires over a billion R3000 instructions while emitting no GP0
      * drawing commands, and nothing else distinguishes "running the game" from
      * "spinning in a wait loop". */
-    { static int pc_on = -1;
+    { static _Atomic int pc_on = -1;
       if (pc_on < 0) pc_on = getenv("PS1_R3000_PC") ? 1 : 0;
       if (pc_on) {
           const uint32_t lr = (uint32_t)ctx->lr;
@@ -974,7 +974,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
                  * forever; if it changes, the input is moving and the fault is
                  * in the extraction or the table lookup. Sampling at yields is
                  * enough because this window already takes 15,213 of them. */
-                { static int lw = -2; static uint32_t lwb;
+                { static _Atomic int lw = -2; static _Atomic uint32_t lwb;
                   if (lw == -2) { const char* e = getenv("PS1_LOOPWATCH");
                                   lw = e ? 1 : 0;
                                   lwb = e ? (uint32_t)strtoul(e, 0, 16) : 0u; }
@@ -1013,7 +1013,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
                * This measures it instead: a flag per 64-byte bucket across the
                * BIOS, reported once, so "CdInit was entered" becomes an
                * observation rather than a deduction. */
-              { static int cen = -1;
+              { static _Atomic int cen = -1;
                 if (cen < 0) cen = getenv("PS1_PC_CENSUS") ? 1 : 0;
                 if (cen) {
                     /* 0xBFC00000..0xBFC80000 in 64-byte buckets = 8192 flags */

@@ -81,7 +81,7 @@ static unsigned long long  s_pass_count = 0;
 static int                 s_watchdog_prints = 0;
 
 static atomic_flag  s_init_claimed = ATOMIC_FLAG_INIT;
-static volatile int s_init_complete = 0;
+static atomic_int   s_init_complete = 0;   /* release-published: on, quantum */
 
 static void ls_arm_now(void)
 {
@@ -101,12 +101,12 @@ static void ls_arm_now(void)
 
 int yz_lockstep_enabled(void)
 {
-    if (s_init_complete) return g_yz_lockstep_on;
+    if (atomic_load_explicit(&s_init_complete, memory_order_acquire)) return g_yz_lockstep_on;
     if (!atomic_flag_test_and_set_explicit(&s_init_claimed, memory_order_acq_rel)) {
         ls_arm_now();
-        s_init_complete = 1;
+        atomic_store_explicit(&s_init_complete, 1, memory_order_release);
     } else {
-        while (!s_init_complete) LS_RELAX();
+        while (!atomic_load_explicit(&s_init_complete, memory_order_acquire)) LS_RELAX();
     }
     return g_yz_lockstep_on;
 }
@@ -194,7 +194,7 @@ void yz_lockstep_register(spu_context* ctx)
     for (int i = 0; i < s_ring_count; i++) if (!s_ring[i].active) { idx = i; break; }
     if (idx < 0) {
         if (s_ring_count >= YZ_LOCKSTEP_MAX_SPUS) {
-            static int wn = 0; if (wn < 4) { wn++;
+            static _Atomic int wn = 0; if (wn < 4) { wn++;
                 fprintf(stderr, "[lockstep] WARNING ring full -- spu=%X runs UNGATED\n", ctx->spu_id);
                 fflush(stderr); }
             LS_UNLOCK();

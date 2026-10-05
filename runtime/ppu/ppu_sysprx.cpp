@@ -173,7 +173,7 @@ static volatile long g_lwm_tab_lock = 0;
  * contended block it logs who holds it and for how long; on unlock it flags a
  * long hold. The leaf holder (the one blocked on a non-lwmutex wait) is the
  * convoy root. Default OFF. */
-static int lwm_trace(void){ static int v=-1; if(v<0){const char*e=getenv("PS3_LWMUTEX_TRACE"); v=e?1:0;} return v; }
+static int lwm_trace(void){ static std::atomic<int> v=-1; if(v<0){const char*e=getenv("PS3_LWMUTEX_TRACE"); v=e?1:0;} return v; }
 static long long lwm_now_us(void){
 #ifdef _WIN32
     static LARGE_INTEGER freq={0}; if(!freq.QuadPart) QueryPerformanceFrequency(&freq);
@@ -400,14 +400,14 @@ static void lwc_unlink(LwcondWaiter* w)    /* s_lwc_mu held */
 
 static bool lwc_poll_mode()
 {
-    static int m = -1;
+    static std::atomic<int> m = -1;
     if (m < 0) m = getenv("PS3_LWCOND_POLL") ? 1 : 0;
     return m == 1;
 }
 
 static int lwc_log()
 {
-    static int n = -1;
+    static std::atomic<int> n = -1;
     if (n < 0) { const char* e = getenv("PS3_LWCOND_LOG"); n = e ? atoi(e) : 0; }
     return n;
 }
