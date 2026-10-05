@@ -588,6 +588,20 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               lsa, (uint32_t)ea, size, (uint32_t)spu->pc, spu->image_id, "\n");
               }
           } }
+        /* SPU_DMA_STACK_CHECK=1: a GET landing on the live stack -- from the
+         * current $r1 to the top of local store -- overwrites saved link
+         * registers; no correct program does it. Reports the transfer. */
+        { static _Atomic int s_sc = -1; if (s_sc < 0) s_sc = getenv("SPU_DMA_STACK_CHECK") ? 1 : 0;
+          uint32_t sp = spu->gpr[1]._u32[0] & SPU_LS_MASK;
+          if (s_sc && sp && lsa + size > sp) {
+              static int _n = 0;
+              if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 40) {
+                  char b[256];
+                  snprintf(b, sizeof b, "[dma-stack] GET over the stack: cmd=0x%02X lsa=0x%05X size=0x%X ea=0x%08X "
+                           "sp=0x%05X pc=0x%05X img=%d ovl=%d task=%d\n", cmd, lsa, size, (uint32_t)ea, sp,
+                           (uint32_t)spu->pc, spu->image_id, (int)spu->resident_ovl, (int)spu->resident_task);
+                  fputs(b, stderr);
+              } } }
         /* GET: main memory -> local store */
         gm_copy_from(ls_ptr, (const uint8_t*)ea_ptr, size);
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
@@ -935,7 +949,7 @@ static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
  * Submit and immediately execute an MFC command.
  * This is the main entry point called when the SPU writes to MFC_Cmd.
  */
-static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+static inline int mfc_submit_body(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
     /* SPU_CMDHIST=1: every MFC command that reaches the engine, by opcode and
      * SPU image. Catches list DMAs (putl/getl) that never reach
@@ -1547,6 +1561,23 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         mfc->tag_completed |= (1u << tag);
 
     return rc;
+}
+
+/* Ordering of MFC commands against other agents. On Cell, a command the SPU
+ * has seen complete is performed before any command it issues afterwards, and
+ * the PPU/SPU hand-off protocols (SPURS: PPU stores a job, lwsync, publishes
+ * it in a lock line; SPU GETLLARs the line, then GETs the job) rest on that.
+ * Our transfers are host loads and stores, which a weakly ordered host (ARM64)
+ * may reorder across addresses: the job GET could return data older than the
+ * flag the GETLLAR saw. A full fence on either side of every command restores
+ * the order -- stronger than the MFC requires (unfenced commands in one queue
+ * may complete out of order), never weaker; one barrier per DMA. */
+static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+{
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    int r = mfc_submit_body(mfc, spu, cmd);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return r;
 }
 
 /* ---------------------------------------------------------------------------
