@@ -5,6 +5,7 @@
  * it with the SPURS task ABI. cellSpurs's AddWorkload/CreateTask call
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
+#include "../memory/guest_mem_atomic.h"
 #include "spu_workload.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
@@ -1042,13 +1043,12 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             for (int row = 0; row < 4; row++) {
                 uint32_t p = b + 0x40 + 16u * (uint32_t)row;
                 extern uint8_t* vm_base;
-                uint16_t ticket = (uint16_t)((vm_base[p] << 8) | vm_base[p+1]);
+                uint16_t ticket = __builtin_bswap16(gm_load16(vm_base + p));
                 for (int lane = 0; lane < 7; lane++) {
                     uint32_t la = p + 2 + 2u * (uint32_t)lane;
-                    uint16_t cur = (uint16_t)((vm_base[la] << 8) | vm_base[la+1]);
+                    uint16_t cur = __builtin_bswap16(gm_load16(vm_base + la));
                     if (cur != 0xFFFF && cur < ticket) {
-                        vm_base[la]   = (uint8_t)(ticket >> 8);
-                        vm_base[la+1] = (uint8_t)ticket;
+                        gm_store16(vm_base + la, __builtin_bswap16(ticket));
                     }
                 }
             }
