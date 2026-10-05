@@ -456,7 +456,7 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
 #define SPU_JOB_RETURN_LS   0x3FF00u
 
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
-static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
 {
     /* Classify FIRST. Every MFC_Cmd write lands here, and only the switch at
      * the bottom used to filter -- so the uncommitted-EA guard below reported
@@ -822,6 +822,15 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     default:
         return 0;
     }
+}
+
+/* Lock-line commands are ordered like every MFC command (see mfc_submit). */
+static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+{
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    int r = spu_mfc_atomic_body(ctx, cmd);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return r;
 }
 
 static int channel_is_mfc(uint32_t ch)
@@ -2455,33 +2464,44 @@ void spu_indirect_branch(spu_context* ctx)
     }
 
     if (!fn && !ctx->policy_mode && ctx->pc >= SPU_JM2_KERNEL_BASE) {
+        /* First sighting of each target (up to 16), reported in one write so
+         * several SPU threads hitting it at once cannot interleave lines. */
         static uint32_t seen[16]; static int n_seen = 0;
-        int known = 0;
-        for (int i = 0; i < n_seen; i++) if (seen[i] == ctx->pc) { known = 1; break; }
-        if (!known && n_seen < 16) {
-            seen[n_seen++] = ctx->pc;
-            fprintf(stderr, "[spu] img=%d branched into unlifted LS 0x%05X "
-                    "(lr=0x%05X) -- ending the job\n",
-                    ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
-            { fprintf(stderr, "      last dispatched PCs (oldest first):");
-              for (unsigned q = 0; q < 8; q++) {
-                  unsigned idx = (g_spu_pch_n + q) & 7u;
-                  if (g_spu_pch_n > q || g_spu_pch[idx]) fprintf(stderr, " 0x%05X", g_spu_pch[idx]);
-              }
-              fprintf(stderr, "%c", 10); }
-            /* Is there real code at the target, or is the pc garbage? Eight
-             * words at the target and at the return address separate "the lift
-             * missed a function" from "this branch should never have happened". */
-            { uint32_t a[2]; a[0] = ctx->pc & SPU_LS_MASK;
-              a[1] = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
-              for (int k = 0; k < 2; k++) {
-                  fprintf(stderr, "      LS[0x%05X]:", a[k]);
-                  for (uint32_t o = 0; o < 32 && a[k] + o + 3 < SPU_LS_SIZE; o += 4)
-                      fprintf(stderr, " %02X%02X%02X%02X",
-                              ctx->ls[a[k]+o], ctx->ls[a[k]+o+1],
-                              ctx->ls[a[k]+o+2], ctx->ls[a[k]+o+3]);
-                  fprintf(stderr, "\n");
-              } }
+        int known = 0, n = __atomic_load_n(&n_seen, __ATOMIC_ACQUIRE);
+        for (int i = 0; i < n && i < 16; i++)
+            if (__atomic_load_n(&seen[i], __ATOMIC_RELAXED) == ctx->pc) { known = 1; break; }
+        if (!known && n < 16) {
+            int slot = __atomic_fetch_add(&n_seen, 1, __ATOMIC_ACQ_REL);
+            if (slot < 16) __atomic_store_n(&seen[slot], ctx->pc, __ATOMIC_RELAXED);
+            uint32_t p0 = ctx->pc & SPU_LS_MASK;
+            uint32_t w0 = ((uint32_t)ctx->ls[p0] << 24) | ((uint32_t)ctx->ls[p0+1] << 16) |
+                          ((uint32_t)ctx->ls[p0+2] << 8) | ctx->ls[p0+3];
+            const char* e_iu = getenv("SPU_INTERP_UNLIFTED");
+            int interp = !(e_iu && e_iu[0] == '0') && w0;
+            char buf[1024]; int bp = 0;
+            bp += snprintf(buf + bp, sizeof buf - bp,
+                           "[spu] img=%d branched into unlifted LS 0x%05X (lr=0x%05X) -- %s\n"
+                           "      last dispatched PCs (oldest first):",
+                           ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                           interp ? "interpreting it" : "ending the job");
+            for (unsigned q = 0; q < 8; q++) {
+                unsigned idx = (g_spu_pch_n + q) & 7u;
+                if (g_spu_pch_n > q || g_spu_pch[idx])
+                    bp += snprintf(buf + bp, sizeof buf - bp, " 0x%05X", g_spu_pch[idx]);
+            }
+            bp += snprintf(buf + bp, sizeof buf - bp, "\n");
+            /* Eight words at the target and at the return address separate "the
+             * lift missed a function" from "this branch should never happen". */
+            uint32_t a[2] = { p0, ctx->gpr[0]._u32[0] & SPU_LS_MASK };
+            for (int k = 0; k < 2; k++) {
+                bp += snprintf(buf + bp, sizeof buf - bp, "      LS[0x%05X]:", a[k]);
+                for (uint32_t o = 0; o < 32 && a[k] + o + 3 < SPU_LS_SIZE; o += 4)
+                    bp += snprintf(buf + bp, sizeof buf - bp, " %02X%02X%02X%02X",
+                                   ctx->ls[a[k]+o], ctx->ls[a[k]+o+1],
+                                   ctx->ls[a[k]+o+2], ctx->ls[a[k]+o+3]);
+                bp += snprintf(buf + bp, sizeof buf - bp, "\n");
+            }
+            fputs(buf, stderr);
             fflush(stderr);
         }
         /* If real code is present at the target, run it through the interpreter
