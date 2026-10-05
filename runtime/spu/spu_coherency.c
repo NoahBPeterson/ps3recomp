@@ -12,6 +12,10 @@
 
 #include <stdlib.h>
 #include "spu_coherency.h"
+#ifndef _WIN32
+#include <execinfo.h>
+#include <dlfcn.h>
+#endif
 
 #include <stdint.h>
 #include <stdio.h>
@@ -95,9 +99,30 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
     s_coh_armed = 1;
 
     if (!ctx) return;
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+    /* Already a member anywhere? Look at every slot before taking a free one:
+     * stopping at the first free slot re-added a context that sat in a later
+     * slot (an earlier context's slot had since been freed), and unregister
+     * then removed one copy and left the other pointing at a dead stack. */
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++)
         if (s_coh_ctxs[i] == ctx) return;
-        if (s_coh_ctxs[i] == NULL) { s_coh_ctxs[i] = ctx; return; }
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+        if (s_coh_ctxs[i] == NULL) {
+            s_coh_ctxs[i] = ctx;
+            /* SPU_COH_LOG=1: name each context as it joins the reserving set,
+             * with the host call chain that reserved, so an entry that outlives
+             * its context can be traced to the path that skipped unregister. */
+#ifndef _WIN32
+            { static int s_l = -1; if (s_l < 0) s_l = getenv("SPU_COH_LOG") ? 1 : 0;
+              if (s_l) {
+                  void* bt[8]; int n = backtrace(bt, 8);
+                  fprintf(stderr, "[spu-coh] + ctx %p img=%d spu=0x%X slot %d:", (void*)ctx,
+                          ctx->image_id, ctx->spu_id, i);
+                  for (int k = 1; k < n; k++) { Dl_info di;
+                      if (dladdr(bt[k], &di) && di.dli_sname) fprintf(stderr, " %s", di.dli_sname); }
+                  fprintf(stderr, "\n"); } }
+#endif
+            return;
+        }
     }
     /* More live SPU contexts than the registry holds. The ones already in it
      * still get their events; this one would silently never wake, so say so. */
@@ -129,7 +154,7 @@ void spu_coh_unregister(spu_context* ctx)
      * spu_coh_notify_write, reading a freed thread stack. */
     spu_lockline_lock();
     for (int i = 0; i < SPU_COH_MAX_CTX; i++)
-        if (s_coh_ctxs[i] == ctx) { s_coh_ctxs[i] = NULL; break; }
+        if (s_coh_ctxs[i] == ctx) s_coh_ctxs[i] = NULL;
     spu_lockline_unlock();
 }
 

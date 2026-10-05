@@ -345,6 +345,31 @@ static void test_block_stores(void)
 /* ===========================================================================
  * main: run all and report
  * ===========================================================================*/
+/* ===========================================================================
+ * Membership: a context is in the reserving set at most once
+ * ===========================================================================*/
+static void test_unregister_after_slot_reuse(void)
+{
+    TEST("re-reserving after an earlier slot frees does not add a second copy");
+    spu_reset(&g_spu_a, 0);
+    spu_reset(&g_spu_b, 1);
+    spu_coh_unregister(&g_spu_a);
+    spu_coh_unregister(&g_spu_b);
+    spu_getllar(&g_spu_a, LINE_A);          /* A takes the first slot   */
+    spu_getllar(&g_spu_b, LINE_B);          /* B the one after it       */
+    spu_coh_unregister(&g_spu_a);           /* the first slot is free   */
+    spu_getllar(&g_spu_b, LINE_B);          /* B again: still one entry */
+    spu_coh_unregister(&g_spu_b);           /* ...so this removes it    */
+
+    /* Out of the set, B must not be notified even holding a reservation
+     * (its context could be gone: a stack local whose thread exited). */
+    g_wakes = 0;
+    g_spu_b.resv_ea = LINE_B; g_spu_b.resv_valid = 1; g_spu_b.event_status = 0;
+    vm_write32(LINE_B + 8, 0x55555555u);
+    CHECK_EQ_U32(g_spu_b.event_status, 0);
+    CHECK(g_wakes == 0);
+}
+
 int main(void)
 {
     test_bitmap();
@@ -353,6 +378,7 @@ int main(void)
     test_all_store_widths();
     test_store_conditional();
     test_block_stores();
+    test_unregister_after_slot_reuse();
 
     printf("\nSPU lock-line coherence tests: %d passed, %d failed\n",
            g_pass, g_fail);
