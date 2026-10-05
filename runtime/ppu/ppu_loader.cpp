@@ -928,6 +928,40 @@ static inline int resv_off() { static int v = -1; if (v < 0) v = getenv("PPU_RES
 extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra);
 extern "C" uint32_t g_ww_lo, g_ww_hi;
 
+/* Line-granular reservations. On the Cell PPU a lwarx/ldarx reservation covers
+ * the whole 128-byte line: the store-conditional fails if ANY byte of the line
+ * changed, an SPU's PUTLLC included. Firmware relies on it -- libsre's
+ * _cellSpursSendSignal reserves a taskset's line, reads every bitset in it, and
+ * commits only `signalled`; were an SPU to set `waiting` in between and the
+ * commit still succeed, the PPU would skip the workload wake-up that waiting
+ * task needs and it would sleep forever. For lines shared with SPUs, the lifted
+ * lwarx/ldarx snapshot the line here, and the store-conditional fails if it no
+ * longer matches -- the rule SPU PUTLLC already follows. Thread-local, so the
+ * ppu_context layout (shared with every existing lift) is unchanged; a lift
+ * without the note keeps word-granular behaviour. */
+static PPU_THREAD_LOCAL uint8_t  t_resv_line[128];
+static PPU_THREAD_LOCAL uint32_t t_resv_line_ea;
+static PPU_THREAD_LOCAL int      t_resv_line_valid;
+
+extern "C" void ppu_resv_line_note(uint64_t ea)
+{
+    const uint32_t line = (uint32_t)ea & ~127u;
+    if (!spu_coh_is_reserved(line)) { t_resv_line_valid = 0; return; }
+    spu_lockline_lock();                       /* no torn copy against a PUTLLC */
+    memcpy(t_resv_line, vm_base + line, 128);
+    spu_lockline_unlock();
+    t_resv_line_ea = line;
+    t_resv_line_valid = 1;
+}
+
+/* Under the lock-line lock: did the reserved line change since the note? */
+static inline int resv_line_lost(uint64_t ea)
+{
+    const uint32_t line = (uint32_t)ea & ~127u;
+    if (!t_resv_line_valid || t_resv_line_ea != line) return 0;
+    return memcmp(t_resv_line, vm_base + line, 128) != 0;
+}
+
 extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
 {
     uint32_t exp_raw = __builtin_bswap32(expected);
@@ -956,8 +990,10 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
                         n, (uint32_t)ea & ~127u); } }
     if (coh) spu_lockline_lock();
-    int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
+    int ok = (coh && resv_line_lost(ea)) ? 0 :
+             __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+    t_resv_line_valid = 0;
     if (coh) {
         if (ok) spu_coh_notify_write((uint32_t)ea);
         spu_lockline_unlock();
@@ -1027,7 +1063,9 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int coh = spu_coh_is_reserved((uint32_t)ea);
     if (coh) spu_lockline_lock();
-    int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+    int ok = (coh && resv_line_lost(ea)) ? 0 :
+             __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+    t_resv_line_valid = 0;
     if (coh) {
         if (ok) spu_coh_notify_write((uint32_t)ea);
         spu_lockline_unlock();
