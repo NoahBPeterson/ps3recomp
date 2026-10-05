@@ -196,10 +196,10 @@ void lbp_unstick_once(void)
  * because such a caller is invariably spinning. */
 static void sem_report_bad_id(ppu_context* ctx, uint32_t sem_id, const char* op)
 {
-    static int on = -1;
+    static _Atomic int on = -1;
     if (on < 0) on = getenv("SEM_BADID") ? 1 : 0;
     if (!on) return;
-    static uint64_t seen[32]; static int nseen = 0;
+    static uint64_t seen[32]; static _Atomic int nseen = 0;
     uint64_t key = ((uint64_t)sem_id << 32) | (uint32_t)ctx->lr;
     for (int i = 0; i < nseen; i++) if (seen[i] == key) return;
     if (nseen < 32) seen[nseen++] = key;
@@ -329,7 +329,7 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx);
 int64_t sys_semaphore_wait(ppu_context* ctx)
 {
     int64_t r = sys_semaphore_wait_impl(ctx);
-    static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
+    static _Atomic int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
     if (d && r) { static int n = 0; if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 12)
         fprintf(stderr, "[sem] wait(sem=%u) -> %lld%c",
                 (unsigned)ctx->gpr[3], (long long)r, 10); }
@@ -337,7 +337,7 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
 }
 static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
 {
-    { static int _d = -1; if (_d < 0) _d = getenv("SEM_WAITDBG") ? 1 : 0;
+    { static _Atomic int _d = -1; if (_d < 0) _d = getenv("SEM_WAITDBG") ? 1 : 0;
       if (_d) { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 20)
           fprintf(stderr, "[sem] wait(id=%u) tid=%llu%c", (unsigned)ctx->gpr[3],
                   (unsigned long long)ctx->thread_id, 10); } }
@@ -358,7 +358,7 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
      * table. Fires reliably DURING the loader hang (respump spins sem16 waits),
      * so two consecutive [BC] lines reveal which worker's count is FROZEN = the
      * job it's stuck in, and its last indirect-call target = that callback. */
-    { static int bc=-2; if(bc==-2) bc=getenv("PS3_BREADCRUMB")?1:0;
+    { static _Atomic int bc=-2; if(bc==-2) bc=getenv("PS3_BREADCRUMB")?1:0;
       if(bc){ static long w=0; if((++w % 500)==0){ extern void lbp_breadcrumb_dump(const char*); lbp_breadcrumb_dump("semwait"); } } }
     /* SEMCHAIN: dump the guest call-chain at the main thread's sem=7 poll (the
      * "loading done" wait) to locate its loop -- is it meant to re-post sem=3? */

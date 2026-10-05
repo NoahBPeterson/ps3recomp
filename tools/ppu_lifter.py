@@ -148,6 +148,21 @@ void     ppu_resv_line_note(uint64_t addr);
 extern "C" {
 #endif
 extern uint8_t* vm_base;
+/* Raw (guest byte order) accesses for the byte-reversed and vector forms:
+ * aligned ones single-copy atomic, as on Cell -- the same rule as
+ * runtime/memory/guest_mem_atomic.h, which the generated code cannot include. */
+#define VM_RAW_LD(T, ea) ({ const uint8_t* _p = vm_base + (uint32_t)(ea); T _v; \
+    if (!((uintptr_t)_p & (sizeof(T) - 1))) _v = __atomic_load_n((const T*)_p, __ATOMIC_RELAXED); \
+    else memcpy(&_v, _p, sizeof(T)); _v; })
+#define VM_RAW_ST(T, ea, val) do { uint8_t* _p = vm_base + (uint32_t)(ea); T _v = (val); \
+    if (!((uintptr_t)_p & (sizeof(T) - 1))) __atomic_store_n((T*)_p, _v, __ATOMIC_RELAXED); \
+    else memcpy(_p, &_v, sizeof(T)); } while (0)
+static inline void vm_raw_ld16(void* dst, uint64_t ea) {   /* quadword-aligned */
+    uint64_t lo = VM_RAW_LD(uint64_t, ea), hi = VM_RAW_LD(uint64_t, ea + 8);
+    memcpy(dst, &lo, 8); memcpy((uint8_t*)dst + 8, &hi, 8); }
+static inline void vm_raw_st16(uint64_t ea, const void* src) {
+    uint64_t lo, hi; memcpy(&lo, src, 8); memcpy(&hi, (const uint8_t*)src + 8, 8);
+    VM_RAW_ST(uint64_t, ea, lo); VM_RAW_ST(uint64_t, ea + 8, hi); }
 extern int      vm_inline_ok;
 extern uint32_t ppu_vm_size;
 extern uint32_t ppu_hle_inject_base;
@@ -163,25 +178,37 @@ static inline int vm_inl_ok(uint32_t ea, uint32_t n)
 static inline uint8_t vm_read8_inl(uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 1)) return vm_base[ea];
+    if (vm_inl_ok(ea, 1)) return __atomic_load_n(vm_base + ea, __ATOMIC_RELAXED);
     return vm_read8(a);
 }
 static inline uint16_t vm_read16_inl(uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 2)) { uint16_t v; memcpy(&v, vm_base + ea, 2); return __builtin_bswap16(v); }
+    if (vm_inl_ok(ea, 2)) {   /* aligned: single-copy atomic, as on Cell */
+        uint16_t v;
+        if (!(ea & 1u)) v = __atomic_load_n((const uint16_t*)(vm_base + ea), __ATOMIC_RELAXED);
+        else memcpy(&v, vm_base + ea, 2);
+        return __builtin_bswap16(v); }
     return vm_read16(a);
 }
 static inline uint32_t vm_read32_inl(uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 4)) { uint32_t v; memcpy(&v, vm_base + ea, 4); return __builtin_bswap32(v); }
+    if (vm_inl_ok(ea, 4)) {   /* aligned: single-copy atomic, as on Cell */
+        uint32_t v;
+        if (!(ea & 3u)) v = __atomic_load_n((const uint32_t*)(vm_base + ea), __ATOMIC_RELAXED);
+        else memcpy(&v, vm_base + ea, 4);
+        return __builtin_bswap32(v); }
     return vm_read32(a);
 }
 static inline uint64_t vm_read64_inl(uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 8)) { uint64_t v; memcpy(&v, vm_base + ea, 8); return __builtin_bswap64(v); }
+    if (vm_inl_ok(ea, 8)) {   /* aligned: single-copy atomic, as on Cell */
+        uint64_t v;
+        if (!(ea & 7u)) v = __atomic_load_n((const uint64_t*)(vm_base + ea), __ATOMIC_RELAXED);
+        else memcpy(&v, vm_base + ea, 8);
+        return __builtin_bswap64(v); }
     return vm_read64(a);
 }
 #ifndef PPU_NO_INLINE_LOADS
@@ -2479,7 +2506,7 @@ class PPULifter:
         if mn == "stdbrx":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra, rb)}; uint64_t raw = ctx->gpr[{rs}]; "
-                    f"memcpy(vm_base + (uint32_t)ea, &raw, 8); }}")   # host LE = byte-reversed
+                    f"VM_RAW_ST(uint64_t, ea, raw); }}")   # host LE = byte-reversed
 
         # ------- String word load/store -------
         # NB bytes (lswi: NB field, 0 = 32; lswx: XER[25:31]) move between memory
@@ -2509,19 +2536,19 @@ class PPULifter:
         if mn == "lwbrx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"uint32_t raw; memcpy(&raw, vm_base + (uint32_t)ea, 4); "
+                    f"uint32_t raw = VM_RAW_LD(uint32_t, ea); "
                     f"ctx->gpr[{rd}] = raw; }}") # NOTE: no bswap — reads in host (LE) order
 
         if mn == "stwbrx":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"uint32_t raw = (uint32_t)ctx->gpr[{rs}]; "
-                    f"memcpy(vm_base + (uint32_t)ea, &raw, 4); }}")
+                    f"VM_RAW_ST(uint32_t, ea, raw); }}")
 
         if mn == "lhbrx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"uint16_t raw; memcpy(&raw, vm_base + (uint32_t)ea, 2); "
+                    f"uint16_t raw = VM_RAW_LD(uint16_t, ea); "
                     f"ctx->gpr[{rd}] = raw; }}")
 
         if mn == "ldbrx":
@@ -2530,14 +2557,14 @@ class PPULifter:
             # as lhbrx above.
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"uint64_t raw; memcpy(&raw, vm_base + (uint32_t)ea, 8); "
+                    f"uint64_t raw = VM_RAW_LD(uint64_t, ea); "
                     f"ctx->gpr[{rd}] = raw; }}")
 
         if mn == "sthbrx":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"uint16_t raw = (uint16_t)ctx->gpr[{rs}]; "
-                    f"memcpy(vm_base + (uint32_t)ea, &raw, 2); }}")
+                    f"VM_RAW_ST(uint16_t, ea, raw); }}")
 
         # ------- Load algebraic -------
         if mn == "lwax":
@@ -2665,14 +2692,14 @@ class PPULifter:
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
-                    f"memcpy(&ctx->vr[{vd}], vm_base + (uint32_t)ea, 16); }}")
+                    f"vm_raw_ld16(&ctx->vr[{vd}], ea); }}")
 
         if mn in ("stvx", "stvxl"):
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
-                    f"memcpy(vm_base + (uint32_t)ea, &ctx->vr[{vs}], 16); }}")
+                    f"vm_raw_st16(ea, &ctx->vr[{vs}]); }}")
 
         # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
         # [EA&15 .. 15] of the aligned quadword left-justified into vD and
@@ -2710,8 +2737,8 @@ class PPULifter:
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"ea &= ~{size - 1}ULL; "
                     f"memset(&ctx->vr[{vd}], 0, 16); "
-                    f"memcpy((uint8_t*)&ctx->vr[{vd}] + (ea & 15), "
-                    f"vm_base + (uint32_t)ea, {size}); }}")
+                    f"{{ uint{size*8}_t _e = VM_RAW_LD(uint{size*8}_t, ea); "
+                    f"memcpy((uint8_t*)&ctx->vr[{vd}] + (ea & 15), &_e, {size}); }} }}")
 
         if mn == "stvebx" or mn == "stvehx" or mn == "stvewx":
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
@@ -2720,8 +2747,8 @@ class PPULifter:
             size = {"stvebx": 1, "stvehx": 2, "stvewx": 4}[mn]
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"ea &= ~{size - 1}ULL; "
-                    f"memcpy(vm_base + (uint32_t)ea, "
-                    f"(const uint8_t*)&ctx->vr[{vs}] + (ea & 15), {size}); }}")
+                    f"{{ uint{size*8}_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[{vs}] + (ea & 15), {size}); "
+                    f"VM_RAW_ST(uint{size*8}_t, ea, _e); }} }}")
 
         if mn == "lvsl" or mn == "lvsr":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])

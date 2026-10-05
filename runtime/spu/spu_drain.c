@@ -67,13 +67,13 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
      * via `bi $r0`, but some branch to 0 DIRECTLY, which the lifter turns into
      * a plain trampoline that never reaches spu_indirect_branch. The drain sees
      * every step, so catch it here too. Step 0 is the real entry. */
-    static int s_no_ls0 = -1;
+    static _Atomic int s_no_ls0 = -1;
     if (s_no_ls0 < 0) s_no_ls0 = getenv("SPU_NO_LS0_END") ? 1 : 0;
     /* SPU_EXITTRACE=<img>: remember the last PCs this image executed and dump
      * them when the job ends. "Why did it exit here" is a question about the
      * path taken, and a forward trace from the entry never reaches far enough
      * to show it. */
-    static int64_t s_et = -2;
+    static _Atomic int64_t s_et = -2;
     if (s_et == -2) { const char* e = getenv("SPU_EXITTRACE");
                       s_et = e ? strtol(e, 0, 0) : -1; }
     static uint32_t s_ring[64]; static uint32_t s_ri;
@@ -98,9 +98,9 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     /* SPU_STEPTRACE=<img>: pc and the argument registers at every trampoline
      * step. This runs on each drain iteration, so it is the finest-grained
      * view of a register file changing under a running job. */
-    { static int64_t s_t = -2;
+    { static _Atomic int64_t s_t = -2;
       if (s_t == -2) { const char* e = getenv("SPU_STEPTRACE"); s_t = e ? strtol(e,0,0) : -1; }
-      static int64_t s_from = -2;
+      static _Atomic int64_t s_from = -2;
       if (s_from == -2) { const char* e = getenv("SPU_STEPTRACE_FROM");
                           s_from = e ? strtol(e,0,16) : -1; }
       static int s_armed = 0;
@@ -118,7 +118,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     if (g_pm_flow_ctx == (void*)ctx && g_pm_flow_n < 8192)
         g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;
 
-    static int s_on = -1;
+    static _Atomic int s_on = -1;
     if (s_on < 0) s_on = getenv("SPU_JOBDRAIN") ? 1 : 0;
     if (!s_on || ctx->image_id != 2 || !ctx->policy_mode) return;
 
@@ -196,7 +196,7 @@ void spu_img_restore(spu_context* ctx, int32_t saved_img)
 
 unsigned spu_sn_defer_ticks(void)
 {
-    static int s_n = -1;
+    static _Atomic int s_n = -1;
     if (s_n < 0) { const char* e = getenv("SPU_SN_DEFER"); s_n = e ? atoi(e) : 0; }
     return (unsigned)(s_n < 0 ? 0 : s_n);
 }
@@ -250,7 +250,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                 if (f && ctx->host_depth <= f->depth)
                     ctx->irq_frame = f->prev;      /* returned to its loop the ordinary way */
                 if (f && ctx->host_depth > f->depth) {
-                    { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
+                    { static _Atomic int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
                       static int _n = 0;
                       if (s_it && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 200)
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to taking frame depth %u (srr0=0x%05X)\n",
@@ -261,7 +261,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                     /* Taken by the top-level driver loop (depth 0), which
                      * keeps no frame: the driver's own restart re-enters at
                      * srr0 with the host stack empty, which is that frame. */
-                    { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
+                    { static _Atomic int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
                       static int _n = 0;
                       if (s_it && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 200)
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to the driver (srr0=0x%05X)\n",
@@ -305,7 +305,7 @@ void (*spu_take_interrupt(spu_context* ctx,
     ctx->srr0 = ctx->pc;             /* resume point for iret */
     ctx->int_enable = 0;
     spu_irq_regs_save(ctx);          /* hardware contract: handler preserves regs */
-    { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
+    { static _Atomic int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
       if (s_it) { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 200)
         fprintf(stderr, "[irq] TAKE srr0=0x%05X depth=%d r13=%08X r15=%08X\n",
                 ctx->srr0 & SPU_LS_MASK, ctx->host_depth,
@@ -332,7 +332,7 @@ void (*spu_take_interrupt(spu_context* ctx,
 /* See the declaration in spu_context.h. */
 void spu_depth_guard(spu_context* ctx)
 {
-    static uint32_t s_max = 0;
+    static _Atomic uint32_t s_max = 0;
     if (!s_max) {
         const char* e = getenv("SPU_HOST_DEPTH_MAX");
         s_max = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
@@ -342,13 +342,13 @@ void spu_depth_guard(spu_context* ctx)
      * not "where are we" but "what cycle got us here" -- one pc names a point,
      * a ring names the loop. */
     enum { RING = 24 };
-    static uint32_t s_ring[RING];
-    static uint32_t s_n;
+    static SPU_THREAD_LOCAL uint32_t s_ring[RING];   /* per SPU thread: its own cycle */
+    static SPU_THREAD_LOCAL uint32_t s_n;
     s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
     s_n++;
 
     if (ctx->host_depth < s_max) return;
-    static int s_reported = 0;
+    static _Atomic int s_reported = 0;
     if (s_reported < 1) {   /* one report: five SPU threads all trip together */
         s_reported++;
         fprintf(stderr, "[spu-depth] img=%d pc=0x%05X lr=0x%05X host_depth=%u"
@@ -368,7 +368,7 @@ void spu_depth_guard(spu_context* ctx)
 /* See spu_context.h. Env-gated: SPU_TAILRET=1. */
 int spu_tailret_enabled(void)
 {
-    static int s_on = -1;
+    static _Atomic int s_on = -1;
     if (s_on < 0) { const char* e = getenv("SPU_TAILRET"); s_on = (e && e[0] == 0x31) ? 1 : 0; }
     return s_on;
 }

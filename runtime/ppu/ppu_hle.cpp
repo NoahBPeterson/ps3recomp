@@ -91,7 +91,7 @@ static ps3_nid_entry* hle_nid_find(uint32_t nid)
 typedef void (*hle_ctx_fn)(ppu_context*);
 #define HLE_CTX_CAP 256
 static struct { uint32_t nid; hle_ctx_fn fn; const char* name; } g_ctx[HLE_CTX_CAP];
-static uint32_t g_ctx_count = 0;
+static std::atomic<uint32_t> g_ctx_count = 0;
 
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn fn)
 {
@@ -124,8 +124,9 @@ void vm_write64(uint64_t addr, uint64_t val);
 
 /* Breadcrumb for the crash reporter: the last firmware import dispatched, so a
  * host AV inside an HLE handler names the culprit NID/function. */
-extern "C" uint32_t    g_last_hle_nid  = 0;
-extern "C" const char* g_last_hle_name = "";
+/* Per thread: the breadcrumb names what THIS thread last called into. */
+extern "C" PPU_THREAD_LOCAL uint32_t    g_last_hle_nid  = 0;
+extern "C" PPU_THREAD_LOCAL const char* g_last_hle_name = "";
 
 /* Which HLE each guest thread is currently INSIDE, indexed by ctx->thread_id.
  *
@@ -184,7 +185,7 @@ extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
 static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
 {
     enum { CELL_ERROR_ERROR = (int)0x8001003Fu };  /* generic CELL failure */
-    static int s_fake = -1;
+    static std::atomic<int> s_fake = -1;
     if (s_fake < 0) {
         const char* m = getenv("PS3_HLE_UNRESOLVED");
         s_fake = (m && (m[0]=='f' || m[0]=='F')) ? 0 : 1;   /* "fail" -> error, else fake */
@@ -220,7 +221,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * and "the title ran for a while and then quietly stopped advancing" is
      * exactly that shape. Every guest frame goes through HLE calls, so the last
      * dump in the log names the frame the loop was in when it stopped. */
-    { static int every = -1;
+    { static std::atomic<int> every = -1;
       if (every < 0) { const char* e = getenv("HLE_BT_EVERY"); every = e ? atoi(e) : 0; }
       if (every > 0 && ctx) {
           static unsigned n[8] = {0};
@@ -291,7 +292,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 
     /* Boot trace: log the first N HLE calls (PS3_HLE_TRACE=N). Invaluable for
      * new-SDK bring-up (e.g. PSL1GHT) where the failure is "nothing happens". */
-    static int s_trace = -2;
+    static std::atomic<int> s_trace = -2;
     if (s_trace == -2) { const char* e = getenv("PS3_HLE_TRACE"); s_trace = e ? atoi(e) : 0; }
     if (s_trace > 0) {
         s_trace--;
@@ -304,7 +305,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * a MISDECLARED HLE prototype from a guest passing bad values -- the two look
      * identical from the callee side, and getting it wrong silently shifts every
      * argument after the mistake. */
-    { static long s_ha = -1;
+    { static std::atomic<long> s_ha = -1;
       if (s_ha < 0) { const char* e = getenv("PS3_HLE_ARGS");
                       s_ha = e ? (long)strtoul(e, 0, 16) : 0; }
       if (s_ha && nid == (uint32_t)s_ha) {
@@ -350,7 +351,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * the caller no longer reads [r1+0x28] to restore r2, so this ABI TOC-spill is
      * unnecessary — and in the frameless-cascade it can clobber a caller frame slot
      * (e.g. the deserializer's this-pointer). Skip it to test that theory. */
-    { static int _ns=-1; if(_ns<0)_ns=getenv("FLOW_NOSPILL")?1:0;
+    { static std::atomic<int> _ns=-1; if(_ns<0)_ns=getenv("FLOW_NOSPILL")?1:0;
       if(!_ns) vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]); }
 
     /* A loaded firmware module (runtime/prx) that exports this NID serves it,
@@ -408,7 +409,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
             return;
         }
-        static int logged = 0;
+        static std::atomic<int> logged = 0;
         if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
          * callbacks (statCallback/fileCallback) to learn the cellSaveDataAutoLoad2
@@ -418,7 +419,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
          * state never transitions. Implement the no-save/new-user path: invoke the
          * game's statCallback (r8 OPD) with a CellSaveDataStatGet{isNewData=1}, honor
          * its result, return CELL_SAVEDATA_RET_OK(0). Legit HLE (real first-run behavior). */
-        if (nid==0xCDC6AEFDu) { static int _sdi=-1; if(_sdi<0)_sdi=getenv("YDKJ_SAVEDATA")?1:0;
+        if (nid==0xCDC6AEFDu) { static std::atomic<int> _sdi=-1; if(_sdi<0)_sdi=getenv("YDKJ_SAVEDATA")?1:0;
           if(_sdi){ static int _once=0; if(__atomic_fetch_add(&_once, 1, __ATOMIC_RELAXED)<2){
             uint32_t statCb=(uint32_t)ctx->gpr[8];               /* statCallback OPD */
             uint32_t SC=0x02000000u, SG=0x02000100u, SS=0x02000900u; /* scratch structs */
@@ -449,7 +450,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
          * and later virtual-calls it -> the 0xC708C708 null-vtable crash. Return a
          * negative error instead so the game's online-content check takes its
          * graceful OFFLINE-FAILURE path and proceeds with the local Persistent.zip. */
-        { static int _no=-1; if(_no<0)_no=getenv("YDKJ_NETOFFLINE")?1:0;
+        { static std::atomic<int> _no=-1; if(_no<0)_no=getenv("YDKJ_NETOFFLINE")?1:0;
           if(_no){ switch(nid){
             case 0x139A9E9Bu: case 0x9FB6228Eu: case 0x05893E7Cu:
             case 0x52AAC4FAu: case 0x9638F766u: case 0x522180BCu:
@@ -479,7 +480,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * CELL_ERROR code (0x8001xxxx / 0x8002xxxx) is leaking a truncated HOST
      * pointer. It surfaces much later as an unresolved indirect call with no hint
      * of where it came from, which is why it is worth checking for directly. */
-    { static int _pl=-1; if(_pl<0)_pl=getenv("PS3_HLE_PTRCHECK")?1:0;
+    { static std::atomic<int> _pl=-1; if(_pl<0)_pl=getenv("PS3_HLE_PTRCHECK")?1:0;
       if(_pl){ uint32_t rv=(uint32_t)r;
         if(rv>=0x10000000u && (rv & 0xFFFF0000u)!=0x80010000u && (rv & 0xFFFF0000u)!=0x80020000u){
           static int _n=0; if(__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED)<40) fprintf(stderr,"[PTRLEAK] NID 0x%08X %s returned 0x%08X (out-of-guest-RAM host ptr?)\n",

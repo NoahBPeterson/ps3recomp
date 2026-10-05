@@ -95,7 +95,7 @@ static raw_spu s_spu[SPU_RAW_COUNT];
 
 static int dbg(void)
 {
-    static int v = -1;
+    static _Atomic int v = -1;
     if (v < 0) v = getenv("SPU_RAW_DBG") ? 1 : 0;
     return v;
 }
@@ -351,7 +351,7 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width)
              * the chain of the last write against an earlier one: the frame
              * that is present early and missing late is the one that stopped
              * asking. */
-            { static int cap = -1; static int seen[SPU_RAW_COUNT];
+            { static _Atomic int cap = -1; static int seen[SPU_RAW_COUNT];
               if (cap < 0) { const char* e = getenv("SPU_MBOX_CHAIN");
                              cap = e ? atoi(e) : 0; }
               uint32_t si = (uint32_t)(s - s_spu);
@@ -389,7 +389,7 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width)
          * signals keeps receiving from its event queue the whole time. So
          * either the writes stop or they land and the SPU does not see them --
          * and those are opposite bugs. This counts the writes as they happen. */
-        { static int s_ss = -1;
+        { static _Atomic int s_ss = -1;
           if (s_ss < 0) { const char* e = getenv("SPU_SIGSTAT");
                           s_ss = e ? (atoi(e) > 0 ? atoi(e) : 256) : 0; }
           if (s_ss) { static unsigned long long c[8][2]; static unsigned long long n;
@@ -518,7 +518,7 @@ static int64_t sc_raw_spu_set_int_mask(ppu_context* ctx)
      * so if the guest only enables 0x1|0x2 that write raises nothing and the PPU
      * has to poll. If it stopped polling, the message sits unread and the SPUs
      * spin. This prints enough to tell those apart. */
-    { static int _d = -1; if (_d < 0) _d = getenv("SPU_DBG_MBOX") ? 1 : 0;
+    { static _Atomic int _d = -1; if (_d < 0) _d = getenv("SPU_DBG_MBOX") ? 1 : 0;
       if (_d) fprintf(stderr, "[spu-mask] spu%u class=%llu mask=0x%llX\n",
               n, (unsigned long long)ctx->gpr[4], (unsigned long long)ctx->gpr[5]); }
     return CELL_OK;

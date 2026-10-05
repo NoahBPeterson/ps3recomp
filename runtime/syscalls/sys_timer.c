@@ -124,7 +124,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
      * Deliberately unlocked: the counts are a diagnostic, and a lost increment
      * under a race cannot change which site is at the top of a 30k-per-second
      * poll. */
-    { static long s_pt = -1;
+    { static _Atomic long s_pt = -1;
       if (s_pt < 0) { const char* e = getenv("PS3_POLLTOP");
                       s_pt = e ? (long)strtoul(e, 0, 10) : 0;
                       if (s_pt < 0) s_pt = 0; }
@@ -170,7 +170,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
      * address, dump the registers and the object they point at. A poll loop
      * tells you WHERE it is spinning; this tells you WHAT it is spinning on,
      * which is the part you actually need to find who never releases it. */
-    { static long s_wo = -1;
+    { static _Atomic long s_wo = -1;
       if (s_wo < 0) { const char* e = getenv("PS3_WAIT_OBJ");
                       s_wo = e ? (long)strtoul(e, 0, 16) : 0; }
       if (s_wo && (uint32_t)ctx->lr == (uint32_t)s_wo) {
@@ -207,7 +207,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 
     /* POLLSITE: resolve the host chain of the 1ms poller (LBP bringup) to
      * guest functions -- names the stage that is starving. */
-    { static int _ps = -1; if (_ps < 0) _ps = getenv("POLLSITE") ? 12 : 0;
+    { static _Atomic int _ps = -1; if (_ps < 0) _ps = getenv("POLLSITE") ? 12 : 0;
       if (_ps > 0 && usec == 1000) { _ps--;
         extern void ppu_log_host_chain(const char*);
         ppu_log_host_chain("usleep1ms"); } }

@@ -397,10 +397,26 @@ static uint32_t     s_spu_next_group_id  = 0x1000;
 static uint32_t     s_spu_next_thread_id = 0x2000;
 static int          s_spu_initialized    = 0;
 
+/* Table slots are claimed and published without a lock: several PPU threads
+ * create, look up and destroy groups and threads at once (lv2 serialises
+ * these per object, not globally). in_use is the publication flag -- 0 free,
+ * 2 being filled in, 1 live -- so a lookup that sees 1 (acquire) sees the
+ * slot's id and fields as written before the release that set it. */
+#define SLOT_LIVE(p)      (__atomic_load_n(&(p)->in_use, __ATOMIC_ACQUIRE) == 1)
+#define SLOT_PUBLISH(p)   __atomic_store_n(&(p)->in_use, 1, __ATOMIC_RELEASE)
+#define SLOT_FREE(p)      __atomic_store_n(&(p)->in_use, 0, __ATOMIC_RELEASE)
+static int slot_claim(int* in_use)
+{
+    int z = 0;
+    return __atomic_compare_exchange_n(in_use, &z, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+}
+/* Zero a claimed slot without touching in_use (the first member). */
+#define SLOT_CLEAR(p) memset((char*)(p) + sizeof((p)->in_use), 0, sizeof(*(p)) - sizeof((p)->in_use))
+
 static spu_group_t* spu_find_group(uint32_t id)
 {
     for (int i = 0; i < MAX_SPU_GROUPS; i++) {
-        if (s_spu_groups[i].in_use && s_spu_groups[i].id == id)
+        if (SLOT_LIVE(&s_spu_groups[i]) && s_spu_groups[i].id == id)
             return &s_spu_groups[i];
     }
     return NULL;
@@ -409,14 +425,15 @@ static spu_group_t* spu_find_group(uint32_t id)
 static spu_group_t* spu_alloc_group(void)
 {
     for (int i = 0; i < MAX_SPU_GROUPS; i++) {
-        if (!s_spu_groups[i].in_use) {
-            memset(&s_spu_groups[i], 0, sizeof(s_spu_groups[i]));
-            s_spu_groups[i].in_use = 1;
-            s_spu_groups[i].id     = s_spu_next_group_id++;
-            s_spu_groups[i].state  = SPU_GROUP_STATE_NOT_INITIALIZED;
-            s_spu_groups[i].exit_status = 0;
-            s_spu_groups[i].cause  = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
-            return &s_spu_groups[i];
+        spu_group_t* g = &s_spu_groups[i];
+        if (slot_claim(&g->in_use)) {
+            SLOT_CLEAR(g);
+            g->id          = __atomic_fetch_add(&s_spu_next_group_id, 1, __ATOMIC_RELAXED);
+            g->state       = SPU_GROUP_STATE_NOT_INITIALIZED;
+            g->exit_status = 0;
+            g->cause       = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
+            SLOT_PUBLISH(g);
+            return g;
         }
     }
     return NULL;
@@ -425,7 +442,7 @@ static spu_group_t* spu_alloc_group(void)
 static spu_thread_t* spu_find_thread(uint32_t tid)
 {
     for (int i = 0; i < MAX_SPU_THREADS; i++) {
-        if (s_spu_threads[i].in_use && s_spu_threads[i].tid == tid)
+        if (SLOT_LIVE(&s_spu_threads[i]) && s_spu_threads[i].tid == tid)
             return &s_spu_threads[i];
     }
     return NULL;
@@ -434,11 +451,12 @@ static spu_thread_t* spu_find_thread(uint32_t tid)
 static spu_thread_t* spu_alloc_thread(void)
 {
     for (int i = 0; i < MAX_SPU_THREADS; i++) {
-        if (!s_spu_threads[i].in_use) {
-            memset(&s_spu_threads[i], 0, sizeof(s_spu_threads[i]));
-            s_spu_threads[i].in_use = 1;
-            s_spu_threads[i].tid    = s_spu_next_thread_id++;
-            return &s_spu_threads[i];
+        spu_thread_t* t = &s_spu_threads[i];
+        if (slot_claim(&t->in_use)) {
+            SLOT_CLEAR(t);
+            t->tid = __atomic_fetch_add(&s_spu_next_thread_id, 1, __ATOMIC_RELAXED);
+            SLOT_PUBLISH(t);
+            return t;
         }
     }
     return NULL;
@@ -499,7 +517,7 @@ static int spu_limits_busy(uint32_t spu_limit, uint32_t raw_limit,
 {
     for (int i = 0; i < MAX_SPU_GROUPS; i++) {
         const spu_group_t* g = &s_spu_groups[i];
-        if (!g->in_use) continue;
+        if (!SLOT_LIVE(g)) continue;
         if (g->type & 0x20) {
             system_coop++;
             if (controllable < 1) controllable = 1;
@@ -981,6 +999,12 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
 int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
 {
     if (!getenv("RD_SPU_INTERP")) return 0;
+    /* This re-runs a worker on the calling PPU thread, which is only right in
+     * the synchronous sim mode, where the worker has no host thread of its
+     * own. With real SPU threads (RD_SPU_INTERP_ASYNC) the worker is already
+     * running and drains its own queue; a second run here would execute the
+     * same SPU program twice at once. */
+    if (getenv("RD_SPU_INTERP_ASYNC")) return 0;
     /* Two callers reach here: an event-port send, which carries the frame's
      * work descriptor in data2, and the blocking-receive path, which has none
      * and passes 0. A worker started without a descriptor reads an empty inbox,
@@ -995,7 +1019,7 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
     }
     for (uint32_t i = 0; i < MAX_SPU_THREADS; i++) {
         spu_thread_t* t = &s_spu_threads[i];
-        if (!t->in_use || t->connected_queue != comp_queue || !t->img_ea) continue;
+        if (!SLOT_LIVE(t) || t->connected_queue != comp_queue || !t->img_ea) continue;
         uint8_t* ls = spu_thread_get_or_alloc_ls(t);
         if (!ls) return 0;
         uint32_t entry = spu_load_image_to_ls(t, ls);
@@ -1017,7 +1041,7 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
          * pointers are where the job DMAs from and to, so a job that writes
          * only scratch is either reading the wrong descriptor or the descriptor
          * does not name the buffer we expect. */
-        { static int _wd = -1; if (_wd < 0) _wd = getenv("SPU_WORKDESC_DUMP") ? 1 : 0;
+        { static _Atomic int _wd = -1; if (_wd < 0) _wd = getenv("SPU_WORKDESC_DUMP") ? 1 : 0;
           if (_wd && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 3) {
               fprintf(stderr, "[WORKDESC] tid=0x%X ea=0x%08X:%c", t->tid, work_ea, 10);
               for (int r = 0; r < 16; r++) {
@@ -1026,13 +1050,13 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
                       fprintf(stderr, " %08X", vm_read_be32(work_ea + r*16 + c*4));
                   fprintf(stderr, "%c", 10);
               } } } }
-        { static int _wh = -1; if (_wh < 0) _wh = getenv("SPU_WORKDESC_HDR") ? 1 : 0;
+        { static _Atomic int _wh = -1; if (_wh < 0) _wh = getenv("SPU_WORKDESC_HDR") ? 1 : 0;
           if (_wh && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 40)
               fprintf(stderr, "[WORKHDR] tid=0x%X ea=0x%08X w0=%u w1=%u f2=%g f3=%g%c",
                       t->tid, work_ea, vm_read_be32(work_ea), vm_read_be32(work_ea+4),
                       (double)*(const float*)&(const uint32_t){0}, 0.0, 10); }
           if (_wh && work_ea > 0x1000000u && vm_base) { } }
-        { static int _sd = -1; if (_sd < 0) _sd = getenv("SPU_SEED_DBG") ? 1 : 0;
+        { static _Atomic int _sd = -1; if (_sd < 0) _sd = getenv("SPU_SEED_DBG") ? 1 : 0;
           if (_sd) { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 12)
               fprintf(stderr, "[SPU-SEED] tid=0x%X entry=0x%05X args=0x%08X seed=0x%08X%c",
                       t->tid, entry, t->args_ea, work_ea, 10); } }
@@ -1043,7 +1067,7 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
         LARGE_INTEGER _t0, _t1, _fq; QueryPerformanceCounter(&_t0);
         int32_t frc = spu_run_interp_job(ls, entry, t->args, -1, t->tid, t->group_id,
                                          getenv("RD_SPU_FRAME_MBOX") ? work_ea : 0u);
-        { static int _sp = -1; if (_sp < 0) _sp = getenv("SPU_SPEED") ? 1 : 0;
+        { static _Atomic int _sp = -1; if (_sp < 0) _sp = getenv("SPU_SPEED") ? 1 : 0;
           if (_sp) { QueryPerformanceCounter(&_t1); QueryPerformanceFrequency(&_fq);
               extern SPU_THREAD_LOCAL uint64_t g_spu_interp_steps;
               double sec = (double)(_t1.QuadPart - _t0.QuadPart) / (double)_fq.QuadPart;
@@ -1101,7 +1125,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
       static int s_d = 0;
       if (vm_base && s_d < 4) {
         s_d++;
-        static int _idump = -1;
+        static _Atomic int _idump = -1;
         if (_idump < 0) _idump = getenv("YDKJ_INSTDUMP") ? 1 : 0;
         /* Dump BOTH candidate instance addrs: the real one is 0x40009F00 (init arg);
          * 0x40009D00 was the old hardcoded guess. See which libsre actually populated. */
@@ -1145,7 +1169,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         uint32_t idx = g->thread_indices[i];
         if (idx >= MAX_SPU_THREADS) continue;
         spu_thread_t* t = &s_spu_threads[idx];
-        if (!t->in_use) continue;
+        if (!SLOT_LIVE(t)) continue;
 
         /* Real SPU execution first. If the title registered lifted code for
          * this thread's image, the thread runs THAT -- on its own host thread,
@@ -1484,10 +1508,10 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
                     free(t->sctx);
                     t->sctx = NULL;
                 }
-                t->in_use = 0;
+                SLOT_FREE(t);
             }
         }
-        g->in_use = 0;
+        SLOT_FREE(g);
     }
     fprintf(stderr, "[SPU] group_destroy id=0x%X  caller_lr=0x%08X cia=0x%08X r3..r6=%08X %08X %08X %08X\n",
             id, (uint32_t)ctx->lr, (uint32_t)ctx->cia,
@@ -2063,7 +2087,7 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
     uint32_t ls_offset = (uint32_t)ctx->gpr[4];
     uint32_t value_ea  = (uint32_t)ctx->gpr[5];
     uint32_t type      = (uint32_t)ctx->gpr[6];
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
+    { static _Atomic int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
       static int n = 0;
       if (s_t && __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 12)
           { extern void ppu_guest_caller(char*, size_t);
@@ -2084,7 +2108,7 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
               v = (v << 8) | jls[ls_offset + k];
           for (int k = 0; k < 8; k++)
               vm_base[value_ea + k] = (uint8_t)(v >> (56 - 8 * k));
-          { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
+          { static _Atomic int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
             static int n = 0;
             if (s_t && __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 8)
                 fprintf(stderr, "[spu-readls] chain 0x%08X off=0x%05X -> 0x%llX\n",
@@ -2445,7 +2469,7 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
         else         spu_channel_overwrite(ch, val);      /* one word, replaced */
         extern void spu_ch_wake(spu_context*);
         spu_ch_wake(sc);
-        { static int n = 0; if (n < 12) { n++;
+        { static _Atomic int n = 0; if (n < 12) { n++;
             fprintf(stderr, "[SPU] write_snr tid=0x%X snr%u <- 0x%08X (%s)\n",
                     tid, num + 1, val, or_mode ? "OR" : "overwrite");
             fflush(stderr); } }
@@ -2741,7 +2765,7 @@ int lv2_try_syscall(ppu_context* ctx)
     /* LV2_ERRDBG=1: every syscall that returns non-OK, deduped by (number,
      * result). A guest that asserts on a result once per frame is easier to
      * find from this side than by reading its lifted code. */
-    { static int _ed = -1; if (_ed < 0) _ed = getenv("LV2_ERRDBG") ? 1 : 0;
+    { static _Atomic int _ed = -1; if (_ed < 0) _ed = getenv("LV2_ERRDBG") ? 1 : 0;
       if (_ed && (int32_t)ctx->gpr[3] != 0) {
           static uint64_t seen[64]; static int ns = 0;
           uint64_t k = ((uint64_t)num << 32) | (uint32_t)ctx->gpr[3];
