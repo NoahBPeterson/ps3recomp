@@ -341,8 +341,10 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
  * once two ran concurrently. */
 #define SPU_MAX_CONTEXTS 128
 
+/* `ctx` is read with no lock by every lookup and written by claim/release:
+ * atomic, release on publish so the initialised engine is seen with it. */
 typedef struct {
-    spu_context* volatile ctx;
+    spu_context* ctx;
     mfc_engine   mfc;
 } spu_mfc_slot;
 
@@ -352,7 +354,7 @@ static SRWLOCK      s_mfc_claim_lock = SRWLOCK_INIT;
 static mfc_engine* mfc_for(spu_context* ctx)
 {
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
-        if (s_mfc_slots[i].ctx == ctx)
+        if (__atomic_load_n(&s_mfc_slots[i].ctx, __ATOMIC_ACQUIRE) == ctx)
             return &s_mfc_slots[i].mfc;
 
     /* No slot yet: take one. The engine is initialized before the slot is
@@ -360,9 +362,9 @@ static mfc_engine* mfc_for(spu_context* ctx)
     mfc_engine* e = NULL;
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
     for (int i = 0; i < SPU_MAX_CONTEXTS && !e; i++) {
-        if (s_mfc_slots[i].ctx != NULL) continue;
+        if (__atomic_load_n(&s_mfc_slots[i].ctx, __ATOMIC_RELAXED) != NULL) continue;
         mfc_engine_init(&s_mfc_slots[i].mfc);
-        s_mfc_slots[i].ctx = ctx;
+        __atomic_store_n(&s_mfc_slots[i].ctx, ctx, __ATOMIC_RELEASE);
         e = &s_mfc_slots[i].mfc;
     }
     if (!e) {
@@ -401,8 +403,8 @@ void spu_mfc_release(spu_context* ctx)
     if (!ctx) return;
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
-        if (s_mfc_slots[i].ctx != ctx) continue;
-        s_mfc_slots[i].ctx = NULL;
+        if (__atomic_load_n(&s_mfc_slots[i].ctx, __ATOMIC_RELAXED) != ctx) continue;
+        __atomic_store_n(&s_mfc_slots[i].ctx, NULL, __ATOMIC_RELEASE);
         break;
     }
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
@@ -429,7 +431,7 @@ extern uint8_t* vm_base;
 
 /* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
  * the delta across one policy run to find the run that performed a claim. */
-volatile unsigned g_spu_putllc_count = 0;
+unsigned g_spu_putllc_count = 0;
 /* PUTLLCs that hit the WATCHED sync line (g_barrier_sync_watch) -- isolates the
  * work-run on the stalled job queue from the dozen idle jobmanager instances. */
 volatile unsigned g_spu_putllc_sync_hit = 0;
@@ -694,7 +696,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 1;
 
     case MFC_PUTLLC_CMD:
-        g_spu_putllc_count++;   /* run-scoped delta read by the PM flow trace */
+        __atomic_fetch_add(&g_spu_putllc_count, 1u, __ATOMIC_RELAXED);   /* read by the PM flow trace */
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
@@ -890,7 +892,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         { static int _d = -1; if (_d < 0) _d = getenv("SPU_DBG_MBOX") ? 1 : 0;
           if (_d) { static unsigned long _n = 0; if (++_n <= 24)
             fprintf(stderr, "[spu-outmbox] spu=%X wrote 0x%08X depth=%u\n",
-                    ctx->spu_id, v, (unsigned)ctx->ch_out_mbox.count); } }
+                    ctx->spu_id, v, (unsigned)spu_channel_count(&ctx->ch_out_mbox)); } }
         { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_MBOXTRACE") ? 1 : 0;
           if (s_t) fprintf(stderr, "[spu-mbox] OUT  grp=0x%X spu=0x%X val=0x%08X\n",
                            ctx->spu_group_id, ctx->spu_id, v); }
@@ -989,9 +991,9 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
 {
     if (channel == SPU_RdEventStat) spu_resv_lost_poll(ctx);
     switch (channel) {
-    case SPU_RdInMbox:      return ctx->rcv_evt_n != 0 || ctx->ch_in_mbox.count != 0;
-    case SPU_RdSigNotify1:  return ctx->ch_sig_notify[0].count != 0;
-    case SPU_RdSigNotify2:  return ctx->ch_sig_notify[1].count != 0;
+    case SPU_RdInMbox:      return ctx->rcv_evt_n != 0 || spu_channel_count(&ctx->ch_in_mbox) != 0;
+    case SPU_RdSigNotify1:  return spu_channel_count(&ctx->ch_sig_notify[0]) != 0;
+    case SPU_RdSigNotify2:  return spu_channel_count(&ctx->ch_sig_notify[1]) != 0;
     case SPU_RdEventStat:   return (ctx->event_status & ctx->event_mask) != 0;
     default:                return 1;   /* non-blocking channels: always ready */
     }
@@ -1153,9 +1155,9 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
           if (channel < 40u) c[sp][channel]++;
           lastpc[sp] = (uint32_t)ctx->pc & SPU_LS_MASK;
           lastst[sp] = ctx->event_status; lastmask[sp] = ctx->event_mask;
-          lastsig[sp][0] = ctx->ch_sig_notify[0].count;
-          lastsig[sp][1] = ctx->ch_sig_notify[1].count;
-          lastmb[sp] = ctx->ch_in_mbox.count;
+          lastsig[sp][0] = spu_channel_count(&ctx->ch_sig_notify[0]);
+          lastsig[sp][1] = spu_channel_count(&ctx->ch_sig_notify[1]);
+          lastmb[sp] = spu_channel_count(&ctx->ch_in_mbox);
           lastrv[sp] = ctx->resv_valid; lastrea[sp] = ctx->resv_ea;
           lastlsa[sp] = ctx->mfc_lsa & SPU_LS_MASK;
           lastr90[sp] = ctx->gpr[90]._u32[0];
@@ -1275,11 +1277,11 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
          * has arrived, and parking on an "empty" inbox that actually holds the
          * reply strands it. */
         if (ctx->park_on_empty_inmbox && ctx->rcv_evt_n == 0 &&
-            ctx->ch_in_mbox.count == 0) {
+            spu_channel_count(&ctx->ch_in_mbox) == 0) {
             extern void spu_halt(spu_context*);
             spu_halt(ctx);
         }
-        return (uint32_t)ctx->rcv_evt_n + ctx->ch_in_mbox.count;           /* readable */
+        return (uint32_t)ctx->rcv_evt_n + spu_channel_count(&ctx->ch_in_mbox);           /* readable */
     /* Free slots, CLAMPED. The queue behind each channel is SPU_CHANNEL_CAP
      * deep -- deeper than the hardware depth reported here -- so `count` can
      * exceed the depth and a bare subtraction underflows, telling the SPU it
@@ -1287,13 +1289,13 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
      * into an unbounded one for any title that polls before writing, which is
      * every SPU-heavy one. */
     case SPU_WrOutMbox:
-        return ctx->ch_out_mbox.count >= SPU_MBOX_DEPTH
-             ? 0u : (uint32_t)(SPU_MBOX_DEPTH - ctx->ch_out_mbox.count);
+        return spu_channel_count(&ctx->ch_out_mbox) >= SPU_MBOX_DEPTH
+             ? 0u : (uint32_t)(SPU_MBOX_DEPTH - spu_channel_count(&ctx->ch_out_mbox));
     case SPU_WrOutIntrMbox:
-        return ctx->ch_out_intr_mbox.count >= SPU_INTR_MBOX_DEPTH
-             ? 0u : (uint32_t)(SPU_INTR_MBOX_DEPTH - ctx->ch_out_intr_mbox.count);
-    case SPU_RdSigNotify1:   return ctx->ch_sig_notify[0].count;
-    case SPU_RdSigNotify2:   return ctx->ch_sig_notify[1].count;
+        return spu_channel_count(&ctx->ch_out_intr_mbox) >= SPU_INTR_MBOX_DEPTH
+             ? 0u : (uint32_t)(SPU_INTR_MBOX_DEPTH - spu_channel_count(&ctx->ch_out_intr_mbox));
+    case SPU_RdSigNotify1:   return spu_channel_count(&ctx->ch_sig_notify[0]);
+    case SPU_RdSigNotify2:   return spu_channel_count(&ctx->ch_sig_notify[1]);
     case MFC_Cmd:            return MFC_QUEUE_DEPTH - mfc_for(ctx)->queue_count;
     /* An enabled event pending, or 0 -- NOT the `default: 1` this used to fall
      * through to. The SPU idiom is `rchcnt SPU_RdEventStat; brnz -> rdch`: it

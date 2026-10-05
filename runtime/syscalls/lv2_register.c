@@ -750,6 +750,11 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea, uint32_t args
 /* One lock and condition for every group's run state (start, thread
  * completion, join, terminate). */
 static SRWLOCK            s_grp_lock = SRWLOCK_INIT;
+/* Guards spu_thread_t.live_ctx. The context it points at is a stack local of
+ * the run that published it: a PPU thread writing that context's mailbox or
+ * signal registers holds this shared, and the run takes it exclusive to
+ * unpublish, so it cannot return (and free the frame) mid-write. */
+static SRWLOCK            s_live_ctx_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_grp_cv   = CONDITION_VARIABLE_INIT;
 
 /* The run is over (lock held): settle cause and status, return the group to
@@ -800,7 +805,7 @@ static void spu_group_reap(spu_group_t* g)
         uint32_t idx = g->thread_indices[i];
         if (idx >= MAX_SPU_THREADS) continue;
         spu_thread_t* t = &s_spu_threads[idx];
-        if (!t->host_live || t->running) continue;
+        if (!t->host_live || __atomic_load_n(&t->running, __ATOMIC_ACQUIRE)) continue;
 #ifdef _WIN32
         if (t->host_thread) { WaitForSingleObject(t->host_thread, INFINITE); CloseHandle(t->host_thread); }
         t->host_thread = NULL;
@@ -832,11 +837,11 @@ static void* spu_exec_thread_proc(void* arg)
     spu_lifted_thread_run(t->sctx, &r);
     t->exit_status = r.exit_status;
 #ifdef _WIN32
-    t->running = 0;
+    __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
     SetEvent(t->finish_event);
 #else
     pthread_mutex_lock(&t->finish_event.mu);
-    t->running = 0;
+    __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
     t->finish_event.done = 1;
     pthread_cond_broadcast(&t->finish_event.cv);
     pthread_mutex_unlock(&t->finish_event.mu);
@@ -883,11 +888,11 @@ static void* spu_fallback_thread_proc(void* arg)
         const int gx = t->fb_handler == spu_interp_fallback && g_spu_interp_group_exit_valid;
         const int32_t gs = g_spu_interp_group_exit_status;
 #ifdef _WIN32
-        t->running = 0;
+        __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
         SetEvent(t->finish_event);
 #else
         pthread_mutex_lock(&t->finish_event.mu);
-        t->running = 0;
+        __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
         t->finish_event.done = 1;
         pthread_cond_broadcast(&t->finish_event.cv);
         pthread_mutex_unlock(&t->finish_event.mu);
@@ -939,7 +944,7 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
             tid, entry, t->img_ea, args_ea);
     int32_t sc = spu_run_interp_job(ls, entry, t->args, -1,  /* pure interp: no fast-path rejoin */
                                     t->tid, t->group_id, 0); /* identify for mbox->event delivery */
-    { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
+    { extern SPU_THREAD_LOCAL uint32_t g_spu_interp_last_pc; extern SPU_THREAD_LOCAL uint64_t g_spu_interp_steps;
       fprintf(stderr, "[SPU-INTERP] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
               tid, sc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }
     { extern SPU_THREAD_LOCAL int g_spu_interp_exit_valid;
@@ -1021,13 +1026,13 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
                                          getenv("RD_SPU_FRAME_MBOX") ? work_ea : 0u);
         { static int _sp = -1; if (_sp < 0) _sp = getenv("SPU_SPEED") ? 1 : 0;
           if (_sp) { QueryPerformanceCounter(&_t1); QueryPerformanceFrequency(&_fq);
-              extern uint64_t g_spu_interp_steps;
+              extern SPU_THREAD_LOCAL uint64_t g_spu_interp_steps;
               double sec = (double)(_t1.QuadPart - _t0.QuadPart) / (double)_fq.QuadPart;
               static int _n = 0; if (_n++ < 20)
                   fprintf(stderr, "[spu-speed] tid=0x%X %llu insns in %.3f s = %.1f M/s%c",
                           t->tid, (unsigned long long)g_spu_interp_steps, sec,
                           sec > 0 ? g_spu_interp_steps / sec / 1e6 : 0.0, 10); } }
-        { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
+        { extern SPU_THREAD_LOCAL uint32_t g_spu_interp_last_pc; extern SPU_THREAD_LOCAL uint64_t g_spu_interp_steps;
           fprintf(stderr, "[SPU-FRAME] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
                   t->tid, frc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }
         return 1;
@@ -1128,7 +1133,19 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
          * as a real SPU would, with group_join waiting on it exactly as it
          * waits on a fallback thread. Images with no lifted code fall through
          * to the fallback and interpreter paths below, unchanged. */
-        if (spu_lifted_thread_available(t->entry_point)) {
+        /* Which lifted image is this? By content first: images very often
+         * share an entry address (every plain SPU program starting at LS 0),
+         * so "some image has a function at the entry" picks one of them
+         * arbitrarily, and the thread would run another program's code. The
+         * fingerprint names the image exactly; the entry lookup stays for
+         * images registered without one. */
+        int fp_img = 0;
+        if (t->img_src && vm_base) {
+            size_t isz = spu_elf_image_size(vm_base + t->img_src, 1u << 20);
+            if (isz && !spu_workload_find_img(spu_workload_fingerprint(vm_base + t->img_src, isz), &fp_img))
+                fp_img = 0;
+        }
+        if (fp_img > 0 || spu_lifted_thread_available(t->entry_point)) {
             if (!t->sctx) t->sctx = (spu_context*)calloc(1, sizeof(spu_context));
             if (t->sctx) {
                 spu_lifted_thread_desc d;
@@ -1136,11 +1153,12 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 d.group_id = id;
                 d.entry    = t->entry_point;
                 d.img_ea   = t->img_ea;
+                d.image_id = fp_img;
                 d.segs     = (const struct lv2_spu_seg_s*)t->segs;
                 d.nsegs    = t->nsegs;
                 for (int a = 0; a < 4; a++) d.args[a] = t->args[a];
                 spu_lifted_thread_setup(t->sctx, &d);
-                t->running = 1;
+                __atomic_store_n(&t->running, 1, __ATOMIC_RELEASE);
                 t->run_gen = gen;
                 t->host_live = 1;
                 AcquireSRWLockExclusive(&s_grp_lock); g->running++; ReleaseSRWLockExclusive(&s_grp_lock);
@@ -1235,13 +1253,13 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         }
         if (!fb) {
             t->exit_status = 0;
-            t->running = 0;
+            __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
             instant++; nofb++;
             continue;
         }
         t->fb_handler = fb;
         t->fb_user    = user;
-        t->running    = 1;
+        __atomic_store_n(&t->running, 1, __ATOMIC_RELEASE);
         /* Interpreted sim jobs are fire-and-forget compute (DMA in -> compute ->
          * DMA out -> stop) that don't block on PPU input mid-run. Running them on
          * an async host thread races the PPU's own use of the results (e.g. the
@@ -1261,7 +1279,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
             extern SPU_THREAD_LOCAL int g_spu_interp_group_exit_valid;
             extern SPU_THREAD_LOCAL int32_t g_spu_interp_group_exit_status;
             t->exit_status = fb(t->tid, t->args_ea, t->args_size, user);
-            t->running = 0;
+            __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
             if (g_spu_interp_group_exit_valid) {
                 AcquireSRWLockExclusive(&s_grp_lock);
                 if (g->state == SPU_GROUP_STATE_RUNNING && g->run_gen == gen) {
@@ -1305,13 +1323,15 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
          *
          * Bounded, so a worker that dies during init cannot hang group_start. */
         if (fb == spu_registry_fallback || fb == spu_interp_fallback) {
-            for (int spin = 0; spin < 2000 && !t->live_ctx && t->running; spin++)
+            for (int spin = 0; spin < 2000 && !__atomic_load_n(&t->live_ctx, __ATOMIC_ACQUIRE) &&
+                               __atomic_load_n(&t->running, __ATOMIC_ACQUIRE); spin++)
 #ifdef _WIN32
                 Sleep(1);
 #else
                 { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
 #endif
-            if (!t->live_ctx && t->running)
+            if (!__atomic_load_n(&t->live_ctx, __ATOMIC_ACQUIRE) &&
+                __atomic_load_n(&t->running, __ATOMIC_ACQUIRE))
                 fprintf(stderr, "[SPU] group_start tid=0x%X: worker never published "
                         "a context -- mailbox writes will fall back to re-runs\n",
                         t->tid);
@@ -1473,7 +1493,7 @@ static int64_t sys_spu_thread_get_exit_status_handler(ppu_context* ctx)
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
         return -1;
     }
-    if (t->running) {
+    if (__atomic_load_n(&t->running, __ATOMIC_ACQUIRE)) {
         /* Still in flight — Sony's behaviour. Games that want the exit code
          * synchronously should call group_join first. */
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010003; /* CELL_ESTAT */
@@ -1573,73 +1593,28 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
     /* Preferred path: the worker is alive and blocked in rdch on its own host
      * thread. Write its mailbox and wake it, so it resumes exactly where it was
      * with its registers intact. */
+    AcquireSRWLockShared(&s_live_ctx_lock);
     if (t->live_ctx || t->sctx) {
         extern void spu_ch_wake(spu_context* c);
         spu_context* c = t->live_ctx ? (spu_context*)t->live_ctx : t->sctx;
 
-        /* Back-pressure. The inbound mailbox is a single slot and
-         * spu_channel_write overwrites unconditionally, so a PPU thread writing
-         * faster than the worker drains silently destroyed commands: this title
-         * managed 42,562 writes against 32 replies. Hardware reports a FULL
-         * mailbox instead and the caller retries -- which the game already does,
-         * in exactly the tight loop that made the flood visible. Report busy and
-         * drop nothing.
-         *
-         * Still wake the worker: it is the only thing that can drain the slot,
-         * and a missed wake here would turn back-pressure into a livelock. */
-        /* Full mailbox: WAIT for the worker to drain it, do not reject.
-         *
-         * The slot is single-entry and spu_channel_write overwrites, so a write
-         * arriving while the previous command is unread would destroy it. The
-         * first attempt at fixing that returned CELL_EBUSY, on the theory that
-         * the caller retries -- and one code path does, spinning thousands of
-         * times and burning CPU the renderer needs. But another path does NOT
-         * retry: it writes once, takes the error as "sent", and goes straight to
-         * sys_event_queue_receive. That deadlocks outright -- the worker waits
-         * for a command that was refused while the PPU waits for its reply.
-         *
-         * Waiting fixes both: no command is ever dropped, and a PPU thread that
-         * would otherwise spin sleeps instead. Real hardware has a 4-deep inbox,
-         * so this blocks far more often than it should -- a proper FIFO would be
-         * the faithful fix.
-         *
-         * ponytail: bounded 250 ms so a wedged worker degrades to the old EBUSY
-         * instead of hanging the PPU thread forever. */
-        if (spu_channel_has_data(&c->ch_in_mbox)) {
-            spu_ch_wake(c);                       /* only it can drain the slot */
-            int waited = 0;
-            while (spu_channel_has_data(&c->ch_in_mbox) && waited < 250) {
-#ifdef _WIN32
-                Sleep(1);
-#else
-                { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
-#endif
-                waited++;
-            }
-            if (spu_channel_has_data(&c->ch_in_mbox)) {
-                static int _n = 0;
-                if (_n++ < 8)
-                    fprintf(stderr, "[SPU] write_spu_mb tid=0x%X val=0x%08X -> BUSY after "
-                            "%d ms (mailbox still holds 0x%08X)\n",
-                            tid, val, waited, c->ch_in_mbox.value);
-                ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EBUSY;
-                return (int64_t)(int32_t)CELL_EBUSY;
-            }
-            { static int _n = 0;
-              if (_n++ < 8)
-                  fprintf(stderr, "[SPU] write_spu_mb tid=0x%X: waited %d ms for the "
-                          "mailbox to drain\n", tid, waited); }
-        }
-
+        /* The inbound mailbox is four deep, and a write to a full one replaces
+         * its newest entry: it neither fails nor waits (RPCS3 and the CBEA
+         * agree; tests/conformance/mc mcx X2). Earlier versions made it one
+         * deep and blocked the writer up to 250 ms per word, then failed with
+         * CELL_EBUSY -- a title that writes a multi-word command in one go
+         * saw its second word refused. */
         { static int _n = 0;
           if (_n++ < 32)
               fprintf(stderr, "[SPU] write_spu_mb tid=0x%X val=0x%08X -> live worker\n",
                       tid, val); }
-        spu_channel_write(&c->ch_in_mbox, val);
+        spu_channel_push_inmbox(&c->ch_in_mbox, val);
         spu_ch_wake(c);
+        ReleaseSRWLockShared(&s_live_ctx_lock);
         ctx->gpr[3] = 0;
         return 0;
     }
+    ReleaseSRWLockShared(&s_live_ctx_lock);
 
     /* Fallback: no run in flight (the worker finished). Queue the word and
      * re-run it from its entry with the value pre-loaded. */
@@ -1741,7 +1716,7 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
      * 128 acknowledges the result; 192 is the impatient, no-ack form. */
     if (code == 128 || code == 192) {
         uint32_t result = CELL_EINVAL;
-        if (spu->ch_out_mbox.count) {
+        if (spu_channel_count(&spu->ch_out_mbox)) {
             uint32_t flag_id = spu_channel_read(&spu->ch_out_mbox);
             uint32_t bit = value & 0xFFFFFFu;
             if (bit < 64) {
@@ -1756,7 +1731,7 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
     }
     if (code >= 128) return 0;
     uint32_t result = CELL_EINVAL;
-    if (spu->ch_out_mbox.count) {
+    if (spu_channel_count(&spu->ch_out_mbox)) {
         uint32_t data = spu_channel_read(&spu->ch_out_mbox);
         unsigned port = code & 63;
         uint32_t queue = 0;
@@ -1886,7 +1861,7 @@ static int spu_lv2_stop_service(spu_context* spu)
     if (spu->stop_code != 0x110 && spu->stop_code != 0x111) return 0;
     spu_thread_t* t = spu_find_thread(spu->spu_id);
     if (!t) return 0;
-    uint32_t num = spu->ch_out_mbox.count ? spu_channel_read(&spu->ch_out_mbox) : 0xFFFFFFFFu;
+    uint32_t num = spu_channel_count(&spu->ch_out_mbox) ? spu_channel_read(&spu->ch_out_mbox) : 0xFFFFFFFFu;
     uint32_t queue = 0;
     for (int i = 0; i < t->q_bind_n; i++)
         if (t->q_bind[i].num == num) { queue = t->q_bind[i].queue; break; }
@@ -2114,7 +2089,10 @@ uint32_t spu_thread_get_group_id(uint32_t tid)
 void spu_thread_publish_ctx(uint32_t tid, void* c)
 {
     spu_thread_t* t = spu_find_thread(tid);
-    if (t) t->live_ctx = c;
+    if (!t) return;
+    AcquireSRWLockExclusive(&s_live_ctx_lock);
+    __atomic_store_n(&t->live_ctx, c, __ATOMIC_RELEASE);
+    ReleaseSRWLockExclusive(&s_live_ctx_lock);
 }
 
 /* Public: consume the pending inbound-mailbox command for a SPU thread, if any.
@@ -2393,14 +2371,13 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005;
         return -1;
     }
+    AcquireSRWLockShared(&s_live_ctx_lock);
     spu_context* sc = t->live_ctx ? (spu_context*)t->live_ctx : t->sctx;
     if (sc) {
         spu_channel* ch = &sc->ch_sig_notify[num];
         int or_mode = (t->spu_cfg >> num) & 1;
-        if (or_mode && ch->count)
-            ch->value |= val;
-        else
-            spu_channel_write(ch, val);
+        if (or_mode) spu_channel_or(ch, val);
+        else         spu_channel_overwrite(ch, val);      /* one word, replaced */
         extern void spu_ch_wake(spu_context*);
         spu_ch_wake(sc);
         { static int n = 0; if (n < 12) { n++;
@@ -2408,6 +2385,7 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
                     tid, num + 1, val, or_mode ? "OR" : "overwrite");
             fflush(stderr); } }
     }
+    ReleaseSRWLockShared(&s_live_ctx_lock);
     ctx->gpr[3] = 0;
     return 0;
 }

@@ -191,7 +191,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
     uint64_t caller_tid = ctx->thread_id;
 
     /* Check for deadlock on non-recursive mutex */
-    if (!m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
+    if (!m->recursive && __atomic_load_n(&m->owner_tid, __ATOMIC_RELAXED) == caller_tid && __atomic_load_n(&m->lock_count, __ATOMIC_RELAXED) > 0) {
         return (int64_t)(int32_t)CELL_EDEADLK;
     }
 
@@ -229,7 +229,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
             if (waited == 0)
                 fprintf(stderr, "[mutex] tid=%llu blocked >5s on mutex %u held by tid=%llu (count %u)\n",
                         (unsigned long long)caller_tid, mutex_id,
-                        (unsigned long long)m->owner_tid, (unsigned)m->lock_count);
+                        (unsigned long long)__atomic_load_n(&m->owner_tid, __ATOMIC_RELAXED), (unsigned)__atomic_load_n(&m->lock_count, __ATOMIC_RELAXED));
         }
     } else {
         struct timespec ts;
@@ -247,8 +247,8 @@ int64_t sys_mutex_lock(ppu_context* ctx)
     }
 #endif
 
-    m->owner_tid = caller_tid;
-    m->lock_count++;
+    __atomic_store_n(&m->owner_tid, caller_tid, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&m->lock_count, 1, __ATOMIC_RELAXED);
     return CELL_OK;
 }
 
@@ -279,7 +279,7 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
      * the CS and causes random forever-blocks on later Enters).
      * EnterCriticalSection by the current owner is itself recursive and
      * never blocks, so this is safe and cheap. */
-    if (m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
+    if (m->recursive && __atomic_load_n(&m->owner_tid, __ATOMIC_RELAXED) == caller_tid && __atomic_load_n(&m->lock_count, __ATOMIC_RELAXED) > 0) {
 #ifdef _WIN32
         EnterCriticalSection(&m->cs);
 #else
@@ -293,7 +293,7 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
          * while the guest still believed it held the mutex. */
         pthread_mutex_lock(&m->mtx);
 #endif
-        m->lock_count++;
+        __atomic_fetch_add(&m->lock_count, 1, __ATOMIC_RELAXED);
         return CELL_OK;
     }
 
@@ -308,8 +308,8 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
     }
 #endif
 
-    m->owner_tid = caller_tid;
-    m->lock_count++;
+    __atomic_store_n(&m->owner_tid, caller_tid, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&m->lock_count, 1, __ATOMIC_RELAXED);
     return CELL_OK;
 }
 
@@ -331,7 +331,7 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
 
     uint64_t caller_tid = ctx->thread_id;
 
-    if (m->owner_tid != caller_tid) {
+    if (__atomic_load_n(&m->owner_tid, __ATOMIC_RELAXED) != caller_tid) {
         /* Real lv2 returns EPERM for a non-owner unlock (RPCS3
          * sys_mutex.h's lv2_mutex::try_unlock, oracle, no code copied:
          * "if (it.owner != cpu.id) return CELL_EPERM;"), not a made up
@@ -340,9 +340,9 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EPERM;
     }
 
-    m->lock_count--;
-    if (m->lock_count == 0) {
-        m->owner_tid = 0;
+    __atomic_fetch_sub(&m->lock_count, 1, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&m->lock_count, __ATOMIC_RELAXED) == 0) {
+        __atomic_store_n(&m->owner_tid, 0, __ATOMIC_RELAXED);
     }
 
 #ifdef _WIN32

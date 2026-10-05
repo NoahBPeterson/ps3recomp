@@ -40,7 +40,7 @@ void spu_lifted_thread_setup(spu_context* ctx, const spu_lifted_thread_desc* d)
      * case. Asking the registry which image owns the entry point gets the same
      * answer the title's own registration order implies, without the lv2 layer
      * having to know any image ids. */
-    { int img = spu_image_of_function(ctx->pc);
+    { int img = d->image_id > 0 ? d->image_id : spu_image_of_function(ctx->pc);
       ctx->image_id = (img >= 0) ? img : 0; }
 
     if (d->segs) lv2_spu_load_segments((const lv2_spu_seg*)d->segs, d->nsegs, ctx->ls);
@@ -81,14 +81,14 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
      * the selector, not the status (CBEA p97, SPU_Status.StopCode): 0x102
      * THREAD_EXIT carries this thread's status, 0x101 GROUP_EXIT the group's. */
     if (ctx->status == SPU_STATUS_STOPPED_BY_STOP &&
-        ctx->stop_code == 0x102u && ctx->ch_out_mbox.count) {
-        r.exit_status = (int32_t)ctx->ch_out_mbox.value;
-        ctx->ch_out_mbox.count = 0;
+        ctx->stop_code == 0x102u && spu_channel_count(&ctx->ch_out_mbox)) {
+        r.exit_status = (int32_t)spu_channel_peek(&ctx->ch_out_mbox);
+        spu_channel_clear(&ctx->ch_out_mbox);
     } else if (ctx->status == SPU_STATUS_STOPPED_BY_STOP &&
-               ctx->stop_code == 0x101u && ctx->ch_out_mbox.count) {
+               ctx->stop_code == 0x101u && spu_channel_count(&ctx->ch_out_mbox)) {
         r.group_exit   = 1;
-        r.group_status = (int32_t)ctx->ch_out_mbox.value;
-        ctx->ch_out_mbox.count = 0;
+        r.group_status = (int32_t)spu_channel_peek(&ctx->ch_out_mbox);
+        spu_channel_clear(&ctx->ch_out_mbox);
     } else {
         /* Anything else -- a halt from the dispatcher's unresolved-branch
          * unwind, or a stop code outside the exit protocol -- is a fault. The

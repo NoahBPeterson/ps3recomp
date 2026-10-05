@@ -20,9 +20,14 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 
 /* Work descriptor for the next SYS_SPU_THREAD_STOP_RECEIVE_EVENT service, set
  * by the event-port send that wakes a sim SPU. Single-slot: dispatch is
- * synchronous -- the sending PPU thread runs the SPU inline. */
-uint32_t g_spu_pending_evt[3];
-int      g_spu_pending_evt_valid;
+ * synchronous -- the sending PPU thread runs the SPU inline. Thread-local for
+ * exactly that reason: a global let an SPU running on its own host thread take
+ * whatever event a PPU had just staged, ahead of the ones queued before it
+ * (and the event was still queued as well) -- the mc suite's recv case saw its
+ * second and third events arrive swapped. Only the inline re-run on the
+ * sending thread can see the slot; every other SPU receives from its queue. */
+SPU_THREAD_LOCAL uint32_t g_spu_pending_evt[3];
+SPU_THREAD_LOCAL int      g_spu_pending_evt_valid;
 
 /* ---- decode: 32-bit insn -> fields (mirrors spu_disasm.spu_decode order) ---- */
 typedef struct {
@@ -357,14 +362,14 @@ static int spu_step(spu_context* ctx) {
     return 0;
 }
 
-uint32_t g_spu_interp_last_pc = 0;
+SPU_THREAD_LOCAL uint32_t g_spu_interp_last_pc = 0;   /* per run, read back on the running thread */
 /* Exit status of the last spu_run_interp_job on this host thread (stop 0x102). */
 SPU_THREAD_LOCAL int     g_spu_interp_exit_valid  = 0;
 SPU_THREAD_LOCAL int32_t g_spu_interp_exit_status = 0;
 /* ...and of a sys_spu_thread_group_exit (stop 0x101): the group's status. */
 SPU_THREAD_LOCAL int     g_spu_interp_group_exit_valid  = 0;
 SPU_THREAD_LOCAL int32_t g_spu_interp_group_exit_status = 0;
-uint64_t g_spu_interp_steps   = 0;
+SPU_THREAD_LOCAL uint64_t g_spu_interp_steps   = 0;
 
 /* Call-trace ring buffer for diagnosing SPU asserts (env SPU_CALLTRACE). */
 #define SPU_TRACE_N 32
