@@ -156,11 +156,17 @@ static inline void spu_ls_watch_hit(uint32_t lsa, int is_write, const uint8_t* p
 #define SPU_CHANNEL_CAP      64
 #define SPU_IN_MBOX_HW_DEPTH 4
 
+/* Shared between the SPU and its producers/consumers on other host threads
+ * (a PPU writing the inbound mailbox while the SPU reads it, the PPU polling
+ * the outbound one). Every write and read takes `lock`; `count` is published
+ * with release order so a reader that sees it non-zero also sees the word.
+ * Read the fields through the spu_channel_* helpers below, never directly. */
 typedef struct spu_channel {
     uint32_t value;   /* head: the value the next read returns */
     uint32_t count;   /* number of valid entries, 0..SPU_CHANNEL_CAP */
     uint32_t q[SPU_CHANNEL_CAP];
     uint32_t head;
+    uint32_t lock;    /* spinlock over value/count/q/head */
 } spu_channel;
 
 /* ---------------------------------------------------------------------------
@@ -686,8 +692,44 @@ static inline u128 spu_make_preferred_u32(uint32_t val)
  * -----------------------------------------------------------------------*/
 /* `value` stays the head, and `count` the number of entries, so the many places
  * that read those two fields directly keep working unchanged. */
+static inline void spu_channel_lock(spu_channel* ch)
+{
+    while (__atomic_exchange_n(&ch->lock, 1u, __ATOMIC_ACQUIRE)) {
+        while (__atomic_load_n(&ch->lock, __ATOMIC_RELAXED)) { }
+    }
+}
+static inline void spu_channel_unlock(spu_channel* ch)
+{
+    __atomic_store_n(&ch->lock, 0u, __ATOMIC_RELEASE);
+}
+
+/* Entries waiting. Safe from any thread; a non-zero answer means a following
+ * spu_channel_read finds the word. */
+static inline uint32_t spu_channel_count(const spu_channel* ch)
+{
+    return __atomic_load_n(&ch->count, __ATOMIC_ACQUIRE);
+}
+
+/* The word the next read returns, without consuming it (0 when empty). */
+static inline uint32_t spu_channel_peek(spu_channel* ch)
+{
+    spu_channel_lock(ch);
+    uint32_t v = ch->count ? ch->value : 0u;
+    spu_channel_unlock(ch);
+    return v;
+}
+
+static inline void spu_channel_clear(spu_channel* ch)
+{
+    spu_channel_lock(ch);
+    ch->head = 0;
+    __atomic_store_n(&ch->count, 0u, __ATOMIC_RELEASE);
+    spu_channel_unlock(ch);
+}
+
 static inline void spu_channel_write(spu_channel* ch, uint32_t val)
 {
+    spu_channel_lock(ch);
     if (ch->count >= SPU_CHANNEL_CAP) {
         /* Full. Hardware does not accept the write at all -- the sender polls
          * the free-slot count first -- so the NEW word is what is lost.
@@ -699,27 +741,75 @@ static inline void spu_channel_write(spu_channel* ch, uint32_t val)
          * looks plausible. The Orange Box sends CB.SPU a five-word descriptor
          * from five consecutive call sites -- one more than the mailbox is
          * deep -- so it meets this on every send. */
+        spu_channel_unlock(ch);
         return;
     }
     ch->q[(ch->head + ch->count) % SPU_CHANNEL_CAP] = val;
-    ch->count++;
     ch->value = ch->q[ch->head];
+    __atomic_store_n(&ch->count, ch->count + 1u, __ATOMIC_RELEASE);
+    spu_channel_unlock(ch);
 }
 
 static inline uint32_t spu_channel_read(spu_channel* ch)
 {
+    spu_channel_lock(ch);
     uint32_t val = ch->value;
     if (ch->count) {
         ch->head = (ch->head + 1u) % SPU_CHANNEL_CAP;
-        ch->count--;
-        if (ch->count) ch->value = ch->q[ch->head];
+        if (ch->count > 1u) ch->value = ch->q[ch->head];
+        __atomic_store_n(&ch->count, ch->count - 1u, __ATOMIC_RELEASE);
     }
+    spu_channel_unlock(ch);
     return val;
+}
+
+/* Signal-notification OR mode: a write merges into the pending word, or is
+ * the word when none is pending. One locked step, so a concurrent read
+ * either sees the merged word or takes the old one and leaves the new. */
+static inline void spu_channel_or(spu_channel* ch, uint32_t val)
+{
+    spu_channel_lock(ch);
+    if (ch->count) {
+        ch->q[ch->head] |= val;
+        ch->value = ch->q[ch->head];
+    } else {
+        ch->q[ch->head] = val;
+        ch->value = val;
+        __atomic_store_n(&ch->count, 1u, __ATOMIC_RELEASE);
+    }
+    spu_channel_unlock(ch);
+}
+
+/* A PPU write to an SPU's inbound mailbox: four entries, and a write to a full
+ * mailbox replaces the newest entry rather than failing or waiting (RPCS3 and
+ * the CBEA agree; the mcx suite's X2 pins it). */
+static inline void spu_channel_push_inmbox(spu_channel* ch, uint32_t val)
+{
+    spu_channel_lock(ch);
+    if (ch->count < SPU_IN_MBOX_HW_DEPTH) {
+        ch->q[(ch->head + ch->count) % SPU_CHANNEL_CAP] = val;
+        ch->value = ch->q[ch->head];
+        __atomic_store_n(&ch->count, ch->count + 1u, __ATOMIC_RELEASE);
+    } else {
+        ch->q[(ch->head + ch->count - 1u) % SPU_CHANNEL_CAP] = val;
+        ch->value = ch->q[ch->head];
+    }
+    spu_channel_unlock(ch);
+}
+
+/* A signal-notification register in overwrite mode: one word, replaced. */
+static inline void spu_channel_overwrite(spu_channel* ch, uint32_t val)
+{
+    spu_channel_lock(ch);
+    ch->q[ch->head] = val;
+    ch->value = val;
+    __atomic_store_n(&ch->count, 1u, __ATOMIC_RELEASE);
+    spu_channel_unlock(ch);
 }
 
 static inline int spu_channel_has_data(const spu_channel* ch)
 {
-    return ch->count > 0;
+    return spu_channel_count(ch) > 0;
 }
 
 /* ---------------------------------------------------------------------------

@@ -776,6 +776,10 @@ extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
 extern "C" void spu_coh_notify_write(uint32_t addr);
+extern "C" void spu_coh_notify_write_from_ppu(uint32_t addr);
+extern "C" void spu_coh_ppu_reserve(uint32_t ea);
+extern "C" int  spu_coh_ppu_holds(uint32_t ea);
+extern "C" void spu_coh_ppu_drop(void);
 
 /* ---------------------------------------------------------------------------
  * lwarx/stwcx. cross-thread reservation invalidation.
@@ -929,37 +933,26 @@ extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* r
 extern "C" uint32_t g_ww_lo, g_ww_hi;
 
 /* Line-granular reservations. On the Cell PPU a lwarx/ldarx reservation covers
- * the whole 128-byte line: the store-conditional fails if ANY byte of the line
- * changed, an SPU's PUTLLC included. Firmware relies on it -- libsre's
+ * the whole 128-byte line, and ANY store to the line by another agent clears
+ * it -- an SPU's PUT, PUTLLC or PUTLLUC, another PPU thread's store -- even one
+ * that writes the bytes already there. Firmware relies on it: libsre's
  * _cellSpursSendSignal reserves a taskset's line, reads every bitset in it, and
  * commits only `signalled`; were an SPU to set `waiting` in between and the
- * commit still succeed, the PPU would skip the workload wake-up that waiting
- * task needs and it would sleep forever. For lines shared with SPUs, the lifted
- * lwarx/ldarx snapshot the line here, and the store-conditional fails if it no
- * longer matches -- the rule SPU PUTLLC already follows. Thread-local, so the
- * ppu_context layout (shared with every existing lift) is unchanged; a lift
- * without the note keeps word-granular behaviour. */
-static PPU_THREAD_LOCAL uint8_t  t_resv_line[128];
-static PPU_THREAD_LOCAL uint32_t t_resv_line_ea;
-static PPU_THREAD_LOCAL int      t_resv_line_valid;
+ * commit still succeed, the PPU would skip the wake-up that waiting task needs.
+ *
+ * The lifted lwarx/ldarx call this after the load: it registers the
+ * reservation with the coherence layer (spu_coh_ppu_reserve), which routes
+ * every writer of the line through a notify that clears it; the
+ * store-conditional then succeeds only if it is still held. A lift without
+ * the note keeps the word-granular compare-and-swap. (mcx suite, X1.) */
+static PPU_THREAD_LOCAL int t_resv_noted;
 
 extern "C" void ppu_resv_line_note(uint64_t ea)
 {
-    const uint32_t line = (uint32_t)ea & ~127u;
-    if (!spu_coh_is_reserved(line)) { t_resv_line_valid = 0; return; }
-    spu_lockline_lock();                       /* no torn copy against a PUTLLC */
-    memcpy(t_resv_line, vm_base + line, 128);
+    spu_lockline_lock();
+    spu_coh_ppu_reserve((uint32_t)ea);
     spu_lockline_unlock();
-    t_resv_line_ea = line;
-    t_resv_line_valid = 1;
-}
-
-/* Under the lock-line lock: did the reserved line change since the note? */
-static inline int resv_line_lost(uint64_t ea)
-{
-    const uint32_t line = (uint32_t)ea & ~127u;
-    if (!t_resv_line_valid || t_resv_line_ea != line) return 0;
-    return memcmp(t_resv_line, vm_base + line, 128) != 0;
+    t_resv_noted = 1;
 }
 
 extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
@@ -978,7 +971,9 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
      * notify: the same serialization the coherent stores use, so a PPU commit
      * cannot land inside an SPU PUTLLC's compare/commit window (nor the
      * reverse), and the reserving SPU gets its lost-reservation event. */
-    int coh = spu_coh_is_reserved((uint32_t)ea);
+    const int noted = t_resv_noted;
+    t_resv_noted = 0;
+    int coh = noted || spu_coh_is_reserved((uint32_t)ea);
     /* SPU_PUTLLC_WHY=1: count PPU commits that land on a line an SPU has
      * reserved. If an SPU's PUTLLC never succeeds for "no reservation", the
      * PPU hammering the same 128-byte line is one of only two agents that can
@@ -990,12 +985,12 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
                         n, (uint32_t)ea & ~127u); } }
     if (coh) spu_lockline_lock();
-    int ok = (coh && resv_line_lost(ea)) ? 0 :
+    int ok = (noted && !spu_coh_ppu_holds((uint32_t)ea)) ? 0 :
              __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
-    t_resv_line_valid = 0;
+    if (noted) spu_coh_ppu_drop();
     if (coh) {
-        if (ok) spu_coh_notify_write((uint32_t)ea);
+        if (ok) spu_coh_notify_write_from_ppu((uint32_t)ea);
         spu_lockline_unlock();
     }
     if (ok) ppu_resv_break(ea);
@@ -1061,13 +1056,15 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     volatile LONG* L = resv_slot(ea);   /* ea and ea+4 share a 16-byte-block slot */
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
-    int coh = spu_coh_is_reserved((uint32_t)ea);
+    const int noted = t_resv_noted;
+    t_resv_noted = 0;
+    int coh = noted || spu_coh_is_reserved((uint32_t)ea);
     if (coh) spu_lockline_lock();
-    int ok = (coh && resv_line_lost(ea)) ? 0 :
+    int ok = (noted && !spu_coh_ppu_holds((uint32_t)ea)) ? 0 :
              __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
-    t_resv_line_valid = 0;
+    if (noted) spu_coh_ppu_drop();
     if (coh) {
-        if (ok) spu_coh_notify_write((uint32_t)ea);
+        if (ok) spu_coh_notify_write_from_ppu((uint32_t)ea);
         spu_lockline_unlock();
     }
     if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
@@ -1581,10 +1578,17 @@ static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
         if (spu_coh_is_reserved((uint32_t)(a))) {                             \
             spu_lockline_lock();                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
-            spu_coh_notify_write((uint32_t)(a));                              \
+            spu_coh_notify_write_from_ppu((uint32_t)(a));                     \
             spu_lockline_unlock();                                            \
         } else {                                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
+            /* store, then re-check: see spu_coh_reserve */                  \
+            __atomic_signal_fence(__ATOMIC_SEQ_CST);                          \
+            if (spu_coh_is_reserved((uint32_t)(a))) {                         \
+                spu_lockline_lock();                                          \
+                spu_coh_notify_write_from_ppu((uint32_t)(a));                 \
+                spu_lockline_unlock();                                        \
+            }                                                                 \
         }                                                                     \
     } while (0)
 

@@ -21,6 +21,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, os.path.join(HERE, "..", "ppu"))
 from run_ppu_conform import DEFAULT_RPCS3, run_oracle, sh  # noqa: E402
+sys.path.insert(0, os.path.join(HERE, ".."))
+import sanitize  # noqa: E402
 
 # The faithful SPU thread model: interpret images that have no lifted
 # registration, on their own host threads, with channel reads that block.
@@ -29,7 +31,8 @@ SPU_ENV = {"RD_SPU_INTERP": "1", "RD_SPU_INTERP_ASYNC": "1", "SPU_CH_BLOCK": "1"
 
 
 SUITES = {"mc": ("gen_mc_conform.py", "mc_conform", b"MCCONF"),
-          "spurs": ("gen_spurs_conform.py", "spurs_conform", b"SPURSCONF")}
+          "spurs": ("gen_spurs_conform.py", "spurs_conform", b"SPURSCONF"),
+          "mcx": ("gen_mcx_conform.py", "mcx_conform", b"MCXCONF")}
 
 
 def cut(path, tag):
@@ -50,6 +53,14 @@ def main():
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 8)
+    ap.add_argument("--sanitize", choices=sanitize.KINDS,
+                    help="build the runtime with ThreadSanitizer / AddressSanitizer "
+                         "(separate build dir); any report fails the run")
+    ap.add_argument("--lifted", action="store_true",
+                    help="lift the suite's SPU images (tools/build_spu_workloads.py) and run "
+                         "them as lifted code, not on the interpreter")
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="run ours N times; every run must match the oracle")
     a = ap.parse_args()
     work = os.path.abspath(a.work)
     os.makedirs(work, exist_ok=True)
@@ -62,7 +73,9 @@ def main():
     if not a.skip_oracle:
         run_oracle(a.rpcs3, elf, work, a.timeout, marker=tag + b" END")
 
-    rec, bld = os.path.join(work, "recompiled"), os.path.join(work, "build")
+    rec = os.path.join(work, "recompiled")
+    bld = sanitize.build_dir(os.path.join(work, "build_lifted" if a.lifted else "build"), a.sanitize)
+    lift_dir = os.path.join(work, "spu_lift")
     if not a.skip_build:
         load = os.path.join(work, "load")
         if sh([py, os.path.join(ROOT, "tools", "ppu_loader.py"), elf, "-o", load],
@@ -73,9 +86,19 @@ def main():
                "--hle-stubs", os.path.join(load, stem + ".imports.json"),
                "-o", rec], stdout=subprocess.DEVNULL).returncode:
             sys.exit(2)
+        if a.lifted:
+            if sh([py, os.path.join(ROOT, "tools", "build_spu_workloads.py"),
+                   "--images", os.path.join(work, stem + "_spu"), "--lifted", lift_dir,
+                   "--out", os.path.join(lift_dir, stem + "_spu_register.c"),
+                   "--register-fn", stem + "_spu_register_all", "--constructor", "--relift",
+                   "--eboot", elf, "--lift-arg=--merge-chunks", "--lift-arg=--return-entries"],
+                  stdout=subprocess.DEVNULL).returncode:
+                sys.exit(2)
         if not os.path.exists(os.path.join(bld, "build.ninja")):
+            san = sanitize.cmake_args(a.sanitize)
             if sh(["cmake", "-S", os.path.join(ROOT, "templates", "project"), "-B", bld, "-G", "Ninja",
-                   "-DCMAKE_BUILD_TYPE=Release", "-DRECOMP_DIR=" + rec],
+                   "-DCMAKE_BUILD_TYPE=Release", "-DRECOMP_DIR=" + rec,
+                   "-DFIRMWARE_SPU_DIR=" + (lift_dir if a.lifted else "")] + san,
                   stdout=subprocess.DEVNULL).returncode:
                 sys.exit(2)
         r = sh(["cmake", "--build", bld, "-j", str(a.jobs)], capture_output=True, text=True)
@@ -83,26 +106,50 @@ def main():
             print("\n".join(l for l in (r.stdout + r.stderr).split("\n") if " error" in l or "Error" in l)[:4000])
             sys.exit(2)
 
-    ours = os.path.join(work, "ours.txt")
-    with open(ours, "wb") as fo, open(os.path.join(work, "ours.stderr.txt"), "wb") as fe:
-        try:
-            subprocess.run([os.path.join(bld, "MyGameRecomp"), elf], stdout=fo, stderr=fe,
-                           timeout=a.timeout, env=dict(os.environ, **SPU_ENV), cwd=work)
-        except subprocess.TimeoutExpired:
-            print("lifted run: TIMEOUT")
-
-    want, got = cut(os.path.join(work, "oracle.txt"), tag), cut(ours, tag)
+    want = cut(os.path.join(work, "oracle.txt"), tag)
     if want is None:
         print("oracle transcript has no %s block" % tag.decode()); sys.exit(2)
-    if got is None:
-        print("our transcript has no %s block (see ours.stderr.txt)" % tag.decode()); sys.exit(1)
-    bad = [(i, w, g) for i, (w, g) in enumerate(zip(want, got)) if w != g]
-    if len(want) != len(got):
-        bad.append((min(len(want), len(got)), "<%d lines>" % len(want), "<%d lines>" % len(got)))
-    for i, w, g in bad:
-        print("line %d\n  oracle: %s\n  ours:   %s" % (i, w, g))
-    print("IDENTICAL (%d lines)" % len(want) if not bad else "%d line(s) differ" % len(bad))
-    sys.exit(1 if bad else 0)
+    # Records the architecture decides where the oracle is known to deviate
+    # (written by the generator; see gen_mcx_conform.x1_spec).
+    spec_path = os.path.join(work, stem + ".spec.json")
+    if os.path.exists(spec_path):
+        import json
+        spec = json.load(open(spec_path))
+        for k, v in spec["by_spec"].items():
+            want[int(k) + 1] = v                     # +1: the BEGIN line
+        print("%d record(s) by spec, not oracle: %s" % (len(spec["by_spec"]), spec["why"]))
+    env = sanitize.env(dict(os.environ, **SPU_ENV), a.sanitize)
+    failed = 0
+    for k in range(a.repeat):
+        sfx = "" if a.repeat == 1 else str(k)
+        ours = os.path.join(work, "ours%s.txt" % sfx)
+        errf = os.path.join(work, "ours%s.stderr.txt" % sfx)
+        with open(ours, "wb") as fo, open(errf, "wb") as fe:
+            try:
+                subprocess.run([os.path.join(bld, "MyGameRecomp"), elf], stdout=fo, stderr=fe,
+                               timeout=a.timeout, env=env, cwd=work)
+            except subprocess.TimeoutExpired:
+                print("run %d: TIMEOUT" % k)
+        got = cut(ours, tag)
+        if got is None:
+            print("run %d: our transcript has no %s block (see %s)" % (k, tag.decode(), errf))
+            failed += 1; continue
+        bad = [(i, w, g) for i, (w, g) in enumerate(zip(want, got)) if w != g]
+        if len(want) != len(got):
+            bad.append((min(len(want), len(got)), "<%d lines>" % len(want), "<%d lines>" % len(got)))
+        for i, w, g in bad[:20]:
+            print("run %d line %d\n  oracle: %s\n  ours:   %s" % (k, i, w, g))
+        reports = sanitize.reports(errf) if a.sanitize else []
+        for r in reports:
+            print("run %d: %s" % (k, r))
+        if bad or reports:
+            failed += 1
+    n = len(want)
+    print("IDENTICAL (%d lines)" % n if not failed and a.repeat == 1 else
+          "IDENTICAL (%d lines, %d/%d runs)" % (n, a.repeat, a.repeat) if not failed else
+          "%d/%d run(s) differ or report" % (failed, a.repeat))
+    sys.exit(1 if failed else 0)
+
 
 
 if __name__ == "__main__":

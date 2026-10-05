@@ -16,6 +16,11 @@
 #endif
 static PPU_TLS jmp_buf s_exit_jmp;
 static PPU_TLS int     s_exit_armed = 0;
+/* Set by sys_ppu_thread_exit once it has recorded the status and signalled
+ * the joiner. The thread procedure's epilogue must then do nothing to the
+ * slot: the joiner may already be reading it, and a detached thread's slot is
+ * FREE and may belong to a new thread by the time the epilogue runs. */
+static PPU_TLS int     s_exit_done = 0;
 
 #include <stddef.h>
 #include "sys_ppu_thread.h"
@@ -188,6 +193,18 @@ static void* ppu_host_thread_proc(void* param)
                 (unsigned long long)info->ctx.thread_id);
     }
 
+    /* Its lwarx reservation record (spu_coherency.c) goes with the thread. */
+    { extern void spu_coh_ppu_thread_exit(void); spu_coh_ppu_thread_exit(); }
+
+    if (s_exit_done) {             /* sys_ppu_thread_exit finished the slot */
+        s_exit_done = 0;
+#ifdef _WIN32
+        return 0;
+#else
+        return NULL;
+#endif
+    }
+
     /* Mark as finished */
     table_lock();
     info->exit_status = (int64_t)info->ctx.gpr[3];
@@ -333,7 +350,8 @@ int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
     }
     if (t->state == PPU_THREAD_STATE_FREE) return 0;
     *tid  = (unsigned)(idx + 1);
-    *cia  = t->prof_pc ? t->prof_pc : (unsigned)t->ctx.cia;
+    { unsigned pp = __atomic_load_n(&t->prof_pc, __ATOMIC_RELAXED);
+      *cia = pp ? pp : (unsigned)t->ctx.cia; }
     *name = t->name;
     return 1;
 }
@@ -345,12 +363,9 @@ void ppu_prof_stamp(void* vctx, unsigned lr)
     char* p = (char*)vctx - offsetof(ppu_thread_info, ctx);
     ppu_thread_info* t = (ppu_thread_info*)p;
     int in_range = (t >= g_ppu_threads && t < g_ppu_threads + PPU_THREAD_MAX);
-    if (!in_range) { s_prof_main_pc = lr; return; }
-    { static int _n = 0; if (_n++ < 0)
-        fprintf(stderr, "[prof-stamp] ctx=%p base=%p in_range=%d lr=0x%X\n",
-                vctx, (void*)g_ppu_threads, in_range, lr); }
-    if (in_range)
-        t->prof_pc = lr;
+    if (!in_range) { __atomic_store_n(&s_prof_main_pc, lr, __ATOMIC_RELAXED); return; }
+    /* Read by the profiler's sampling thread: relaxed atomics, not a lock. */
+    __atomic_store_n(&t->prof_pc, lr, __ATOMIC_RELAXED);
 }
 
 /* Set by _sys_ppu_thread_create around its call into sys_ppu_thread_create:
@@ -606,6 +621,7 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
         pthread_cond_signal(&t->finish_cond);
         pthread_mutex_unlock(&t->finish_mutex);
 #endif
+        s_exit_done = 1;
     }
     table_unlock();
 

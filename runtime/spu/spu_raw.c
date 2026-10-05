@@ -136,11 +136,11 @@ static void publish(raw_spu* s)
     if (!c) return;
     be32_store(s->base + SPU_RAW_STATUS, c->status);
     be32_store(s->base + SPU_RAW_MBOX_STATUS,
-               MBOX_STATUS(c->ch_out_mbox.count,
-                           SPU_IN_MBOX_FREE(c->ch_in_mbox.count),
-                           c->ch_out_intr_mbox.count));
-    if (c->ch_out_mbox.count)
-        be32_store(s->base + SPU_RAW_OUT_MBOX, c->ch_out_mbox.value);
+               MBOX_STATUS(spu_channel_count(&c->ch_out_mbox),
+                           SPU_IN_MBOX_FREE(spu_channel_count(&c->ch_in_mbox)),
+                           spu_channel_count(&c->ch_out_intr_mbox)));
+    if (spu_channel_count(&c->ch_out_mbox))
+        be32_store(s->base + SPU_RAW_OUT_MBOX, spu_channel_peek(&c->ch_out_mbox));
 }
 
 /* ---------------------------------------------------------------------------
@@ -257,9 +257,9 @@ static DWORD WINAPI raw_spu_thread(LPVOID arg)
             (unsigned)(s - s_spu), halted, (unsigned)(c->pc & SPU_LS_MASK),
             (unsigned)(c->gpr[0]._u32[0] & SPU_LS_MASK),
             (unsigned long long)c->steps, c->stop_code,
-            (unsigned)c->ch_out_mbox.count, c->ch_out_mbox.value,
-            (unsigned)c->ch_out_intr_mbox.count, c->ch_out_intr_mbox.value,
-            (unsigned)c->ch_in_mbox.count);
+            (unsigned)spu_channel_count(&c->ch_out_mbox), spu_channel_peek(&c->ch_out_mbox),
+            (unsigned)spu_channel_count(&c->ch_out_intr_mbox), spu_channel_peek(&c->ch_out_intr_mbox),
+            (unsigned)spu_channel_count(&c->ch_in_mbox));
     fflush(stderr);
     return 0;
 }
@@ -372,7 +372,7 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width)
                   }
                   fprintf(stderr, "%s\n", b); fflush(stderr);
               } }
-            spu_channel_write(&s->ctx->ch_in_mbox, val);
+            spu_channel_push_inmbox(&s->ctx->ch_in_mbox, val);
             spu_ch_wake(s->ctx);
             publish(s);
         }
@@ -433,9 +433,9 @@ int spu_raw_reg_load(uint32_t ea, uint32_t* out)
      * moment it does -- the PPU would keep reading "no free slot", never send a
      * second word, and both sides would wait on each other forever. */
     if (off == SPU_RAW_MBOX_STATUS) {
-        *out = MBOX_STATUS(s->ctx->ch_out_mbox.count,
-                           SPU_IN_MBOX_FREE(s->ctx->ch_in_mbox.count),
-                           s->ctx->ch_out_intr_mbox.count);
+        *out = MBOX_STATUS(spu_channel_count(&s->ctx->ch_out_mbox),
+                           SPU_IN_MBOX_FREE(spu_channel_count(&s->ctx->ch_in_mbox)),
+                           spu_channel_count(&s->ctx->ch_out_intr_mbox));
         return 1;
     }
     if (off == SPU_RAW_STATUS) { *out = s->ctx->status; return 1; }

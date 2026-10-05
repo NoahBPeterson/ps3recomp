@@ -31,6 +31,8 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "ppu"))
 from run_ppu_conform import DEFAULT_RPCS3, run_oracle, sh  # noqa: E402
 import spurs_lib  # noqa: E402
+sys.path.insert(0, os.path.join(HERE, ".."))
+import sanitize  # noqa: E402
 
 SPU_ENV = {"RD_SPU_INTERP": "1", "RD_SPU_INTERP_ASYNC": "1", "SPU_CH_BLOCK": "1", "PS3_VERBOSE": "0"}
 TAG = spurs_lib.TAG.decode()
@@ -72,6 +74,8 @@ def main():
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 8)
     ap.add_argument("--lle", help="directory of lifted firmware modules (see above)")
+    ap.add_argument("--sanitize", choices=sanitize.KINDS,
+                    help="build with ThreadSanitizer / AddressSanitizer; a report fails the run")
     ap.add_argument("--lle-spu", help="with --lle: tools/lift_firmware_spu.py output, so libsre's "
                                       "SPU side (SPURS kernel, modules) runs lifted, not interpreted")
     a = ap.parse_args()
@@ -82,7 +86,8 @@ def main():
         tests = [t for t in tests if t in a.only.split(",")]
     py = sys.executable
     rec = os.path.join(work, "recompiled")
-    bld = os.path.join(work, ("build_lle_spu" if a.lle_spu else "build_lle") if a.lle else "build")
+    bld = sanitize.build_dir(os.path.join(work, ("build_lle_spu" if a.lle_spu else "build_lle")
+                                       if a.lle else "build"), a.sanitize)
     summary = []
     for name in tests:
         tdir = os.path.join(work, name)
@@ -120,7 +125,8 @@ def main():
         if not os.path.exists(os.path.join(bld, "build.ninja")) or a.lle:
             sh(["cmake", "-S", os.path.join(ROOT, "templates", "project"), "-B", bld, "-G", "Ninja",
                 "-DCMAKE_BUILD_TYPE=Release", "-DRECOMP_DIR=" + rec,
-                "-DFIRMWARE_SPU_DIR=" + (os.path.abspath(a.lle_spu) if a.lle_spu else "")],
+                "-DFIRMWARE_SPU_DIR=" + (os.path.abspath(a.lle_spu) if a.lle_spu else "")]
+               + sanitize.cmake_args(a.sanitize),
                stdout=subprocess.DEVNULL)
         r = sh(["cmake", "--build", bld, "-j", str(a.jobs)], capture_output=True, text=True)
         if r.returncode:
@@ -133,7 +139,8 @@ def main():
             with open(ours, "wb") as fo, open(os.path.join(tdir, "ours%d.stderr.txt" % k), "wb") as fe:
                 try:
                     subprocess.run([os.path.join(bld, "MyGameRecomp"), elf], stdout=fo, stderr=fe,
-                                   timeout=a.timeout, env=dict(os.environ, **SPU_ENV), cwd=tdir)
+                                   timeout=a.timeout, cwd=tdir,
+                                   env=sanitize.env(dict(os.environ, **SPU_ENV), a.sanitize))
                 except subprocess.TimeoutExpired:
                     pass
             got = transcript(ours)
@@ -143,7 +150,10 @@ def main():
                 got = None
             if got is None:
                 results.append(None); continue
-            results.append(compare(lines, want, got))
+            rep_ = sanitize.reports(os.path.join(tdir, "ours%d.stderr.txt" % k)) if a.sanitize else []
+            for r in rep_:
+                print("   run %d: %s" % (k, r))
+            results.append(compare(lines, want, got) + [(r, "", "") for r in rep_])
 
         first_bad = next((r for r in results if r), None)
         if any(r is None for r in results):

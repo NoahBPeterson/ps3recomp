@@ -1035,8 +1035,13 @@ int64_t sys_event_port_send(ppu_context* ctx)
       /* Stage the full event for the SPU's sys_spu_thread_receive_event
        * (stop 0x110): the worker reads back {CELL_OK, data1, data2, data3} and
        * takes its work-descriptor EA from those, so data2 alone is not enough. */
-      extern uint32_t g_spu_pending_evt[3];
-      extern int      g_spu_pending_evt_valid;
+#ifdef _WIN32
+      extern __declspec(thread) uint32_t g_spu_pending_evt[3];
+      extern __declspec(thread) int      g_spu_pending_evt_valid;
+#else
+      extern __thread uint32_t g_spu_pending_evt[3];   /* thread-local: see spu_interp.c */
+      extern __thread int      g_spu_pending_evt_valid;
+#endif
       g_spu_pending_evt[0] = (uint32_t)data1;
       g_spu_pending_evt[1] = (uint32_t)data2;
       g_spu_pending_evt[2] = (uint32_t)data3;
@@ -1231,7 +1236,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 #endif
         return (int64_t)(int32_t)CELL_ESRCH;
     }
-    { static int _a=0; if(_a++<8) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, pattern=0x%llX awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)f->pattern,(unsigned long long)bitpat); }
+    { static int _a=0; if(_a++<8) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)bitpat); }
 
     if (bitpat == 0)
         return (int64_t)(int32_t)CELL_EINVAL;
