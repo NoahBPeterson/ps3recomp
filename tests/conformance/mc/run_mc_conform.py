@@ -32,7 +32,13 @@ SPU_ENV = {"RD_SPU_INTERP": "1", "RD_SPU_INTERP_ASYNC": "1", "SPU_CH_BLOCK": "1"
 
 SUITES = {"mc": ("gen_mc_conform.py", "mc_conform", b"MCCONF"),
           "spurs": ("gen_spurs_conform.py", "spurs_conform", b"SPURSCONF"),
-          "mcx": ("gen_mcx_conform.py", "mcx_conform", b"MCXCONF")}
+          "mcx": ("gen_mcx_conform.py", "mcx_conform", b"MCXCONF"),
+          "spu": (os.path.join("..", "spu", "gen_spu_conform.py"), "spu_conform", b"SPUCONF")}
+
+# Per-suite oracle settings on top of the PPU suite's. The SPU instruction
+# suite compares against RPCS3's reference SPU interpreter with exact
+# extended-range single precision, not its default LLVM recompiler.
+ORACLE_EXTRA = {"spu": {"SPU Decoder": "Interpreter (static)", "SPU XFloat Accuracy": "Accurate"}}
 
 
 def cut(path, tag):
@@ -71,7 +77,7 @@ def main():
     if sh([py, os.path.join(HERE, gen), "-o", elf]).returncode:
         sys.exit(2)
     if not a.skip_oracle:
-        run_oracle(a.rpcs3, elf, work, a.timeout, marker=tag + b" END")
+        run_oracle(a.rpcs3, elf, work, a.timeout, marker=tag + b" END", extra=ORACLE_EXTRA.get(a.suite))
 
     rec = os.path.join(work, "recompiled")
     bld = sanitize.build_dir(os.path.join(work, "build_lifted" if a.lifted else "build"), a.sanitize)
