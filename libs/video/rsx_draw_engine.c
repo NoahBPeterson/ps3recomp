@@ -548,7 +548,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
                 g.surfaces[i].offset == offset &&
                 (best == ENG_INVALID || g.surfaces[i].stamp > g.surfaces[best].stamp)) best = i;
         static u32 logs = 0;
-        if (logs++ < 8)
+        if (__atomic_fetch_add(&logs, 1, __ATOMIC_RELAXED) < 8)
             fprintf(stderr, "[rsx engine] rejected implausible surface 0x%X %ux%u;"
                             " keeping the %s target\n", offset, want_w, want_h,
                     best != ENG_INVALID ? "existing" : "absent");
@@ -577,7 +577,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->handle = handle;
     s->stamp = ++s_surf_clock;
     if (slot == g.n_surfaces) g.n_surfaces++;
-    { static u32 logs = 0; if (logs++ < 16)
+    { static u32 logs = 0; if (__atomic_fetch_add(&logs, 1, __ATOMIC_RELAXED) < 16)
         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
                 location, offset, want_w, want_h, (int)want_fmt,
                 seed ? " (seeded from guest memory)" : ""); }
@@ -1158,7 +1158,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             FILE* f = fopen(path, "w"); if (f) { fputs(s_vs_hlsl, f); fclose(f); }
             snprintf(path, sizeof path, "%s/p%u_ps.hlsl", dir, handle);
             f = fopen(path, "w"); if (f) { fputs(s_ps_hlsl, f); fclose(f); } } }
-    { static u32 logs = 0; if (logs++ < 32)
+    { static u32 logs = 0; if (__atomic_fetch_add(&logs, 1, __ATOMIC_RELAXED) < 32)
         fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
                         " %u constants -> %s\n",
                 (unsigned long long)key, fixed ? "built-in" : "guest",
@@ -1351,7 +1351,7 @@ static void sink_inline_array(void* user, const rsx_dispatch* r,
     const u32 stride = rsx_vertex_inline_layout(r, NULL);
     if (!stride || bytes < stride) {
         static int n;
-        if (getenv("PS3RECOMP_ENG_DROPLOG") && n++ < 6)
+        if (getenv("PS3RECOMP_ENG_DROPLOG") && __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 6)
             fprintf(stderr, "[rsx engine] inline array dropped: stride=%u bytes=%u\n", stride, bytes);
         return;
     }
