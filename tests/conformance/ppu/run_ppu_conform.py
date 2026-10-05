@@ -41,32 +41,33 @@ def sh(cmd, **kw):
     return subprocess.run(cmd, **kw)
 
 
-def oracle_config(work):
+def oracle_config(work, extra=None):
     """The user's RPCS3 config with the oracle settings forced (written to work/)."""
+    settings = dict(ORACLE_SETTINGS, **(extra or {}))
     base = os.path.expanduser("~/Library/Application Support/rpcs3/config.yml")
     out = os.path.join(work, "oracle_config.yml")
     lines = open(base).read().split("\n") if os.path.exists(base) else ["Core:"]
     seen = set()
     for i, l in enumerate(lines):
         k = l.strip().split(":")[0]
-        if k in ORACLE_SETTINGS:
+        if k in settings:
             indent = l[:len(l) - len(l.lstrip())]
-            lines[i] = "%s%s: %s" % (indent, k, ORACLE_SETTINGS[k])
+            lines[i] = "%s%s: %s" % (indent, k, settings[k])
             seen.add(k)
-    missing = [k for k in ORACLE_SETTINGS if k not in seen]
+    missing = [k for k in settings if k not in seen]
     if missing:
         i = next((n for n, l in enumerate(lines) if l.startswith("Core:")), None)
         if i is None:
             lines.append("Core:"); i = len(lines) - 1
         for k in missing:
-            lines.insert(i + 1, "  %s: %s" % (k, ORACLE_SETTINGS[k]))
+            lines.insert(i + 1, "  %s: %s" % (k, settings[k]))
     open(out, "w").write("\n".join(lines))
     return out
 
 
-def run_oracle(rpcs3, elf, work, timeout, marker=b"PPUCONF END"):
+def run_oracle(rpcs3, elf, work, timeout, marker=b"PPUCONF END", extra=None):
     tty = os.path.join(RPCS3_CACHE, "TTY.log")
-    cfg = oracle_config(work)
+    cfg = oracle_config(work, extra)
     # The previous run's TTY.log ends with the marker too: remove it, or the
     # wait below can match it before RPCS3 has started a new one.
     try:
