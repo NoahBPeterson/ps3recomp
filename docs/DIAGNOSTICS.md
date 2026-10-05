@@ -1010,7 +1010,7 @@ not changed while a title runs.
   `runtime/spu/spu_dma.h:1193`
 - **`SPU_DMA_LAX`** — the guest image. YDKJ issues exactly one such PUT -- 16 KB from a 4-byte-aligned EA of 0x00542004, straight over the title's own data -- and every later call through the clobbered OPDs reports "code 0x00000000 not registered". SPU_DMA_LAX=1 restores the old permissive behaviour. */
   `runtime/spu/spu_dma.h:215`
-- **`SPU_DMA_REPEAT_LIMIT`** — _(no description in source)_
+- **`SPU_DMA_REPEAT_LIMIT`** — off by default. `=N` halts an SPU that issues the same DMA transfer N times in a row (a wedged job), naming its pc. Polling memory with one GET is legitimate, so it is never on by default.
   `runtime/spu/spu_dma.h:1099`
 - **`SPU_DMA_SKIP_DUMP`** — SPU_DMA_SKIP_DUMP=1: show the LS payload a skipped PUT was carrying. A job that DMAs a small buffer to a garbage EA in a tight loop is usually an SPU-side assert/print path, and the payload names the actual complaint -- far more useful than the address it failed at. */
   `runtime/spu/spu_dma.h:392`

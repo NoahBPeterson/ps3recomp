@@ -305,7 +305,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
         uintptr_t c = (uintptr_t)s_coh_ctxs[i];
         if (c >= lo && c < hi) {
             static int _n = 0;
-            if (_n++ < 16)
+            if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 16)
                 fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
                         (void*)c, s_coh_ctxs[i]->image_id);
             s_coh_ctxs[i] = NULL;
@@ -339,7 +339,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
         spu_context* c = s_coh_ctxs[i];
         if (!c || (const void*)c == self) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
-            c->event_status |= SPU_EVENT_LR;
+            spu_ev_raise(c, SPU_EVENT_LR);
             c->resv_valid = 0;
             g_spu_lr_raise++;
             spu_ch_wake(c);
@@ -368,7 +368,7 @@ static void notify_spus(uint32_t line)
         spu_context* c = s_coh_ctxs[i];
         if (!c) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
-            c->event_status |= SPU_EVENT_LR;
+            spu_ev_raise(c, SPU_EVENT_LR);
             c->resv_valid = 0;          /* reservation lost, PUTLLC must fail */
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
              * always fails for "no reservation" is useless without knowing who

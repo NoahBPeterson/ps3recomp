@@ -332,7 +332,7 @@ static int spu_step(spu_context* ctx) {
         DST = spu_link((pc + 4) & 0x3FFFC); next = tg; break; }
     case SPU_bisled: { uint32_t tg = PREF(A) & 0x3FFFC;
         DST = spu_link((pc + 4) & 0x3FFFC);
-        if ((ctx->event_status & ctx->event_mask) != 0) next = tg;   /* branch only if an event is pending */
+        if ((spu_ev_get(ctx) & ctx->event_mask) != 0) next = tg;   /* branch only if an event is pending */
         break; }
     case SPU_iret: next = ctx->srr0 & 0x3FFFC; break;
     case SPU_biz:  if (PREF(DST) == 0) next = PREF(A) & 0x3FFFC; break;
@@ -495,6 +495,11 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
                       if (hist[i][j] > tot / 50) fprintf(stderr, "[spu-hist]   img %d page 0x%05X: %.1f%%\n",
                                                         i == 63 ? -1 : i, j << 12, 100.0 * hist[i][j] / tot);
               } } }
+        if (__atomic_load_n(&ctx->stop_request, __ATOMIC_RELAXED)) {   /* group terminated */
+            ctx->status = SPU_STATUS_STOPPED_BY_HALT; ctx->stop_code = 0;
+            g_spu_interp_steps = steps;
+            return 0;
+        }
         const int _st = spu_step(ctx);
         if (g_spu_oracle_trace_ctx == ctx && _tpc >= 0x3780 && g_spu_oracle_trace_left-- > 0) {
             const u128* r = &ctx->gpr[_top & 0x7F];
