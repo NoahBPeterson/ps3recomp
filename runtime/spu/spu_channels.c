@@ -2656,8 +2656,8 @@ void spu_indirect_branch(spu_context* ctx)
                 uint32_t w = (ctx->ls[o]<<24)|(ctx->ls[o+1]<<16)|(ctx->ls[o+2]<<8)|ctx->ls[o+3];
                 if ((w & 0xFFFF0000u) == 0x470A0000u && vm_base) {
                     /* write nonzero to the completion word in main RAM (BE) */
-                    if (vm_base[w]==0 && vm_base[w+1]==0 && vm_base[w+2]==0 && vm_base[w+3]==0) {
-                        vm_base[w+3] = 1;
+                    if (gm_load32(vm_base + w) == 0) {
+                        gm_store32(vm_base + w, __builtin_bswap32(1u));
                         static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 24)
                             fprintf(stderr, "[hle-jobdone] wrote completion 0x%08X=1 (job overlay %d)\n",
                                     w, ctx->resident_ovl);

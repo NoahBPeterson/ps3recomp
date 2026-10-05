@@ -10,6 +10,7 @@
  * remain available as direct C calls for the runtime to use.
  */
 
+#include "../memory/guest_mem_atomic.h"
 #include <stdlib.h>   /* calloc, free */
 #include "ps3emu/nid.h"   /* ps3_compute_nid (static inline) */
 #include "lv2_syscall_table.h"
@@ -466,20 +467,14 @@ static void vm_write_be32(uint32_t guest_addr, uint32_t val)
 {
     extern uint8_t* vm_base;
     if (!vm_base || !guest_addr) return;
-    uint8_t* p = vm_base + guest_addr;
-    p[0] = (uint8_t)(val >> 24);
-    p[1] = (uint8_t)(val >> 16);
-    p[2] = (uint8_t)(val >>  8);
-    p[3] = (uint8_t)(val);
+    gm_store32(vm_base + guest_addr, __builtin_bswap32(val));   /* single-copy atomic */
 }
 
 static uint32_t vm_read_be32(uint32_t guest_addr)
 {
     extern uint8_t* vm_base;
     if (!vm_base || !guest_addr) return 0;
-    const uint8_t* p = vm_base + guest_addr;
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] <<  8) | (uint32_t)p[3];
+    return __builtin_bswap32(gm_load32(vm_base + guest_addr));
 }
 
 /* syscall 872: sys_ss_get_open_psid(CellSsOpenPSID* psid { u64 high; u64 low })
@@ -1808,7 +1803,7 @@ static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_contex
         for (unsigned port = 0; port < 64; ++port) {
             if ((requested & (1ull << port)) && !g->user_event_ports[port]) {
                 g->user_event_ports[port] = (uint32_t)ctx->gpr[4];
-                vm_base[output] = (uint8_t)port;
+                gm_store8(vm_base + output, (uint8_t)port);
                 result = CELL_OK;
                 break;
             }
@@ -2138,8 +2133,7 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
           uint64_t v = 0;
           for (uint32_t k = 0; k < type && k < 8; k++)
               v = (v << 8) | jls[ls_offset + k];
-          for (int k = 0; k < 8; k++)
-              vm_base[value_ea + k] = (uint8_t)(v >> (56 - 8 * k));
+          gm_store64(vm_base + value_ea, __builtin_bswap64(v));
           { static _Atomic int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
             static int n = 0;
             if (s_t && __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 8)
