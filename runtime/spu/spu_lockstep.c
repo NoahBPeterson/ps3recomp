@@ -96,25 +96,27 @@ static void ls_arm_now(void)
                 (unsigned long long)q);
         fflush(stderr);
     }
-    g_yz_lockstep_on = on;
+    __atomic_store_n(&g_yz_lockstep_on, on, __ATOMIC_RELAXED);   /* published by s_init_complete */
 }
 
 int yz_lockstep_enabled(void)
 {
-    if (atomic_load_explicit(&s_init_complete, memory_order_acquire)) return g_yz_lockstep_on;
+    if (atomic_load_explicit(&s_init_complete, memory_order_acquire)) return __atomic_load_n(&g_yz_lockstep_on, __ATOMIC_RELAXED);
     if (!atomic_flag_test_and_set_explicit(&s_init_claimed, memory_order_acq_rel)) {
         ls_arm_now();
         atomic_store_explicit(&s_init_complete, 1, memory_order_release);
     } else {
         while (!atomic_load_explicit(&s_init_complete, memory_order_acquire)) LS_RELAX();
     }
-    return g_yz_lockstep_on;
+    return __atomic_load_n(&g_yz_lockstep_on, __ATOMIC_RELAXED);
 }
 
 static int ls_hot(void)
 {
-    if (g_yz_lockstep_on == 0) return 0;
-    if (g_yz_lockstep_on < 0) return yz_lockstep_enabled();
+    /* Read once, atomically: the first caller may be arming it right now. */
+    int on = __atomic_load_n(&g_yz_lockstep_on, __ATOMIC_RELAXED);
+    if (on == 0) return 0;
+    if (on < 0) return yz_lockstep_enabled();
     return 1;
 }
 
@@ -215,7 +217,7 @@ void yz_lockstep_register(spu_context* ctx)
 
 void yz_lockstep_unregister(spu_context* ctx)
 {
-    if (g_yz_lockstep_on != 1) return;
+    if (__atomic_load_n(&g_yz_lockstep_on, __ATOMIC_RELAXED) != 1) return;
     LS_LOCK();
     int idx = ls_find_slot(ctx);
     if (idx >= 0) {
