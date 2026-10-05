@@ -57,6 +57,8 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* c, uint32_t a) { (void)c;(voi
 int (*g_spu_lv2_stop_hook)(spu_context*) = 0;   /* no lv2: stops end the step */
 void spu_spurs_taskset_syscall(spu_context* c) { (void)c; }
 void spu_trace_pc(spu_context* c, uint32_t pc) { (void)c; (void)pc; }
+/* SPU_DIFF_SHOW=N: print up to N mismatches per op (default 3). */
+static int show_limit(void) { static int n = -1; if (n < 0) { const char* e = getenv("SPU_DIFF_SHOW"); n = e ? atoi(e) : 3; } return n; }
 uint8_t* vm_base = 0;   /* SPU_INTERP_XFER_LOG reads guest memory; never armed here */
 void spu_ls_watch_slow(uint32_t l, int w, const uint8_t* p, uint32_t pc, uint32_t lr) { (void)l;(void)w;(void)p;(void)pc;(void)lr; }
 
@@ -611,7 +613,7 @@ static int one_trial(int op, uint32_t insn, uint32_t pc, backend_fn be, void* us
     /* restore ours' LS from the pristine copy: instruction word + any touched quad */
     memcpy(g_ctx.ls + m, sv, 4);
     if (e.mem) memcpy(g_ctx.ls + e.mem_addr, g_ls0 + e.mem_addr, 16);
-    if (bad) { st->fail++; if ((*printed)++ < 3) { printf("  MISMATCH %s insn=%08X pc=%05X%s: %s\n", nm, insn, pc, hand ? " [vs hand-ref]" : "", why);
+    if (bad) { st->fail++; if ((*printed)++ < show_limit()) { printf("  MISMATCH %s insn=%08X pc=%05X%s: %s\n", nm, insn, pc, hand ? " [vs hand-ref]" : "", why);
         char x[64], y[64], z[64], w[64]; qhex(x, g_gbe[(insn >> 7) & 0x7F]); qhex(y, g_gbe[(insn >> 14) & 0x7F]); qhex(z, g_gbe[insn & 0x7F]); qhex(w, g_gbe[(insn >> 21) & 0x7F]);
         printf("      operands: ra=%s rb=%s rt/rc=%s rt4=%s\n", x, y, z, w); } }
     return bad;
