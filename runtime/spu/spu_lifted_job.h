@@ -97,16 +97,16 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
         if (ctx.status == SPU_STATUS_STOPPED_BY_STOP && ctx.stop_code == 0x102u &&
             spu_channel_has_data(&ctx.ch_out_mbox)) {
             g_spu_interp_exit_valid  = 1;
-            g_spu_interp_exit_status = (int32_t)ctx.ch_out_mbox.value;
-            ctx.ch_out_mbox.count = 0;
+            g_spu_interp_exit_status = (int32_t)spu_channel_peek(&ctx.ch_out_mbox);
+            spu_channel_clear(&ctx.ch_out_mbox);
         }
         /* sys_spu_thread_group_exit: stop 0x101, the group's status in the
          * same mailbox. */
         if (ctx.status == SPU_STATUS_STOPPED_BY_STOP && ctx.stop_code == 0x101u &&
             spu_channel_has_data(&ctx.ch_out_mbox)) {
             g_spu_interp_group_exit_valid  = 1;
-            g_spu_interp_group_exit_status = (int32_t)ctx.ch_out_mbox.value;
-            ctx.ch_out_mbox.count = 0;
+            g_spu_interp_group_exit_status = (int32_t)spu_channel_peek(&ctx.ch_out_mbox);
+            spu_channel_clear(&ctx.ch_out_mbox);
         }
     }
     /* Completion signal, exactly ONCE per run. Real hardware raises a PPU event
@@ -125,7 +125,7 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
          spu_channel_has_data(&ctx.ch_out_mbox)) {
         extern void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
         if (g_spu_out_mbox_hook)
-            g_spu_out_mbox_hook(ctx.spu_group_id, ctx.spu_id, 1, ctx.ch_out_mbox.value);
+            g_spu_out_mbox_hook(ctx.spu_group_id, ctx.spu_id, 1, spu_channel_peek(&ctx.ch_out_mbox));
     }
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);
     /* `ctx` is about to go out of scope: take it out of the reserving set
@@ -329,9 +329,9 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
                 "inmbox(n=%u) outmbox(n=%u v=0x%08X) outintr(n=%u v=0x%08X)\n",
                 ctx.spu_id, _halted, (unsigned long long)ctx.steps, (unsigned)ctx.status,
                 (unsigned)(ctx.pc & SPU_LS_MASK),
-                (unsigned)ctx.ch_in_mbox.count,
-                (unsigned)ctx.ch_out_mbox.count, ctx.ch_out_mbox.value,
-                (unsigned)ctx.ch_out_intr_mbox.count, ctx.ch_out_intr_mbox.value);
+                (unsigned)spu_channel_count(&ctx.ch_in_mbox),
+                (unsigned)spu_channel_count(&ctx.ch_out_mbox), spu_channel_peek(&ctx.ch_out_mbox),
+                (unsigned)spu_channel_count(&ctx.ch_out_intr_mbox), spu_channel_peek(&ctx.ch_out_intr_mbox));
         fflush(stderr);
     }
 
@@ -345,7 +345,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
         spu_channel_has_data(&ctx.ch_out_mbox)) {
         extern void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
         if (g_spu_out_mbox_hook)
-            g_spu_out_mbox_hook(ctx.spu_group_id, ctx.spu_id, 1, ctx.ch_out_mbox.value);
+            g_spu_out_mbox_hook(ctx.spu_group_id, ctx.spu_id, 1, spu_channel_peek(&ctx.ch_out_mbox));
     }
     if (opts && opts->spu_id) {
         extern void spu_thread_publish_ctx(uint32_t tid, void* c);

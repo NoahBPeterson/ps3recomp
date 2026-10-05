@@ -36,6 +36,7 @@ typedef struct spu_lifted_thread_desc {
     const struct lv2_spu_seg_s* segs;   /* the image, as copied at initialize    */
     uint32_t nsegs;
     uint64_t args[4];    /* sys_spu_thread_argument, as captured at initialize */
+    int      image_id;   /* lifted image identified by content, or 0: by entry */
 } spu_lifted_thread_desc;
 
 /* How the thread stopped, in the terms the group state machine needs. */

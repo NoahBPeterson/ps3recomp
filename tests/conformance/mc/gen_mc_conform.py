@@ -326,6 +326,10 @@ def build(out_path):
             "event": wrap_spu(spu_event_prog(), tmp, "event"),
             "mfc2": wrap_spu(spu_mfc2_prog(), tmp, "mfc2"),
             "recv": wrap_spu(spu_recv_prog(), tmp, "recv")}
+    spu_dir = os.path.splitext(out_path)[0] + "_spu"          # for --lifted
+    os.makedirs(spu_dir, exist_ok=True)
+    for k, b in imgs.items():
+        open(os.path.join(spu_dir, "mc_%s.elf" % k), "wb").write(b)
 
     D = Data()
     D.take("opd", 8 * len(FUNCS))
