@@ -403,14 +403,14 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
     uint64_t steps = 0;
     /* YDKJ_SPU_TRACE=N: log the last N PCs into a ring buffer and dump them when the
      * interp halts -- shows the path to a branch-to-0 (the cri task/policy wall). */
-    static int _tr=-1; if(_tr<0){const char*e=getenv("YDKJ_SPU_TRACE");_tr=e?atoi(e):0;}
-    static uint64_t _cap=0; { static int _ci=0; if(!_ci){_ci=1; const char*e=getenv("SPU_STEPCAP"); _cap=e?strtoull(e,0,0):0;} }
+    static _Atomic int _tr=-1; if(_tr<0){const char*e=getenv("YDKJ_SPU_TRACE");_tr=e?atoi(e):0;}
+    static _Atomic uint64_t _cap=0; { static _Atomic int _ci=0; if(!_ci){const char*e=getenv("SPU_STEPCAP"); _cap=e?strtoull(e,0,0):0; _ci=1;} }
     /* YDKJ_CRI_GATE1TRACE=N: cri decode task busy-spins in the validator func_00026E80
      * (LS 0x26E80..0x26F14), a straight-line leaf that returns r3 = 0 / 0x8041090F /
      * 0x80410909. Hand-decoding its selb/fsm/gb/ceqh lanes proved unreliable, so log the
      * ACTUAL runtime result + inputs the first N times it returns. Fires on range-exit
      * (pc left the fn), when r3 and the leaf's non-restored intermediates are still live. */
-    static int _g1=-1; if(_g1<0){const char*e=getenv("YDKJ_CRI_GATE1TRACE");_g1=e?atoi(e):0;}
+    static _Atomic int _g1=-1; if(_g1<0){const char*e=getenv("YDKJ_CRI_GATE1TRACE");_g1=e?atoi(e):0;}
     static int _g1in=0;
     uint32_t ring[64]; int rc=0, rn=0;
     for (;;) {
@@ -435,7 +435,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
          * another image's functions that happen to share an LS address. */
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
         if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) {
-            { static int s_rj = -1; if (s_rj < 0) { const char* e = getenv("SPU_REJOIN_DBG"); s_rj = e ? atoi(e) : 0; }
+            { static _Atomic int s_rj = -1; if (s_rj < 0) { const char* e = getenv("SPU_REJOIN_DBG"); s_rj = e ? atoi(e) : 0; }
               if (s_rj > 0 && steps > 1000) { s_rj--; fprintf(stderr, "[rejoin] img=%d pc=0x%05X after %llu steps (from 0x%05X)\n",
                   ctx->image_id, ctx->pc, (unsigned long long)steps, start_lsa & 0x3FFFC); } }
             g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
@@ -457,7 +457,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
         /* SPU_TRACE_INTERP=1: emit the same per-instruction PC trace a --trace lift
          * does (spu_trace_pc), so an interpreted run diffs against a lifted one. */
-        { static int s_ti = -1; if (s_ti < 0) s_ti = getenv("SPU_TRACE_INTERP") ? 1 : 0;
+        { static _Atomic int s_ti = -1; if (s_ti < 0) s_ti = getenv("SPU_TRACE_INTERP") ? 1 : 0;
           if (s_ti) { extern void spu_trace_pc(spu_context*, uint32_t); spu_trace_pc(ctx, ctx->pc); } }
         steps++;
         /* SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
@@ -484,7 +484,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
                               ((uint32_t)ctx->ls[_tpc+2] << 8) | ctx->ls[_tpc+3];
         /* SPU_INTERP_HIST=1: which (image, 4 KB LS page) the interpreter spends
          * its steps in -- the candidates for ahead-of-time lifting. */
-        { static int on = -1; if (on < 0) on = getenv("SPU_INTERP_HIST") ? 1 : 0;
+        { static _Atomic int on = -1; if (on < 0) on = getenv("SPU_INTERP_HIST") ? 1 : 0;
           if (on) {
               static _Atomic unsigned long long hist[64][64]; static _Atomic unsigned long long tot;
               const int img = ctx->image_id < 0 ? 63 : (ctx->image_id & 63);

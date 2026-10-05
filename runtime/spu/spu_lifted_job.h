@@ -55,7 +55,7 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
     /* SPU_CTX_LOG=1: one line per job context, with its address. "Three
      * contexts for one dispatch" is otherwise unanswerable -- every other
      * probe sees contexts only once they reserve. */
-    { static int s_cl = -1;
+    { static _Atomic int s_cl = -1;
       if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
       if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d entry=0x%05X\n",
                           (void*)&ctx, image_id, entry_pc); fflush(stderr); } }
@@ -188,7 +188,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     if (!entry) return -1;
     spu_context ctx;
     spu_context_init(&ctx, 0);
-    { static int s_cl = -1;
+    { static _Atomic int s_cl = -1;
       if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
       if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d\n",
                           (void*)&ctx, image_id); fflush(stderr); } }

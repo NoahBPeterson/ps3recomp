@@ -11,6 +11,7 @@
 #ifndef PPU_MEMORY_H
 #define PPU_MEMORY_H
 
+#include "../memory/guest_mem_atomic.h"
 #include "../../include/ps3emu/endian.h"
 #include "ppu_context.h"
 
@@ -66,34 +67,30 @@ static inline uint64_t* vm_ptr64(uint32_t addr) { return (uint64_t*)vm_translate
  * -----------------------------------------------------------------------*/
 static inline uint8_t vm_read8(uint32_t addr)
 {
-    return *vm_ptr8(addr);
+    return gm_load8(vm_ptr8(addr));
 }
 
 static inline uint16_t vm_read16(uint32_t addr)
 {
-    uint16_t raw;
-    memcpy(&raw, vm_ptr8(addr), sizeof(raw));
+    uint16_t raw = gm_load16(vm_ptr8(addr));
     return ps3_bswap16(raw);
 }
 
 static inline uint32_t vm_read32(uint32_t addr)
 {
-    uint32_t raw;
-    memcpy(&raw, vm_ptr8(addr), sizeof(raw));
+    uint32_t raw = gm_load32(vm_ptr8(addr));
     return ps3_bswap32(raw);
 }
 
 static inline uint64_t vm_read64(uint32_t addr)
 {
-    uint64_t raw;
-    memcpy(&raw, vm_ptr8(addr), sizeof(raw));
+    uint64_t raw = gm_load64(vm_ptr8(addr));
     return ps3_bswap64(raw);
 }
 
 static inline float vm_read_f32(uint32_t addr)
 {
-    uint32_t raw;
-    memcpy(&raw, vm_ptr8(addr), sizeof(raw));
+    uint32_t raw = gm_load32(vm_ptr8(addr));
     raw = ps3_bswap32(raw);
     float result;
     memcpy(&result, &raw, sizeof(result));
@@ -102,8 +99,7 @@ static inline float vm_read_f32(uint32_t addr)
 
 static inline double vm_read_f64(uint32_t addr)
 {
-    uint64_t raw;
-    memcpy(&raw, vm_ptr8(addr), sizeof(raw));
+    uint64_t raw = gm_load64(vm_ptr8(addr));
     raw = ps3_bswap64(raw);
     double result;
     memcpy(&result, &raw, sizeof(result));
@@ -144,11 +140,11 @@ void        spu_coh_notify_write_from_ppu(uint32_t addr);
     do {                                                                      \
         if (spu_coh_is_reserved((uint32_t)(addr))) {                          \
             spu_lockline_lock();                                              \
-            memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                    \
+            gm_store_bytes(vm_ptr8((uint32_t)(addr)), (src), (n));            \
             spu_coh_notify_write_from_ppu((uint32_t)(addr));                  \
             spu_lockline_unlock();                                            \
         } else {                                                              \
-            memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                    \
+            gm_store_bytes(vm_ptr8((uint32_t)(addr)), (src), (n));            \
             /* store, then re-check: see spu_coh_reserve */                  \
             __atomic_signal_fence(__ATOMIC_SEQ_CST);                          \
             if (spu_coh_is_reserved((uint32_t)(addr))) {                      \

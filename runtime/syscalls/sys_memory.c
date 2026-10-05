@@ -30,7 +30,7 @@ uint32_t g_sys_mem_bump_ptr = 0;
  * pointers line up with the oracle, so LS/RAM dumps diff without a constant offset. */
 static uint32_t sys_mem_alloc_base(void)
 {
-    static uint32_t s_base = 0;
+    static _Atomic uint32_t s_base = 0;
     if (!s_base) {
         const char* e = getenv("PS3_MEM_ALLOC_BASE");
         uint32_t b = e ? (uint32_t)strtoul(e, 0, 16) : 0;

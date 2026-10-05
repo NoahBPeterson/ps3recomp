@@ -125,7 +125,7 @@ void spu_process_barrier(void)
 #include <unistd.h>
 void spu_process_barrier(void)
 {
-    static int s_ok = -1;
+    static _Atomic int s_ok = -1;
     if (s_ok < 0)
         s_ok = syscall(__NR_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0) == 0;
     if (!s_ok || syscall(__NR_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0) != 0)
@@ -246,7 +246,7 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
              * with the host call chain that reserved, so an entry that outlives
              * its context can be traced to the path that skipped unregister. */
 #ifndef _WIN32
-            { static int s_l = -1; if (s_l < 0) s_l = getenv("SPU_COH_LOG") ? 1 : 0;
+            { static _Atomic int s_l = -1; if (s_l < 0) s_l = getenv("SPU_COH_LOG") ? 1 : 0;
               if (s_l) {
                   void* bt[8]; int n = backtrace(bt, 8);
                   fprintf(stderr, "[spu-coh] + ctx %p img=%d spu=0x%X slot %d:", (void*)ctx,
@@ -373,7 +373,7 @@ static void notify_spus(uint32_t line)
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
              * always fails for "no reservation" is useless without knowing who
              * took it away -- a peer SPU, or the PPU committing to the line. */
-            { static int s_w = -1;
+            { static _Atomic int s_w = -1;
               if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
               if (s_w) { static unsigned long long n;
                   if ((++n % 200000) == 1)
