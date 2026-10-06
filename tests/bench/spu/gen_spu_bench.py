@@ -91,6 +91,7 @@ SP_CHAIN = w4(F32(1.5), F32(2.0), F32(0.75), F32(3.0))
 SP_ONE = w4(F32(1.0))
 SP_HALF = w4(F32(0.5))
 SP_SPECIAL = w4(0x7F800000, F32(2.0), F32(0.75), F32(3.0))  # lane 0: SPU 2^128 (extended range)
+SP_ONE_ZERO = [F32(1.0), F32(1.0), F32(1.0), 0]               # lane 3: 0.0 (w = 0, padding)
 DP_CHAIN = d2(F64(1.5), F64(0.75))
 DP_ONE = d2(F64(1.0))
 DP_HALF = d2(F64(0.5))
@@ -157,8 +158,12 @@ class Case:
 
 
 def operands(name, special=False):
-    """(chain init, rb init, rc init) for a register op."""
+    """(chain init, rb init, rc init) for a register op. special: "special"
+    (an extended-range / NaN lane in the chain) or "zero" (a 0.0 lane in the
+    second operand, which keeps the lane on the exact path every op)."""
     if name in SP_OPS:
+        if special == "zero":
+            return SP_CHAIN, SP_ONE_ZERO, SP_HALF
         return (SP_SPECIAL if special else SP_CHAIN), SP_ONE, SP_HALF
     if name in DP_OPS:
         return (DP_SPECIAL if special else DP_CHAIN), DP_ONE, DP_HALF
@@ -194,12 +199,13 @@ def register_cases():
             c.body = [enc(name, 10 + i) for i in range(OPS)]
             cases.append(c)
             continue
-        variants = [False, True] if (name in SP_OPS or name in DP_OPS) else [False]
+        variants = ([False, "special", "zero"] if name in SP_OPS else
+                    [False, "special"] if name in DP_OPS else [False])
         for special in variants:
             chain, b, cc = operands(name, special)
             if name in INT_TO_F:
                 chain = w4(1000, 2000, 3000, 4000)
-            sfx = " special" if special else ""
+            sfx = " " + special if special else ""
             # lat: rt = ra = $3
             c = Case(name, "lat" + sfx, OPS, {R_CHAIN: chain, R_B: b, R_C: cc})
             c.body = [enc(name, R_CHAIN, R_CHAIN, R_B, R_C) for _ in range(OPS)]
