@@ -64,7 +64,8 @@ void spu_trace_rt(spu_context* ctx, uint32_t rt);
 
 
 void spu_func_00000000(spu_context* ctx);
-void spu_func_00000010(spu_context* ctx);
+void spu_func_00000080(spu_context* ctx);
+void spu_func_000000C0(spu_context* ctx);
 
 /* Runtime glue (runtime/spu/spu_channels.c) */
 void spu_register_function(uint32_t addr, void (*fn)(spu_context*));

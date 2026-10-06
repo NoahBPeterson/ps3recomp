@@ -220,8 +220,17 @@ unsigned spu_sn_defer_ticks(void)
  * until iret). */
 static void spu_irq_regs_save(spu_context* ctx)
 {
+    /* T-0001 (2026-10-08): no nesting guard existed despite the "no nesting"
+     * contract below -- a second take while a save is armed silently
+     * OVERWRITES the snapshot and loses the outer resume point. Log it. */
+    { static int _n = 0;
+      if (ctx->irq_saved && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8)
+          fprintf(stderr, "[t0001-irq] NESTED TAKE while save armed: "
+                  "old resume=%05X new resume=%05X (outer snapshot LOST)\n",
+                  ctx->irq_resume_pc & SPU_LS_MASK, ctx->srr0 & SPU_LS_MASK); }
     ctx->irq_saved = 1;
     ctx->irq_resume_pc = ctx->srr0;
+    ctx->irq_save_steps = ctx->steps;      /* T-0001: staleness detection */
     memcpy(ctx->irq_gpr, ctx->gpr, sizeof ctx->irq_gpr);
 }
 
@@ -242,6 +251,20 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
         if (ctx->irq_saved) {
             if ((ctx->pc & SPU_LS_MASK) == (ctx->irq_resume_pc & SPU_LS_MASK) &&
                 ctx->int_enable) {
+                /* T-0001 (2026-10-08): a restore firing long after its take
+                 * means the genuine iret was MISSED (e.g. executed by the
+                 * interpreter, which has no irq_saved awareness) and this is
+                 * a STALE snapshot being memcpy'd over a live register file
+                 * at an unrelated moment -- the false-fire corruption family.
+                 * steps-since-take is recorded on save; a job launch or hot
+                 * loop head re-branching to the old resume pc triggers it. */
+                { uint64_t _age = ctx->steps - ctx->irq_save_steps;
+                  static int _n = 0;
+                  if (_age > 100000 && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8)
+                      fprintf(stderr, "[t0001-irq] STALE RESTORE: take was %llu steps "
+                              "ago (resume=%05X) -- genuine iret was MISSED\n",
+                              (unsigned long long)_age,
+                              ctx->irq_resume_pc & SPU_LS_MASK); }
                 memcpy(ctx->gpr, ctx->irq_gpr, sizeof ctx->irq_gpr);
                 ctx->irq_saved = 0;
                 /* The iret completed below the frame that took the interrupt:
@@ -415,7 +438,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
             yz_lockstep_tick(ctx);
             spu_task_launch_check(ctx, (void*)fn);
-            if (ctx->int_enable && (spu_ev_get(ctx) & ctx->event_mask)) {
+            if (ctx->int_enable && !ctx->irq_saved && (spu_ev_get(ctx) & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */
                     /* Interrupt taken here: this loop is the frame the iret

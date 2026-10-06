@@ -652,17 +652,23 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
           spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
         /* SPU_LS_WATCH: a DMA GET landing on a watched LS line is how the PPU
-         * delivers commands into the SPU's queue (bypasses spu_ls_write128). */
+         * delivers commands into the SPU's queue (bypasses spu_ls_write128).
+         * Ring mode (SPU_LS_WATCH_RING) records the landing in the per-line
+         * ring instead of printing -- DMA fills of watched buffers are
+         * frequent and the print path is unbounded (T-0001: boot7's 3.3 GB
+         * log); the ring keeps the tail so the fault dump still sees it. */
         { int _n; unsigned* _w = spu_ls_watch_list(&_n);
           for (int _i = 0; _i < _n; _i++) {
               if (_w[_i] >= lsa && _w[_i] < lsa + size) {
                   const uint8_t* q = &spu->ls[_w[_i] & (SPU_LS_MASK & ~0xFu)];
-                  fprintf(stderr, "[spu-watch DMA-GET 0x%05X <- ea=0x%08X sz=%u img=%d] "
-                          "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
-                          _w[_i], (uint32_t)ea, size, spu->image_id,
-                          q[0],q[1],q[2],q[3], q[4],q[5],q[6],q[7],
-                          q[8],q[9],q[10],q[11], q[12],q[13],q[14],q[15]);
-                  fflush(stderr);
+                  if (!spu_ls_watch_ring_dma(spu, _w[_i], (uint32_t)ea, size, q)) {
+                      fprintf(stderr, "[spu-watch DMA-GET 0x%05X <- ea=0x%08X sz=%u img=%d] "
+                              "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                              _w[_i], (uint32_t)ea, size, spu->image_id,
+                              q[0],q[1],q[2],q[3], q[4],q[5],q[6],q[7],
+                              q[8],q[9],q[10],q[11], q[12],q[13],q[14],q[15]);
+                      fflush(stderr);
+                  }
               }
           } }
     } else if (mfc_is_put(cmd)) {

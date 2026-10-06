@@ -112,6 +112,31 @@ def make_cases(per_op, seed, only):
             inputs = [rand_qword(rng) for _ in range(4)]
             cases.append(dict(op=name, word=word, regs=regs,
                               inputs=[b.hex() for b in inputs]))
+
+    # ---- T-0001 patterned pass: shift-count boundaries vs pointer data ----
+    # A WWS scatter loop derives its store offset from shl (6-bit count) but
+    # its step from shlqbi (3-bit count); a count > 7 splits the pair and
+    # overran the whole local store (the once-per-boot stack smash). Random
+    # operands hit these boundaries only by luck, so pin every boundary
+    # count, each against pointer-like data patterns, for the register-form
+    # shift/rotate ops. Compared bit-for-bit against RPCS3 like every case.
+    SHIFT_OPS = ("shl", "shlh", "shlqbi", "shlqbybi", "shlqby",
+                 "rot", "roth", "rotm", "rotma", "rotqbi", "rotqbybi", "rotqby")
+    SHIFT_BOUNDARIES = (0, 1, 3, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65)
+    PTR_LIKE = (0x00033700, 0x0003FFF0, 0x3BFFFFFF, 0x382EC33E,
+                0x003FFFFF, 0x4080FFFF, 0x7F800000, 0xFFFFFFFF)
+    for name, width, val in OPCODES:
+        if name in EXCLUDE or name not in SHIFT_OPS or (only and name not in only):
+            continue
+        for cnt in SHIFT_BOUNDARIES:
+            for pat in PTR_LIKE:
+                # rt=2 (dest), ra=3 (data), rb=4 (count) -- distinct, no aliasing
+                word = (val << 21) | (4 << 14) | (3 << 7) | 2
+                data_q = b"".join(struct.pack(">I", pat | (k << 28)) for k in range(4))
+                cnt_q = b"".join(struct.pack(">I", cnt) for _ in range(4))
+                cases.append(dict(op=name, word=word, regs=[2, 3, 4],
+                                  inputs=["00" * 16, data_q.hex(), cnt_q.hex(),
+                                          "00" * 16]))
     return cases
 
 
