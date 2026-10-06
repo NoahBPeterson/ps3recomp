@@ -30,6 +30,7 @@ efficiency-core run is only ever slower, so the minimum is the clean number).
 | `tput`  | eight independent chains: the host overlaps them -- the op's throughput |
 | `issue` | no result to chain (stores, branches, hints, constants, channels) -- independent copies |
 | `special` | float ops with an extended-range single (exponent 255) or a double NaN in one lane: the helpers' exact (slow) path |
+| `zero` | single float ops with 0.0 in one lane of the second operand (w = 0, padding): zero is not on the fast path either |
 
 The loop control is included, not subtracted; `lnop`/`nop` (lifted to
 nothing) are that floor. Channel rows are single channel instructions;

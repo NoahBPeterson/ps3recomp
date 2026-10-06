@@ -64,6 +64,58 @@ int main(void)
     if (bad) { printf("test_spu_float_neon: %ld mismatches in %ld cases\n", bad, N); return 1; }
     printf("test_spu_float_neon: ok (%ld random cases)\n", N);
 
+    /* fma's fast path trusts a double sum unless it was rounded (TwoSum error != 0) AND landed
+     * on a 24-bit boundary. Random operands almost never reach either side of that test, so aim
+     * at it: products of short (dyadic) significands, plus an addend that is either dyadic too
+     * (exact sums: must stay correct on the fast path) or a lone power of two far below the
+     * product (the sum rounds back onto the product -- a boundary -- and must go exact:
+     * 1*1 - 2^-60 truncates to 0x3F7FFFFF, not 1.0). */
+    {
+        long hits = 0, exact_sums = 0;
+        const long M = 2000000;
+        for (long it = 0; it < M; it++) {
+            u128 a, b, c, got, ref;
+            for (int i = 0; i < 4; i++) {
+                const uint32_t ea = 115 + rnd32() % 24, eb = 115 + rnd32() % 24;
+                a._u32[i] = ((rnd32() & 1u) << 31) | (ea << 23) | ((rnd32() & 7u) << 20);
+                b._u32[i] = ((rnd32() & 1u) << 31) | (eb << 23) | ((rnd32() & 7u) << 20);
+                const int ep = (int)ea + (int)eb - 127;                /* product's biased exponent */
+                int ec;
+                if (rnd32() & 1) { ec = ep - (int)(rnd32() % 24); c._u32[i] = (rnd32() & 7u) << 20; }
+                else             { ec = ep - 25 - (int)(rnd32() % 70); c._u32[i] = 0; }
+                if (ec < 1) ec = 1;
+                if (ec > 254) ec = 254;
+                c._u32[i] |= ((rnd32() & 1u) << 31) | ((uint32_t)ec << 23);
+                const double pd = (double)spu__sf_f(a._u32[i]) * (double)spu__sf_f(b._u32[i]);
+                const double zd = (double)spu__sf_f(c._u32[i]), sd = pd + zd, bb = sd - pd;
+                const double er = (pd - (sd - bb)) + (zd - bb);
+                uint64_t su; memcpy(&su, &sd, 8);
+                hits += er != 0.0 && !(su & 0x1FFFFFFFull);
+                exact_sums += er == 0.0;
+            }
+            const int op = (int)(it % 3);
+            if (op == 0)      { got = spu_fma(a, b, c);  ref = spu_fma_ref(a, b, c); }
+            else if (op == 1) { got = spu_fms(a, b, c);  ref = spu_fms_ref(a, b, c); }
+            else              { got = spu_fnms(a, b, c); ref = spu_fnms_ref(a, b, c); }
+            if (memcmp(&got, &ref, 16)) {
+                if (bad++ < 10)
+                    printf("MISMATCH (boundary) op=%d a=%08X b=%08X c=%08X got=%08X ref=%08X\n", op,
+                           a._u32[0], b._u32[0], c._u32[0], got._u32[0], ref._u32[0]);
+            }
+        }
+        u128 one, tiny; memset(&one, 0, 16); memset(&tiny, 0, 16);
+        one._u32[0] = 0x3F800000u; tiny._u32[0] = 0x80000000u | ((127u - 60u) << 23);   /* -2^-60 */
+        const u128 r = spu_fma(one, one, tiny);
+        if (r._u32[0] != 0x3F7FFFFFu) { printf("fma(1, 1, -2^-60) = %08X, want 3F7FFFFF\n", r._u32[0]); bad++; }
+        if (bad || !hits || !exact_sums) {
+            printf("test_spu_float_neon: boundary pass: %ld mismatches, %ld rounded-onto-boundary lanes, "
+                   "%ld exact sums\n", bad, hits, exact_sums);
+            return 1;
+        }
+        printf("test_spu_float_neon: ok (%ld boundary cases: %ld rounded onto a boundary, %ld exact sums)\n",
+               M, hits, exact_sums);
+    }
+
     /* The NEON paths leave the thread in round-toward-zero; double precision
      * must still round to nearest: 1 + (2^-53 + 2^-60) -> 1 + 2^-52. */
     {
