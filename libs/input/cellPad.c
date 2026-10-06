@@ -448,13 +448,17 @@ static void pad_apply(PadHostState* hs, u16 btns, int lx, int ly, int rx, int ry
  * are held while they are in the file: UP DOWN LEFT RIGHT CROSS CIRCLE SQUARE
  * TRIANGLE L1 R1 L2 R2 L3 R3 START SELECT, plus LX=n LY=n RX=n RY=n (0-255,
  * centre 128). Empty or missing file = nothing held. Re-read on every poll
- * (a few hundred bytes at most). Only used when no real pad is on port 0. */
-static void pad_poll_file(void)
+ * (a few hundred bytes at most). Only used when no real pad is on port 0.
+ * It ADDS to the keyboard rather than replacing it (pad_poll_keys merges the
+ * two): replacing it left a person at the window unable to press anything
+ * while a script drove the pad. */
+static void pad_poll_file(u16* out_btns, int* out_lx, int* out_ly, int* out_rx, int* out_ry)
 {
     static const char* path = (const char*)-1;
     if (path == (const char*)-1) path = getenv("PS3_PAD_FILE");
+    *out_btns = 0; *out_lx = *out_ly = *out_rx = *out_ry = 128;
     if (!path) return;
-    PadHostState* hs = &s_host_state[0];
+    static u16 s_last_file_btns;
     char buf[512]; size_t n = 0;
     FILE* f = fopen(path, "r");
     if (f) { n = fread(buf, 1, sizeof buf - 1, f); fclose(f); }
@@ -478,10 +482,11 @@ static void pad_poll_file(void)
         for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
             if (!strcmp(tok, map[i].name)) btns |= map[i].btn;
     }
-    if (btns != hs->buttons) {
+    if (btns != s_last_file_btns) {
         printf("[cellPad] file pad: buttons 0x%04X\n", btns); fflush(stdout);
+        s_last_file_btns = btns;
     }
-    pad_apply(hs, btns, lx, ly, rx, ry);
+    *out_btns = btns; *out_lx = lx; *out_ly = ly; *out_rx = rx; *out_ry = ry;
 }
 
 /* Keyboard pad (macOS window): the Metal window records key state by
@@ -509,10 +514,19 @@ static void pad_poll_keys(void)
     for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
         if (pad_key(map[i].vk)) btns |= map[i].btn;
     /* Stick axes: 0 = left/up, 255 = right/down. */
-    const int lx = 128 + (pad_key(0x02) ? 127 : 0) - (pad_key(0x00) ? 128 : 0);   /* D, A */
-    const int ly = 128 + (pad_key(0x01) ? 127 : 0) - (pad_key(0x0D) ? 128 : 0);   /* S, W */
-    const int rx = 128 + (pad_key(0x25) ? 127 : 0) - (pad_key(0x26) ? 128 : 0);   /* L, J */
-    const int ry = 128 + (pad_key(0x28) ? 127 : 0) - (pad_key(0x22) ? 128 : 0);   /* K, I */
+    int lx = 128 + (pad_key(0x02) ? 127 : 0) - (pad_key(0x00) ? 128 : 0);   /* D, A */
+    int ly = 128 + (pad_key(0x01) ? 127 : 0) - (pad_key(0x0D) ? 128 : 0);   /* S, W */
+    int rx = 128 + (pad_key(0x25) ? 127 : 0) - (pad_key(0x26) ? 128 : 0);   /* L, J */
+    int ry = 128 + (pad_key(0x28) ? 127 : 0) - (pad_key(0x22) ? 128 : 0);   /* K, I */
+    /* PS3_PAD_FILE: its buttons are held in addition to the keys; an
+     * off-centre file axis wins over the keyboard's. */
+    { u16 fb; int flx, fly, frx, fry;
+      pad_poll_file(&fb, &flx, &fly, &frx, &fry);
+      btns |= fb;
+      if (flx != 128) lx = flx;
+      if (fly != 128) ly = fly;
+      if (frx != 128) rx = frx;
+      if (fry != 128) ry = fry; }
     PadHostState* hs = &s_host_state[0];
     if (btns != hs->buttons) { printf("[cellPad] keyboard: buttons 0x%04X\n", btns); fflush(stdout); }
     pad_apply(hs, btns, lx, ly, rx, ry);
@@ -541,7 +555,7 @@ static void pad_poll_backend(void)
 #endif
     { static int real0 = 0;
       if (s_host_state[0].connected && !getenv("PS3_PAD_FILE")) real0 = 1;
-      if (!real0) { if (getenv("PS3_PAD_FILE")) pad_poll_file(); else pad_poll_keys(); } }
+      if (!real0) pad_poll_keys(); }   /* keyboard, plus PS3_PAD_FILE if set */
 }
 
 /* ---------------------------------------------------------------------------
