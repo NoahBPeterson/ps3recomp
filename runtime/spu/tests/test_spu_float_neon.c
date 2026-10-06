@@ -116,6 +116,49 @@ int main(void)
                M, hits, exact_sums);
     }
 
+    /* Zero lanes are handled on the vector path (T-0014), so aim at them: every operand lane is
+     * drawn from zeros of every kind (+0, -0, and exponent-0 words with a nonzero fraction, which
+     * the SPU reads as zero), extended-range values, and ordinary values, so all mixes of zero
+     * operand position, sign and neighbour occur. */
+    {
+        static const uint32_t zeros[] = { 0x00000000u, 0x80000000u, 0x00000001u, 0x007FFFFFu, 0x807FFFFFu, 0x80400000u };
+        long zcases = 0;
+        const long M = 2000000;
+        for (long it = 0; it < M; it++) {
+            u128 a, b, c, got, ref;
+            for (int i = 0; i < 4; i++) {
+                uint32_t* w[3] = { &a._u32[i], &b._u32[i], &c._u32[i] };
+                for (int k = 0; k < 3; k++) {
+                    const uint32_t r = rnd32() % 8;
+                    *w[k] = r < 3 ? zeros[rnd32() % 6]
+                          : r == 3 ? ((rnd32() & 1u) << 31) | (255u << 23) | (rnd32() & 0x7FFFFFu)
+                          : rnd_float();
+                }
+                zcases += !((a._u32[i] >> 23) & 0xFF) || !((b._u32[i] >> 23) & 0xFF) || !((c._u32[i] >> 23) & 0xFF);
+            }
+            const int op = (int)(it % 6);
+            switch (op) {
+            case 0: got = spu_fa(a, b);      ref = spu_fa_ref(a, b); break;
+            case 1: got = spu_fs(a, b);      ref = spu_fs_ref(a, b); break;
+            case 2: got = spu_fm(a, b);      ref = spu_fm_ref(a, b); break;
+            case 3: got = spu_fma(a, b, c);  ref = spu_fma_ref(a, b, c); break;
+            case 4: got = spu_fms(a, b, c);  ref = spu_fms_ref(a, b, c); break;
+            default: got = spu_fnms(a, b, c); ref = spu_fnms_ref(a, b, c); break;
+            }
+            if (memcmp(&got, &ref, 16)) {
+                if (bad++ < 10)
+                    printf("MISMATCH (zero) op=%d a=%08X %08X %08X %08X b=%08X %08X %08X %08X c=%08X %08X %08X %08X\n"
+                           "  got=%08X %08X %08X %08X ref=%08X %08X %08X %08X\n", op,
+                           a._u32[0], a._u32[1], a._u32[2], a._u32[3], b._u32[0], b._u32[1], b._u32[2], b._u32[3],
+                           c._u32[0], c._u32[1], c._u32[2], c._u32[3],
+                           got._u32[0], got._u32[1], got._u32[2], got._u32[3],
+                           ref._u32[0], ref._u32[1], ref._u32[2], ref._u32[3]);
+            }
+        }
+        if (bad) { printf("test_spu_float_neon: %ld mismatches in the zero-lane pass\n", bad); return 1; }
+        printf("test_spu_float_neon: ok (%ld zero-lane cases, %ld lanes with a zero operand)\n", M, zcases);
+    }
+
     /* The NEON paths leave the thread in round-toward-zero; double precision
      * must still round to nearest: 1 + (2^-53 + 2^-60) -> 1 + 2^-52. */
     {
