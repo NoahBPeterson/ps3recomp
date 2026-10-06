@@ -646,6 +646,31 @@ SPU__NV_INLINE float32x2_t spu__nv_trunc(float64x2_t d, uint32x2_t* ok, const fl
     *ok = vmovn_u64(good);
     return vcvt_f32_f64(vreinterpretq_f64_u64(vandq_u64(u, vdupq_n_u64(~0x1FFFFFFFull))));
 }
+/* As spu__nv_trunc, but an exact zero result is accepted too; *zm marks those lanes so the caller
+ * can clear the sign (the SPU never produces -0). Used once true zeros (+-0.0 words) are fast-path
+ * operands: in double, 0 + y = y, x * 0 = +-0, 0 * y + z = z exactly -- the SPU's zero rules --
+ * and a zero result of nonzero operands is an exact cancellation, which the SPU returns as +0.
+ * The sign mask is computed beside the conversion, so it costs one AND on the result path. */
+SPU__NV_INLINE float32x2_t spu__nv_trunc0(float64x2_t d, uint32x2_t* ok, uint32x2_t* zm, const float64x2_t* err) {
+    const uint64x2_t u = vreinterpretq_u64_f64(d);
+    const uint64x2_t az = vceqzq_u64(vshlq_n_u64(u, 1));                  /* +-0 */
+    const int64x2_t e = vsubq_s64(vreinterpretq_s64_u64(vandq_u64(vshrq_n_u64(u, 52), vdupq_n_u64(0x7FF))), vdupq_n_s64(1023));
+    uint64x2_t good = vandq_u64(vcgeq_s64(e, vdupq_n_s64(-126)), vcleq_s64(e, vdupq_n_s64(127)));
+    if (err) good = vandq_u64(good, vorrq_u64(vtstq_u64(u, vdupq_n_u64(0x1FFFFFFFull)), vceqzq_f64(*err)));
+    *ok = vmovn_u64(vorrq_u64(good, az));
+    *zm = vmovn_u64(az);
+    return vcvt_f32_f64(vreinterpretq_f64_u64(vandq_u64(u, vdupq_n_u64(~0x1FFFFFFFull))));
+}
+/* A lane the fast path takes: an ordinary single (biased exponent 1..254) or a true zero
+ * (+-0.0). Exponent-0 words with a nonzero fraction are zero on the SPU but not in double, so
+ * they still go to the fix-up. */
+SPU__NV_INLINE uint32x4_t spu__nv_plain0(uint32x4_t x) {
+    return vorrq_u32(spu__nv_plain(x), vceqzq_u32(vshlq_n_u32(x, 1)));
+}
+/* r with the sign cleared in the lanes whose result is zero */
+SPU__NV_INLINE uint32x4_t spu__nv_pos0(uint32x4_t r, uint32x2_t zlo, uint32x2_t zhi) {
+    return vbicq_u32(r, vandq_u32(vcombine_u32(zlo, zhi), vdupq_n_u32(0x80000000u)));
+}
 SPU__NV_INLINE int spu__nv_all4(uint32x4_t m) { return vminvq_u32(m) == 0xFFFFFFFFu; }
 SPU__NV_INLINE float64x2_t spu__nv_lo(uint32x4_t x) { return vcvt_f64_f32(vget_low_f32(vreinterpretq_f32_u32(x))); }
 SPU__NV_INLINE float64x2_t spu__nv_hi(uint32x4_t x) { return vcvt_high_f64_f32(vreinterpretq_f32_u32(x)); }
@@ -654,34 +679,112 @@ SPU__NV_INLINE float64x2_t spu__nv_hi(uint32x4_t x) { return vcvt_high_f64_f32(v
  * with the fast path's vector result kept every fa/fm/fma result in x-registers, with fmov round
  * trips, on the fast path too (fa 5.3 -> 9.8 ns). */
 #define SPU__NV_LANES(v, m) uint32_t m[4]; vst1q_u32(m, v)
+SPU__NV_INLINE uint32x4_t spu__nv_vec(float32x2_t lo, float32x2_t hi) { return vreinterpretq_u32_f32(vcombine_f32(lo, hi)); }
+SPU__NV_INLINE uint32x4_t spu__nv_zero(uint32x4_t x) { return vceqzq_u32(spu__nv_bexp(x)); }   /* biased exponent 0: zero */
+/* SPU_FLOATFIX_STATS=1: count why lanes reach the fix-ups (T-0014) and print the tally every
+ * 2^24 lanes. Only the cold fix-ups count, so it costs nothing on the fast path; the counters
+ * are one weak global shared by every TU that includes this header. */
+enum { SPU_FF_ZX, SPU_FF_ZY, SPU_FF_EXT, SPU_FF_GAP, SPU_FF_RANGE, SPU_FF_BOUNDARY, SPU_FF_N };
+__attribute__((weak)) uint64_t spu_floatfix_stats[3][SPU_FF_N];
+__attribute__((weak)) uint64_t spu_floatfix_vectors[3];
+__attribute__((weak)) int spu_floatfix_on = -1;
+__attribute__((weak)) uint64_t spu_floatfix_lanes;
+static inline __attribute__((cold, noinline)) void spu__ff_count(int op, int why) {
+    static const char* const ops[3] = { "fa/fs", "fm", "fma/fms/fnms" };
+    __atomic_fetch_add(&spu_floatfix_stats[op][why], 1, __ATOMIC_RELAXED);
+    if ((__atomic_add_fetch(&spu_floatfix_lanes, 1, __ATOMIC_RELAXED) & 0xFFFFFF) != 0) return;
+    uint64_t n = 0;
+    for (int o = 0; o < 3; o++) for (int k = 0; k < SPU_FF_N; k++) n += __atomic_load_n(&spu_floatfix_stats[o][k], __ATOMIC_RELAXED);
+    char buf[640]; int p = snprintf(buf, sizeof buf, "[spu-floatfix] %llu lanes:", (unsigned long long)n);
+    for (int o = 0; o < 3; o++)
+        p += snprintf(buf + p, sizeof buf - p, "  %s vec=%llu zero-a=%llu zero-b=%llu ext=%llu gap=%llu range=%llu boundary=%llu;",
+                      ops[o], (unsigned long long)spu_floatfix_vectors[o],
+                      (unsigned long long)spu_floatfix_stats[o][SPU_FF_ZX], (unsigned long long)spu_floatfix_stats[o][SPU_FF_ZY],
+                      (unsigned long long)spu_floatfix_stats[o][SPU_FF_EXT], (unsigned long long)spu_floatfix_stats[o][SPU_FF_GAP],
+                      (unsigned long long)spu_floatfix_stats[o][SPU_FF_RANGE], (unsigned long long)spu_floatfix_stats[o][SPU_FF_BOUNDARY]);
+    fprintf(stderr, "%s\n", buf);
+}
+static inline int spu__ff_enabled(void) {
+    int on = __atomic_load_n(&spu_floatfix_on, __ATOMIC_RELAXED);
+    if (on < 0) { const char* e = getenv("SPU_FLOATFIX_STATS"); on = (e && e[0] == '1');
+                  __atomic_store_n(&spu_floatfix_on, on, __ATOMIC_RELAXED); }
+    return on;
+}
+static inline uint32_t spu__ff_be(uint32_t v) { return (v >> 23) & 0xFFu; }
+static inline int spu__ff_why_fa(uint32_t x, uint32_t y);
+static inline int spu__ff_why_fm(uint32_t x, uint32_t y);
+static inline int spu__ff_why_fma(uint32_t x, uint32_t y, uint32_t z, uint32_t negp, uint32_t negc);
+static inline __attribute__((cold, noinline)) void spu__ff_tally(int op, uint32x4_t ok, uint32x4_t a, uint32x4_t b,
+                                                                  uint32x4_t c, uint32_t negp, uint32_t negc) {
+    SPU__NV_LANES(ok, m); SPU__NV_LANES(a, x); SPU__NV_LANES(b, y); SPU__NV_LANES(c, z);
+    __atomic_fetch_add(&spu_floatfix_vectors[op], 1, __ATOMIC_RELAXED);
+    for (int i = 0; i < 4; i++) if (!m[i])
+        spu__ff_count(op, op == 0 ? spu__ff_why_fa(x[i], y[i]) : op == 1 ? spu__ff_why_fm(x[i], y[i])
+                                  : spu__ff_why_fma(x[i], y[i], z[i], negp, negc));
+}
+/* Why a fa/fs lane failed (y already sign-adjusted). zero-a/zero-b: operand 1/2 is zero;
+ * ext: an operand is extended range; gap: exponents differ by more than 29; range: the
+ * result is not a normal single. */
+static inline int spu__ff_why_fa(uint32_t x, uint32_t y) {
+    const int bx = (int)spu__ff_be(x), by = (int)spu__ff_be(y);
+    if (!bx) return SPU_FF_ZX;
+    if (!by) return SPU_FF_ZY;
+    if (bx == 255 || by == 255) return SPU_FF_EXT;
+    if (bx - by > 29 || by - bx > 29) return SPU_FF_GAP;
+    return SPU_FF_RANGE;
+}
+static inline int spu__ff_why_fm(uint32_t x, uint32_t y) {
+    const int bx = (int)spu__ff_be(x), by = (int)spu__ff_be(y);
+    if (!bx) return SPU_FF_ZX;
+    if (!by) return SPU_FF_ZY;
+    if (bx == 255 || by == 255) return SPU_FF_EXT;
+    return SPU_FF_RANGE;
+}
+/* fma: zero-a = the product is zero (x or y), zero-b = the addend is zero; boundary = the
+ * TwoSum test (rounded onto a 24-bit boundary), told apart from range by redoing the sum. */
+static inline int spu__ff_why_fma(uint32_t x, uint32_t y, uint32_t z, uint32_t negp, uint32_t negc) {
+    const int bx = (int)spu__ff_be(x), by = (int)spu__ff_be(y), bz = (int)spu__ff_be(z);
+    if (!bx || !by) return SPU_FF_ZX;
+    if (!bz) return SPU_FF_ZY;
+    if (bx == 255 || by == 255 || bz == 255) return SPU_FF_EXT;
+    const double s = (double)spu__sf_f(x ^ negp) * (double)spu__sf_f(y) + (double)spu__sf_f(z ^ negc);
+    uint64_t u; memcpy(&u, &s, 8);
+    const int e = (int)((u >> 52) & 0x7FFu) - 1023;
+    return (e < -126 || e > 127) ? SPU_FF_RANGE : SPU_FF_BOUNDARY;
+}
 SPU__NV_SLOW uint32x4_t spu__fa_fix(uint32x4_t r, uint32x4_t ok, uint32x4_t a, uint32x4_t b, uint32_t negb) {
+    if (spu__ff_enabled()) spu__ff_tally(0, ok, a, veorq_u32(b, vdupq_n_u32(negb)), b, 0, 0);
     SPU__NV_LANES(r, o); SPU__NV_LANES(ok, m); SPU__NV_LANES(a, x); SPU__NV_LANES(b, y);
     for (int i = 0; i < 4; i++) if (!m[i]) o[i] = spu__fa_any(x[i], y[i] ^ negb);
     return vld1q_u32(o);
 }
 SPU__NV_SLOW uint32x4_t spu__fm_fix(uint32x4_t r, uint32x4_t ok, uint32x4_t a, uint32x4_t b) {
+    if (spu__ff_enabled()) spu__ff_tally(1, ok, a, b, b, 0, 0);
     SPU__NV_LANES(r, o); SPU__NV_LANES(ok, m); SPU__NV_LANES(a, x); SPU__NV_LANES(b, y);
     for (int i = 0; i < 4; i++) if (!m[i]) o[i] = spu__fm_any(x[i], y[i]);
     return vld1q_u32(o);
 }
 SPU__NV_SLOW uint32x4_t spu__fma_fix(uint32x4_t r, uint32x4_t ok, uint32x4_t a, uint32x4_t b, uint32x4_t c,
                                      uint32_t negp, uint32_t negc) {
+    if (spu__ff_enabled()) spu__ff_tally(2, ok, a, b, c, negp, negc);
     SPU__NV_LANES(r, o); SPU__NV_LANES(ok, m); SPU__NV_LANES(a, x); SPU__NV_LANES(b, y); SPU__NV_LANES(c, z);
     for (int i = 0; i < 4; i++) if (!m[i]) o[i] = spu__fma_any(x[i], y[i], z[i], negp, negc);
     return vld1q_u32(o);
 }
 SPU__NV_INLINE u128 spu__nv_u128(uint32x4_t v) { u128 r; vst1q_u32(r._u32, v); return r; }
-SPU__NV_INLINE uint32x4_t spu__nv_vec(float32x2_t lo, float32x2_t hi) { return vreinterpretq_u32_f32(vcombine_f32(lo, hi)); }
 SPU__NV_INLINE u128 spu__nv_fa(u128 a, u128 b, uint32_t negb) {
     const uint32x4_t xa = vld1q_u32(a._u32), yb = vld1q_u32(b._u32);
     const uint32x4_t x = xa, y = veorq_u32(yb, vdupq_n_u32(negb));
-    const uint32x4_t pre = vandq_u32(vandq_u32(spu__nv_plain(x), spu__nv_plain(y)),
-                                     vcleq_u32(vabdq_u32(spu__nv_bexp(x), spu__nv_bexp(y)), vdupq_n_u32(29)));
-    uint32x2_t oklo, okhi;
-    const float32x2_t lo = spu__nv_trunc(vaddq_f64(spu__nv_lo(x), spu__nv_lo(y)), &oklo, NULL);
-    const float32x2_t hi = spu__nv_trunc(vaddq_f64(spu__nv_hi(x), spu__nv_hi(y)), &okhi, NULL);
+    const uint32x4_t px = spu__nv_plain0(x), py = spu__nv_plain0(y);
+    /* the exponent-gap limit applies only between two nonzero terms */
+    const uint32x4_t pre = vandq_u32(vandq_u32(px, py),
+                                     vorrq_u32(vcleq_u32(vabdq_u32(spu__nv_bexp(x), spu__nv_bexp(y)), vdupq_n_u32(29)),
+                                               vorrq_u32(vceqzq_u32(vshlq_n_u32(x, 1)), vceqzq_u32(vshlq_n_u32(y, 1)))));
+    uint32x2_t oklo, okhi, zlo, zhi;
+    const float32x2_t lo = spu__nv_trunc0(vaddq_f64(spu__nv_lo(x), spu__nv_lo(y)), &oklo, &zlo, NULL);
+    const float32x2_t hi = spu__nv_trunc0(vaddq_f64(spu__nv_hi(x), spu__nv_hi(y)), &okhi, &zhi, NULL);
     const uint32x4_t ok = vandq_u32(pre, vcombine_u32(oklo, okhi));
-    uint32x4_t r = spu__nv_vec(lo, hi);
+    uint32x4_t r = spu__nv_pos0(spu__nv_vec(lo, hi), zlo, zhi);
     if (!spu__nv_all4(ok)) r = spu__fa_fix(r, ok, xa, yb, negb);
     return spu__nv_u128(r);
 }
@@ -689,11 +792,11 @@ SPU__NV_INLINE u128 spu_fa(u128 a, u128 b) { return spu__nv_fa(a, b, 0); }
 SPU__NV_INLINE u128 spu_fs(u128 a, u128 b) { return spu__nv_fa(a, b, 0x80000000u); }
 SPU__NV_INLINE u128 spu_fm(u128 a, u128 b) {
     const uint32x4_t x = vld1q_u32(a._u32), y = vld1q_u32(b._u32);
-    uint32x2_t oklo, okhi;
-    const float32x2_t lo = spu__nv_trunc(vmulq_f64(spu__nv_lo(x), spu__nv_lo(y)), &oklo, NULL);
-    const float32x2_t hi = spu__nv_trunc(vmulq_f64(spu__nv_hi(x), spu__nv_hi(y)), &okhi, NULL);
-    const uint32x4_t ok = vandq_u32(vandq_u32(spu__nv_plain(x), spu__nv_plain(y)), vcombine_u32(oklo, okhi));
-    uint32x4_t r = spu__nv_vec(lo, hi);
+    uint32x2_t oklo, okhi, zlo, zhi;
+    const float32x2_t lo = spu__nv_trunc0(vmulq_f64(spu__nv_lo(x), spu__nv_lo(y)), &oklo, &zlo, NULL);
+    const float32x2_t hi = spu__nv_trunc0(vmulq_f64(spu__nv_hi(x), spu__nv_hi(y)), &okhi, &zhi, NULL);
+    const uint32x4_t ok = vandq_u32(vandq_u32(spu__nv_plain0(x), spu__nv_plain0(y)), vcombine_u32(oklo, okhi));
+    uint32x4_t r = spu__nv_pos0(spu__nv_vec(lo, hi), zlo, zhi);
     if (!spu__nv_all4(ok)) r = spu__fm_fix(r, ok, x, y);
     return spu__nv_u128(r);
 }
@@ -710,15 +813,15 @@ SPU__NV_INLINE float64x2_t spu__nv_twosum(float64x2_t p, float64x2_t z, float64x
 SPU__NV_INLINE u128 spu__nv_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
     const uint32x4_t xa = vld1q_u32(a._u32), y = vld1q_u32(b._u32), zc = vld1q_u32(c._u32);
     const uint32x4_t x = veorq_u32(xa, vdupq_n_u32(negp)), z = veorq_u32(zc, vdupq_n_u32(negc));
-    uint32x2_t oklo, okhi;
+    uint32x2_t oklo, okhi, zlo, zhi;
     float64x2_t elo, ehi;
     const float64x2_t slo = spu__nv_twosum(vmulq_f64(spu__nv_lo(x), spu__nv_lo(y)), spu__nv_lo(z), &elo);
     const float64x2_t shi = spu__nv_twosum(vmulq_f64(spu__nv_hi(x), spu__nv_hi(y)), spu__nv_hi(z), &ehi);
-    const float32x2_t lo = spu__nv_trunc(slo, &oklo, &elo);
-    const float32x2_t hi = spu__nv_trunc(shi, &okhi, &ehi);
-    const uint32x4_t ok = vandq_u32(vandq_u32(vandq_u32(spu__nv_plain(x), spu__nv_plain(y)), spu__nv_plain(z)),
+    const float32x2_t lo = spu__nv_trunc0(slo, &oklo, &zlo, &elo);
+    const float32x2_t hi = spu__nv_trunc0(shi, &okhi, &zhi, &ehi);
+    const uint32x4_t ok = vandq_u32(vandq_u32(vandq_u32(spu__nv_plain0(x), spu__nv_plain0(y)), spu__nv_plain0(z)),
                                     vcombine_u32(oklo, okhi));
-    uint32x4_t r = spu__nv_vec(lo, hi);
+    uint32x4_t r = spu__nv_pos0(spu__nv_vec(lo, hi), zlo, zhi);
     if (!spu__nv_all4(ok)) r = spu__fma_fix(r, ok, xa, y, zc, negp, negc);
     return spu__nv_u128(r);
 }
