@@ -696,17 +696,6 @@ static inline DWORD     GetTickCount(void)   { return (DWORD)(ps3__mono_ns() / 1
 static inline BOOL QueryPerformanceFrequency(LARGE_INTEGER* f) { f->QuadPart = 1000000000LL; return TRUE; }
 static inline BOOL QueryPerformanceCounter  (LARGE_INTEGER* c) { c->QuadPart = (LONGLONG)ps3__mono_ns(); return TRUE; }
 
-/* File-existence gate, as GetFileAttributesA is used for upstream (the only
- * call sites check `!= INVALID_FILE_ATTRIBUTES`). */
-#ifndef INVALID_FILE_ATTRIBUTES
-#  define INVALID_FILE_ATTRIBUTES 0xFFFFFFFFu
-#endif
-#define FILE_ATTRIBUTE_NORMAL 0x00000080u
-static inline DWORD GetFileAttributesA(const char* path)
-{
-    return path && access(path, F_OK) == 0 ? FILE_ATTRIBUTE_NORMAL : INVALID_FILE_ATTRIBUTES;
-}
-
 /* 100 ns units since 1601-01-01, as GetSystemTimeAsFileTime reports. */
 static inline void GetSystemTimeAsFileTime(FILETIME* ft)
 {
