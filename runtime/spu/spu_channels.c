@@ -75,6 +75,19 @@ void (*g_spu_line_commit_hook)(uint32_t line) = 0;
 #define SPU_WATCH_MAX 4
 int g_spu_ls_watch_n = -1;
 static unsigned s_spu_ls_watch[SPU_WATCH_MAX];
+/* SPU_LS_WATCH_PC=<lo>:<hi> filter (see spu_ls_watch_slow). */
+static int      s_watch_pc_on;
+static uint32_t s_watch_pc_lo, s_watch_pc_hi;
+static int      s_watch_img = -2;    /* -2 = unread, -1 = any, else an image id */
+static int      s_watch_img_neg;    /* SPU_LS_WATCH_IMG=!id: report all but id */
+/* SPU_LS_WATCH_RING: record hits in per-line rings instead of printing (see
+ * the SPU_LS_WATCH_RING comment in spu_ls_watch_slow). 4096 hits per watched
+ * line; fault paths dump them via spu_ls_watch_dump(). */
+#define SPU_WATCH_RING 4096
+struct spu_watch_ent { uint8_t wr; uint8_t img_pad[3]; int32_t img; uint32_t pc, lr; uint8_t data[16]; };
+static struct spu_watch_ent s_watch_ring[SPU_WATCH_MAX][SPU_WATCH_RING];
+static uint32_t s_watch_ring_pos[SPU_WATCH_MAX];
+static int      s_watch_ring_n = -1;
 /* One gate for every LS-access debug hook (spu_ls_read128/write128): nonzero
  * when any of SPU_LS_WATCH, SPU_LS_LOWREAD, SPU_SMC_WATCH or SPU_WWS_PROBES is
  * set. Resolved before main, so the disabled path is one load and a branch. */
@@ -85,6 +98,20 @@ __attribute__((constructor)) static void spu_ls_dbg_init(void)
     g_spu_ls_probe  = getenv("SPU_LS_LOWREAD") ? 1 : 0;
     g_spu_smc_watch = getenv("SPU_SMC_WATCH") ? 1 : 0;
     g_spu_ls_dbg = n || g_spu_ls_probe || g_spu_smc_watch || getenv("SPU_WWS_PROBES");
+    const char* wpc = getenv("SPU_LS_WATCH_PC");
+    if (wpc) {
+        char* d;
+        s_watch_pc_lo = (uint32_t)strtoul(wpc, &d, 16);
+        s_watch_pc_hi = (*d == ':') ? (uint32_t)strtoul(d + 1, 0, 16) : s_watch_pc_lo;
+        s_watch_pc_on = 1;
+    }
+    const char* wim = getenv("SPU_LS_WATCH_IMG");
+    if (wim) {
+        if (*wim == '!') { s_watch_img_neg = 1; ++wim; }
+        s_watch_img = (int)strtol(wim, 0, 0);
+    }
+    const char* wring = getenv("SPU_LS_WATCH_RING");
+    if (wring) s_watch_ring_n = (int)strtol(wring, 0, 0) ? 1 : 0;  /* any value = on */
 }
 unsigned* spu_ls_watch_list(int* out_n)
 {
@@ -99,22 +126,100 @@ unsigned* spu_ls_watch_list(int* out_n)
     *out_n = g_spu_ls_watch_n;
     return s_spu_ls_watch;
 }
-void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
+/* SPU_LS_WATCH_PC=<lo>:<hi>: only report accesses whose pc is inside [lo, hi).
+ * SPU_LS_WATCH_IMG=<id>|!<id>: only report accesses from that image id
+ * ("!id" = every image except that one; -1 = any).
+ * Both pair with SPU_LS_WATCH to silence the owner of the watched line -- e.g.
+ * watch the SPURS kernel stack at the top of local store but log only job
+ * code (pc >= 0x4000), so the kernel's own legitimate stack traffic does not
+ * bury the one foreign write that corrupts it (T-0001). A second image using
+ * the same LS lines as its own stack (the audio policy module runs its ABI
+ * stack at the same top-of-LS addresses on its own SPU) is silenced by the
+ * image filter the same way. */
+void spu_ls_watch_slow(const struct spu_context* c, uint32_t lsa, int is_write, const uint8_t* p,
+                       uint32_t pc, uint32_t lr)
 {
     int n; spu_ls_watch_list(&n);
     if (!n) return;
+    if (s_watch_pc_on && !(pc >= s_watch_pc_lo && pc < s_watch_pc_hi)) return;
+    if (s_watch_img_neg) {
+        if (c && c->image_id == s_watch_img) return;
+    } else if (s_watch_img >= 0) {
+        if (!c || c->image_id != s_watch_img) return;
+    } else if (s_watch_img == -1 && !c) return;
     uint32_t a = lsa & (SPU_LS_MASK & ~0xFu);
     for (int i = 0; i < g_spu_ls_watch_n; i++) {
         if (s_spu_ls_watch[i] == a) {
-            fprintf(stderr, "[spu-watch %s 0x%05X pc=0x%05X lr=0x%05X] "
+            /* Race-transparent mode (SPU_LS_WATCH_RING=N): record the hit in a
+             * per-slot lock-free ring instead of printing. No I/O, no locks, no
+             * fflush on the SPU hot path -- timing stays near-native so a
+             * scheduling-dependent corruption (T-0001 suspected race) is not
+             * hidden by the trap's own serialization. The ring keeps the last N
+             * hits per watched line; spu_ls_watch_dump() prints them, called
+             * from the fault paths (BRANCH-TO-0 / unimplemented op / thread
+             * stop) so the writer of the corrupting store is in the tail. */
+            if (s_watch_ring_n > 0) {
+                struct spu_watch_ent* e =
+                    &s_watch_ring[i][__atomic_fetch_add(&s_watch_ring_pos[i], 1, __ATOMIC_RELAXED) & (SPU_WATCH_RING - 1)];
+                e->wr = (uint8_t)is_write; e->pc = pc; e->lr = lr; e->img = c ? c->image_id : -1;
+                memcpy(e->data, p, 16);
+                return;
+            }
+            fprintf(stderr, "[spu-watch %s 0x%05X pc=0x%05X lr=0x%05X img=%d] "
                 "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
-                is_write ? "WR" : "rd", a, pc, lr,
+                is_write ? "WR" : "rd", a, pc, lr, c ? c->image_id : -1,
                 p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
                 p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
             fflush(stderr);
             break;
         }
     }
+}
+
+/* DMA landing on a watched line, ring-recorded (see spu_dma.h): the PPU/kernel
+ * fills SPU buffers via GET, and the store-side watch in spu_ls_write128 never
+ * sees those. Records the landing with the source EA in the lr slot (EAs are
+ * main-memory addresses, visually distinct from LS link registers). */
+int spu_ls_watch_ring_dma(struct spu_context* spu, uint32_t line, uint32_t ea,
+                          uint32_t size, const uint8_t* q16)
+{
+    int n; spu_ls_watch_list(&n);
+    if (s_watch_ring_n <= 0 || !n) return 0;
+    uint32_t a = line & (SPU_LS_MASK & ~0xFu);
+    for (int i = 0; i < g_spu_ls_watch_n; i++) {
+        if (s_spu_ls_watch[i] == a) {
+            struct spu_watch_ent* e =
+                &s_watch_ring[i][__atomic_fetch_add(&s_watch_ring_pos[i], 1, __ATOMIC_RELAXED) & (SPU_WATCH_RING - 1)];
+            e->wr = 1; e->pc = spu ? spu->pc : 0; e->lr = ea; e->img = spu ? spu->image_id : -1;
+            memcpy(e->data, q16, 16);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- ring-buffer watch dump (see the SPU_LS_WATCH_RING comment above) ---- */
+void spu_ls_watch_dump(const char* why)
+{
+    if (s_watch_ring_n <= 0) return;
+    int n; spu_ls_watch_list(&n);
+    if (!n) return;
+    for (int i = 0; i < g_spu_ls_watch_n; i++) {
+        uint32_t pos = s_watch_ring_pos[i];
+        uint32_t start = pos < SPU_WATCH_RING ? 0 : pos - SPU_WATCH_RING;  /* print oldest first */
+        uint32_t last  = pos < SPU_WATCH_RING ? pos : SPU_WATCH_RING;
+        fprintf(stderr, "[spu-watch-ring line 0x%05X %s: %u hits, last %u]\n",
+                s_spu_ls_watch[i], why, pos, last);
+        for (uint32_t k = start; k < pos; k++) {
+            struct spu_watch_ent* e = &s_watch_ring[i][k & (SPU_WATCH_RING - 1)];
+            fprintf(stderr, "  #%u %s pc=0x%05X lr=0x%05X img=%d] "
+                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                k, e->wr ? "WR" : "rd", e->pc, e->lr, e->img,
+                e->data[0],e->data[1],e->data[2],e->data[3], e->data[4],e->data[5],e->data[6],e->data[7],
+                e->data[8],e->data[9],e->data[10],e->data[11], e->data[12],e->data[13],e->data[14],e->data[15]);
+        }
+    }
+    fflush(stderr);
 }
 
 static SPU_TLS jmp_buf s_spu_halt_env;
@@ -148,6 +253,14 @@ void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
 
 void spu_halt(spu_context* ctx)
 {
+    /* T-0001 (2026-10-08): a halt with an interrupt register save still
+     * armed strands the stale snapshot -- in the persistent LLE thread it
+     * survives to false-fire on a later dispatch. Log it. */
+    { static int _n = 0;
+      if (ctx->irq_saved && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8)
+          fprintf(stderr, "[t0001-irq] HALT with save armed (resume=%05X) -- "
+                  "stale snapshot survives the halt\n",
+                  ctx->irq_resume_pc & SPU_LS_MASK); }
     /* Register/context dump at halt-asserts: the WWS job's parameter guard
      * (heqi 0x1650 in job_wws_7BD900) checks (r12 bit0) & (r9 16-aligned) &
      * (r15 != 0) -- job descriptor/ABI values our execute path must supply.
@@ -2761,9 +2874,28 @@ void spu_indirect_branch(spu_context* ctx)
      * LS 0 in this path is a re-entry. Treat it as job end. */
     if (!ctx->policy_mode && ctx->pc == 0 && ctx->image_id > 0) {
         static int _n = 0;
-        if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8)
+        if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8) {
             fprintf(stderr, "[spurs-job] img=%d returned to the job manager "
                     "(branch to LS 0) -- job complete\n", ctx->image_id);
+            /* T-0001 (2026-10-07): boot20 (furthest-ever progression) hit this
+             * path in the SAME audio window where every other boot faults from
+             * the 28-byte-record context smash. The record's word 5 is
+             * 00000000 -- a smashed link restored to r0=0 would branch HERE
+             * and be misread as a clean job completion, converting the crash
+             * into the observed black-screen deadlock (PPU job manager blocks
+             * in sys_event_queue_receive; game thread spins; SPUs idle).
+             * Log the register state so the next occurrence shows which it
+             * is: record floats in r1/r2/r3 = the corruption; clean
+             * LS-pointer-looking values = a genuine completion path. */
+            fprintf(stderr, "[spurs-job]   r0=%08X %08X %08X %08X  r1=%08X %08X %08X %08X\n",
+                    ctx->gpr[0]._u32[0], ctx->gpr[0]._u32[1], ctx->gpr[0]._u32[2], ctx->gpr[0]._u32[3],
+                    ctx->gpr[1]._u32[0], ctx->gpr[1]._u32[1], ctx->gpr[1]._u32[2], ctx->gpr[1]._u32[3]);
+            fprintf(stderr, "[spurs-job]   r2=%08X %08X %08X %08X  r3=%08X %08X %08X %08X  sp(r1)=%05X\n",
+                    ctx->gpr[2]._u32[0], ctx->gpr[2]._u32[1], ctx->gpr[2]._u32[2], ctx->gpr[2]._u32[3],
+                    ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1], ctx->gpr[3]._u32[2], ctx->gpr[3]._u32[3],
+                    ctx->gpr[1]._u32[0] & SPU_LS_MASK);
+            fflush(stderr);
+        }
         spu_halt(ctx);
         return;
     }
@@ -2832,7 +2964,8 @@ void spu_indirect_branch(spu_context* ctx)
                      ? (unsigned)ctx->image_id : 0;
       if (_bt0[img]++ < BT0_PER_IMG)
         fprintf(stderr, "[SPU] BRANCH-TO-0 unresolved pc=0x%05X image=%d lr=0x%05X\n",
-                ctx->pc, ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
+                ctx->pc, ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+      spu_ls_watch_dump("branch-to-0"); }
     /* One-shot: the FMOD null-handler DSP node carries a PPU descriptor EA at
      * node+0x14 (observed 0x93C3C0). Dump it to identify which plugin/unit
      * type never got its SPU code streamed (env SPU_DSPDESC=<hex ea>). */

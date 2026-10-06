@@ -43,15 +43,25 @@ extern "C" {
  * kept it out of line) and ~9% of GH3's FMOD mixer task. The list lives in
  * spu_channels.c; g_spu_ls_watch_n is -1 until the first check reads the env. */
 extern int g_spu_ls_watch_n;
-void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr);
+struct spu_context;
+void spu_ls_watch_slow(const struct spu_context* c, uint32_t lsa, int is_write,
+                       const uint8_t* p, uint32_t pc, uint32_t lr);
+/* SPU_LS_WATCH_RING fault-path dump: prints the recorded hits per watched
+ * line, oldest first. Call from SPU fault handling (branch-to-0, bad op,
+ * thread stop) -- the tail names the store that corrupted the LS. */
+void spu_ls_watch_dump(const char* why);
 unsigned* spu_ls_watch_list(int* out_n);   /* the armed lines (n may be 0) */
-static inline void spu_ls_watch_hit2(uint32_t lsa, int is_write, const uint8_t* p,
-                                     uint32_t pc, uint32_t lr) {
+/* Ring-record a DMA landing on a watched line (ring mode only); returns 1 if
+ * recorded, 0 when ring mode is off (caller prints). T-0001. */
+int spu_ls_watch_ring_dma(struct spu_context* spu, uint32_t line, uint32_t ea,
+                         uint32_t size, const uint8_t* q16);
+static inline void spu_ls_watch_hit2(const struct spu_context* c, uint32_t lsa, int is_write,
+                                     const uint8_t* p, uint32_t pc, uint32_t lr) {
     if (__builtin_expect(g_spu_ls_watch_n == 0, 1)) return;
-    spu_ls_watch_slow(lsa, is_write, p, pc, lr);
+    spu_ls_watch_slow(c, lsa, is_write, p, pc, lr);
 }
 static inline void spu_ls_watch_hit(uint32_t lsa, int is_write, const uint8_t* p) {
-    spu_ls_watch_hit2(lsa, is_write, p, 0, 0);
+    spu_ls_watch_hit2(0, lsa, is_write, p, 0, 0);
 }
 
 /* Maximum number of MFC tag groups */
@@ -199,6 +209,11 @@ typedef struct spu_context {
      * checked by blocking channel waits, interpreter steps and lifted
      * trampoline transfers, which then leave the SPU stopped. */
     uint32_t stop_request;
+    /* Test hook (T-0001): when >0, spu_interp_run_until bails out after this
+     * many steps with status still RUNNING -- lets the regression suite run
+     * the never-exiting hang families (count % 4 != 0) against real guest
+     * bytes without looping forever. */
+    uint32_t interp_step_budget;
     #define SPU_STATUS_STOPPED      0x0
     #define SPU_STATUS_RUNNING      0x1
     #define SPU_STATUS_STOPPED_BY_STOP  0x2
@@ -400,6 +415,7 @@ typedef struct spu_context {
      * the handler's registers. */
     int      irq_saved;
     uint32_t irq_resume_pc;
+    uint64_t irq_save_steps;   /* T-0001: ctx->steps at take, for stale-restore detection */
     u128     irq_gpr[128];
 
     /* Return pc of the innermost spu_drain_call (0 = none). The interpreter
@@ -559,7 +575,7 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     u128 v;
     if (__builtin_expect(g_spu_ls_dbg != 0, 0)) {
         spu_ls_read_probe(ctx, lsa);
-        spu_ls_watch_hit2(lsa & (SPU_LS_MASK & ~0xFu), 0, &ctx->ls[lsa & (SPU_LS_MASK & ~0xFu)],
+        spu_ls_watch_hit2(ctx, lsa & (SPU_LS_MASK & ~0xFu), 0, &ctx->ls[lsa & (SPU_LS_MASK & ~0xFu)],
                           (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
     }
     lsa &= SPU_LS_MASK & ~0xFu;
@@ -661,7 +677,7 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
     }
 #endif
     if (__builtin_expect(g_spu_ls_dbg != 0, 0)) {
-        spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
+        spu_ls_watch_hit2(ctx, lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                           ctx->gpr[0]._u32[0] & SPU_LS_MASK);
         if (g_spu_smc_watch) spu_ls_write_probe_smc(ctx, lsa, p);
     }

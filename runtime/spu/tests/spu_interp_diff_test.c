@@ -60,7 +60,7 @@ void spu_trace_pc(spu_context* c, uint32_t pc) { (void)c; (void)pc; }
 /* SPU_DIFF_SHOW=N: print up to N mismatches per op (default 3). */
 static int show_limit(void) { static int n = -1; if (n < 0) { const char* e = getenv("SPU_DIFF_SHOW"); n = e ? atoi(e) : 3; } return n; }
 uint8_t* vm_base = 0;   /* SPU_INTERP_XFER_LOG reads guest memory; never armed here */
-void spu_ls_watch_slow(uint32_t l, int w, const uint8_t* p, uint32_t pc, uint32_t lr) { (void)l;(void)w;(void)p;(void)pc;(void)lr; }
+void spu_ls_watch_slow(const spu_context* c, uint32_t l, int w, const uint8_t* p, uint32_t pc, uint32_t lr) { (void)c;(void)l;(void)w;(void)p;(void)pc;(void)lr; }
 
 enum { R_UNK = 0,
 #define X(m, v, n) R_##n,

@@ -328,14 +328,55 @@ static int spu_step(spu_context* ctx) {
     case SPU_brnz: if (PREF(DST) != 0) next = d.tgt; break;
     case SPU_brhz: if ((PREF(DST) & 0xFFFF) == 0) next = d.tgt; break;
     case SPU_brhnz:if ((PREF(DST) & 0xFFFF) != 0) next = d.tgt; break;
-    case SPU_bi:   next = PREF(A) & 0x3FFFC; break;
+    /* T-0001 (2026-10-08): the bi/iret interrupt-enable/disable bits (E =
+     * 0x40000 -> int_enable=1, D = 0x80000 -> int_enable=0, effective when the
+     * branch is taken) were decoded ONLY by the lifter; the interpreter dropped
+     * them, distorting every interrupt window that executes interpreted.
+     * Mirror spu_lifter.py:942-943. */
+    #define SPU_IED_BITS() do { \
+        if (insn & 0x40000u) ctx->int_enable = 1; \
+        else if (insn & 0x80000u) ctx->int_enable = 0; \
+    } while (0)
+    case SPU_bi:   next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); break;
     case SPU_bisl: { uint32_t tg = PREF(A) & 0x3FFFC;   /* read ra BEFORE the link write: rt may alias ra */
         DST = spu_link((pc + 4) & 0x3FFFC); next = tg; call_link = (pc + 4) & 0x3FFFC; break; }
     case SPU_bisled: { uint32_t tg = PREF(A) & 0x3FFFC;
         DST = spu_link((pc + 4) & 0x3FFFC);
-        if ((spu_ev_get(ctx) & ctx->event_mask) != 0) { next = tg; call_link = (pc + 4) & 0x3FFFC; }
+        if ((spu_ev_get(ctx) & ctx->event_mask) != 0) {
+            next = tg; call_link = (pc + 4) & 0x3FFFC;
+            SPU_IED_BITS(); }   /* E/D effective when taken, like the lift */
         break; }
-    case SPU_iret: next = ctx->srr0 & 0x3FFFC; break;
+    case SPU_iret: next = ctx->srr0 & 0x3FFFC;
+        /* T-0001 (2026-10-08, CONFIRMED root cause): the register-file
+         * save/restore contract was enforced ONLY on the lifted dispatch
+         * path (spu_indirect_branch -> spu_irq_regs_maybe_restore). The
+         * WWS interrupt handler's iret frequently executes HERE, in the
+         * interpreter, where irq_saved was never checked -- the restore
+         * was silently missed and the stale 128-GPR snapshot stayed
+         * armed in the persistent LLE thread, later false-firing
+         * (pc == resume && int_enable) on an unrelated dispatch and
+         * memcpy'ing interrupt-time registers over live job parameters.
+         * boot22's tripwires caught: 8 missed restores, 8 nested takes
+         * (each losing the outer snapshot), and 1 stale restore firing
+         * 145,874 steps after its take.
+         *
+         * Hardware contract: the handler preserves every register; state
+         * it publishes lives in LS/channels. On a genuine return to the
+         * take point, restore the interrupted register file. */
+        SPU_IED_BITS();                              /* E/D bits, like the lift */
+        if (ctx->irq_saved) {
+            if (next == (ctx->irq_resume_pc & SPU_LS_MASK)) {
+                memcpy(ctx->gpr, ctx->irq_gpr, sizeof ctx->irq_gpr);
+                ctx->irq_saved = 0;
+            } else {
+                static int _n = 0;
+                if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8)
+                    fprintf(stderr, "[t0001-irq] INTERP IRET to %05X but save "
+                            "resume=%05X -- mismatch, snapshot stays armed\n",
+                            next, ctx->irq_resume_pc & SPU_LS_MASK);
+            }
+        }
+        break;
     case SPU_biz:  if (PREF(DST) == 0) next = PREF(A) & 0x3FFFC; break;
     case SPU_binz: if (PREF(DST) != 0) next = PREF(A) & 0x3FFFC; break;
     case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) next = PREF(A) & 0x3FFFC; break;
@@ -357,6 +398,29 @@ static int spu_step(spu_context* ctx) {
     default:
         fprintf(stderr, "[spu_interp] unimplemented op '%s' (0x%08X) at LS 0x%05X\n",
                 d.op < SPU_OP_COUNT ? spu_op_name[d.op] : "?", insn, pc);
+        spu_ls_watch_dump("unimplemented-op");
+        /* T-0001: the recurring title-window faults die here (executing
+         * data after a smashed control chain). Give this path the same
+         * full LS + GPR state dump the branch-to-0 handler has, so every
+         * fault variant yields a fresh 256 KB dump for offline analysis.
+         * One-shot budget; path from YDKJ_SPU_LSDUMP else recomp_spu_ls.bin. */
+        { static int _dumped = 0;
+          if (__sync_fetch_and_add(&_dumped, 1) == 0) {
+            const char* dp = getenv("YDKJ_SPU_LSDUMP");
+            if (!dp || !*dp) dp = "recomp_spu_ls.bin";
+            FILE* lf = fopen(dp, "wb");
+            if (lf) { fwrite(ctx->ls, 1, SPU_LS_SIZE, lf); fclose(lf);
+                      fprintf(stderr, "[SPU] dumped 256KB LS -> %s\n", dp); }
+            fprintf(stderr, "[SPU] image_id=%d pc=0x%05X  GPR dump (r0..r127):\n",
+                    ctx->image_id, ctx->pc & SPU_LS_MASK);
+            for (int g = 0; g < 128; g++) {
+                fprintf(stderr, " r%-3d=%08X %08X %08X %08X", g,
+                        ctx->gpr[g]._u32[0], ctx->gpr[g]._u32[1],
+                        ctx->gpr[g]._u32[2], ctx->gpr[g]._u32[3]);
+                if ((g & 1) == 1) fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "\n"); fflush(stderr);
+          } }
         ctx->pc = pc; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1;
     }
     /* Interpreted code CALLING lifted code: run the callee as a subroutine and
@@ -524,6 +588,13 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         { static _Atomic int s_ti = -1; if (s_ti < 0) s_ti = getenv("SPU_TRACE_INTERP") ? 1 : 0;
           if (s_ti) { extern void spu_trace_pc(spu_context*, uint32_t); spu_trace_pc(ctx, ctx->pc); } }
         steps++;
+        /* T-0001 (2026-10-08): ctx->steps is the cross-path instruction clock
+         * (the drain loop bumps it once per lifted trampoline). The
+         * interpreter kept only this LOCAL counter, so ctx->steps froze
+         * during interpreted runs -- breaking the irq staleness metric and
+         * any timing analysis. Advance it here per interpreted instruction
+         * (closer to true rate than the trampoline approximation). */
+        ctx->steps++;
         /* SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
          * dumps its ring. Force a one-shot dump after N steps to see where it loops. */
         if (_tr>0 && _cap && steps == _cap) {
@@ -563,6 +634,11 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
             ctx->status = SPU_STATUS_STOPPED_BY_HALT; ctx->stop_code = 0;
             g_spu_interp_steps = steps;
             return 0;
+        }
+        if (ctx->interp_step_budget && steps >= ctx->interp_step_budget) {
+            /* test hook: budget exhausted while still running (T-0001) */
+            g_spu_interp_steps = steps;
+            return 0xFFFFFFFFu;
         }
         const int _st = spu_step(ctx);
         if (g_spu_oracle_trace_ctx == ctx && _tpc >= 0x3780 && g_spu_oracle_trace_left-- > 0) {
@@ -614,6 +690,7 @@ void spu_dispatch(spu_context* ctx, uint32_t target) {
         spu_lifted_fn fn = spu_lifted_lookup(ctx, target);
         if (fn) { ctx->pc = target; fn(ctx); return; }
         uint32_t next = spu_interp_run(ctx, target);
+        if (next == 0xFFFFFFFFu) return;   /* interp_step_budget exhausted (test hook) */
         if (ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT))
             return;
         if ((next & 0x3FFFC) == target) return;   /* no-progress guard */
