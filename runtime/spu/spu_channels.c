@@ -1726,7 +1726,10 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
  * a stack-switching routine without going through spu_indirect_branch. */
 void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
 {
-    if (!ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
+    /* The registry count first: it is a plain global, s_spu_halt_armed is
+     * thread-local (a _tlv_get_addr call on macOS), and with no stack-reset
+     * entries registered the loop below cannot fire. Runs on every dispatch. */
+    if (!s_stack_reset_count || !ctx->host_depth || ctx->policy_mode || !s_spu_halt_armed) return;
     for (unsigned i = 0; i < s_stack_reset_count; ++i)
         if (ctx->pc == s_stack_reset[i].entry &&
             fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
@@ -2325,7 +2328,9 @@ static int spu_smc_microstep(spu_context* ctx)
     return 0;
 }
 
-void spu_indirect_branch(spu_context* ctx)
+/* The full resolver. spu_indirect_branch (below) takes the common case itself
+ * and comes here for everything else. */
+static __attribute__((noinline)) void spu_indirect_branch_slow(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
      * of a computed pointer (e.g. a packed handle like 0x7a028803) are ignored.
@@ -2603,9 +2608,9 @@ void spu_indirect_branch(spu_context* ctx)
                            ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
                            interp ? "interpreting it" : "ending the job");
             for (unsigned q = 0; q < 8; q++) {
-                unsigned idx = (g_spu_pch_n + q) & 7u;
-                if (g_spu_pch_n > q || g_spu_pch[idx])
-                    bp += snprintf(buf + bp, sizeof buf - bp, " 0x%05X", g_spu_pch[idx]);
+                unsigned idx = (ctx->pch_n + q) & 7u;
+                if (ctx->pch_n > q || ctx->pch[idx])
+                    bp += snprintf(buf + bp, sizeof buf - bp, " 0x%05X", ctx->pch[idx]);
             }
             bp += snprintf(buf + bp, sizeof buf - bp, "\n");
             /* Eight words at the target and at the return address separate "the
@@ -3024,6 +3029,89 @@ void spu_indirect_branch(spu_context* ctx)
             ctx->ls[0x2d4ec],ctx->ls[0x2d4ed],ctx->ls[0x2d4ee],ctx->ls[0x2d4ef]); }
     } }
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
+}
+
+/* Indirect-branch fast path (T-0015). Every lifted indirect branch and every
+ * SPU_RET at depth 0 comes here -- millions of times a second -- and the full
+ * resolver above pays for its rare cases on each of them: a 0x570-byte frame,
+ * a thread-local lookup at entry, a dozen env-gated diagnostics. This takes
+ * only the case where the resolver would do nothing but look the target up
+ * and call it, decided by exactly the tests the resolver makes, and leaves
+ * every other case to it with ctx untouched:
+ *  - stop requested; an interrupt register restore pending (irq_saved);
+ *  - the policy-module service addresses, the taskset syscall address, the
+ *    resolver-only image, LS 0xA00 (policy entry trace);
+ *  - a task-region branch that would unwind to the driver (the longjmp case);
+ *  - the job-return address, a lookup miss, a job overlay (>= 200: the
+ *    LBP/WWS job hooks), or any of the resolver's diagnostics enabled.
+ * Resolution order and the resident_task update are the resolver's. */
+static int s_ib_diag = -1;
+static __attribute__((noinline, cold)) int spu_ib_diag_init(void)
+{
+    const int on = getenv("SPU_IBCOV") || getenv("SPU_POLLTRACE") || getenv("SPU_JOBTRACE") ||
+                   getenv("SPU_JOBEXEC") || getenv("LBP_HLE_JOBDONE") || getenv("YDKJ_POLTRACE");
+    __atomic_store_n(&s_ib_diag, on, __ATOMIC_RELAXED);
+    return on;
+}
+static inline int spu_ib_diag_enabled(void)
+{
+    const int on = __atomic_load_n(&s_ib_diag, __ATOMIC_RELAXED);
+    return on < 0 ? spu_ib_diag_init() : on;
+}
+
+void spu_indirect_branch(spu_context* ctx)
+{
+    const uint32_t pc = ctx->pc & SPU_LS_MASK;
+    if (__atomic_load_n(&ctx->stop_request, __ATOMIC_RELAXED) || ctx->irq_saved ||
+        pc == SPURS_TASKSET_PM_SYSCALL_LS || pc == 0xA00u ||
+        ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID || ctx->resident_ovl >= 200 ||
+        (ctx->policy_mode && (pc == SPURS_PM_EXIT_TO_KERNEL_LS || pc == SPURS_PM_SELECT_WORKLOAD_LS)) ||
+        (!ctx->policy_mode && pc == SPU_JOB_RETURN_LS) || spu_ib_diag_enabled())
+        goto slow;
+    {
+        int rt = 0;                                   /* the resolver's resident_task update */
+        if (pc >= SPU_TASKSET_TASK_LO) {
+            rt = ctx->resident_task;
+            /* both lookups are empty loops unless a title registered task ELFs / entries */
+            int ti = s_task_elf_count ? spu_taskset_resident_image(ctx) : 0;
+            if (ti && !rt && ctx->host_depth && !ctx->policy_mode)
+                goto slow;                            /* may unwind to the driver */
+            if (!ti && !rt && s_task_entry_count) ti = spu_taskset_task_image(pc);
+            if (ti) rt = ti;
+        }
+        spu_fn fn = NULL;
+        int code_owner = 0;
+        for (unsigned slot = 0; slot < 4; ++slot) {
+            if (ctx->resident_code[slot].image_id && pc >= ctx->resident_code[slot].lsa &&
+                pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
+                code_owner = ctx->resident_code[slot].image_id;
+                fn = spu_lookup(pc, code_owner);
+                break;
+            }
+        }
+        if (!code_owner && rt) fn = spu_lookup(pc, rt);
+        if (!code_owner && !fn && ctx->resident_ovl) fn = spu_lookup(pc, ctx->resident_ovl);
+        if (!code_owner && !fn) fn = spu_lookup(pc, ctx->image_id);
+        for (unsigned slot = 0; slot < 4 && !fn; ++slot)
+            if (ctx->resident_code[slot].image_id)
+                fn = spu_lookup(pc, ctx->resident_code[slot].image_id);
+        if (!fn) goto slow;
+        ctx->pc = pc;
+        ctx->resident_task = rt;
+        spu_check_stack_reset(ctx, fn);
+#if defined(__clang__)
+        __attribute__((musttail)) return fn(ctx);
+#else
+        fn(ctx);
+        return;
+#endif
+    }
+slow:;
+#if defined(__clang__)
+    __attribute__((musttail)) return spu_indirect_branch_slow(ctx);
+#else
+    spu_indirect_branch_slow(ctx);
+#endif
 }
 
 /* ===========================================================================
