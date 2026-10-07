@@ -2261,9 +2261,31 @@ static uint32_t ppu_code_hi(void)
     return hi;
 }
 
+/* The stack dumper reads guest memory nobody vouched for: words above sp, the
+ * back chain, an object's vtable. vm_oob only says an address is inside the
+ * 4 GB window, and most of that window is PROT_NONE -- guest thread stacks sit
+ * between guard pages. The 700-word scan up from sp ran off the top of a
+ * worker's stack into one and turned a [null-call] report into a SIGBUS
+ * (inFamous, 2026-10-06: the dump itself was the crash). Ask the host whether
+ * the page is readable; one page is remembered, since the scan stays in it. */
+static PPU_THREAD_LOCAL uint64_t gstk_ok_page = ~0ull;   /* reset per dump */
+static int gstk_ok(uint32_t a, uint32_t n)
+{
+    uint64_t& ok_page = gstk_ok_page;
+    if (vm_oob(a, n)) return 0;
+    uint64_t lo = (uint64_t)a >> 12, hi = ((uint64_t)a + n - 1) >> 12;
+    for (uint64_t pg = lo; pg <= hi; pg++) {
+        if (pg == ok_page) continue;
+        if (IsBadReadPtr(vm_base + (pg << 12), 4096)) return 0;
+        ok_page = pg;
+    }
+    return 1;
+}
+
 extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
 {
     if (!ctx || !vm_base) return;
+    gstk_ok_page = ~0ull;
     uint32_t sp = (uint32_t)ctx->gpr[1];
     /* also show cia/lr and a few key regs (r3/r31 = likely 'this'/object) + raw stack */
     /* r13 too: it is the thread pointer, so it says WHICH TLS block this
@@ -2290,8 +2312,8 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
                               (uint32_t)ctx->gpr[row * 8 + c]);
           fprintf(stderr, "%s\n", gr);
       } }
-    if (!vm_oob(sp,4)) { char rw[600]; int rp=snprintf(rw,sizeof rw,"      rawstk:");
-        for (int i=0;i<24 && !vm_oob(sp+i*4,4);i++){ uint32_t t; memcpy(&t,vm_base+sp+i*4,4); rp+=snprintf(rw+rp,sizeof(rw)-rp," %08X",__builtin_bswap32(t)); }
+    if (!gstk_ok(sp,4)) { char rw[600]; int rp=snprintf(rw,sizeof rw,"      rawstk:");
+        for (int i=0;i<24 && !gstk_ok(sp+i*4,4);i++){ uint32_t t; memcpy(&t,vm_base+sp+i*4,4); rp+=snprintf(rw+rp,sizeof(rw)-rp," %08X",__builtin_bswap32(t)); }
         fprintf(stderr,"%s\n",rw); }
     /* Identify the worker's dispatched method: func_000750A8 vcalls
      * [[arg+0xC]+0] (code) with toc [[arg+0xC]+4]. Dump for the known thread
@@ -2299,12 +2321,12 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
      * receive-loop function even though the thread stack has no return addrs. */
     { const uint32_t args[2] = {0x40003450u, 0x40003E80u};
       for (int j=0;j<2;j++){ uint32_t o=args[j];
-        if (vm_oob(o+0x10,4)) continue;
+        if (gstk_ok(o+0x10,4)) continue;
         uint32_t vt, code, toc; { uint32_t t;
           memcpy(&t,vm_base+o+0xC,4); vt=__builtin_bswap32(t);
           if (vt<0x600000 || vt>=0x50000000u) { /* vt could be a guest ptr */ }
         }
-        if (!vm_oob(vt,8)) { uint32_t t; memcpy(&t,vm_base+vt,4); code=__builtin_bswap32(t);
+        if (!gstk_ok(vt,8)) { uint32_t t; memcpy(&t,vm_base+vt,4); code=__builtin_bswap32(t);
           memcpy(&t,vm_base+vt+4,4); toc=__builtin_bswap32(t);
           fprintf(stderr,"      ARG[0x%08X] vtbl=0x%08X -> method code=0x%08X toc=0x%08X (worker body?)\n", o, vt, code, toc); }
       } }
@@ -2323,10 +2345,10 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     { char bc[900]; int bp = snprintf(bc, sizeof bc, "[GSTACK:%s] chain:", tag ? tag : "?");
       uint32_t f = sp;
       for (int d = 0; d < 24 && bp < 820; d++) {
-          if (vm_oob(f, 8)) break;
+          if (gstk_ok(f, 8)) break;
           uint32_t t; memcpy(&t, vm_base + f + 4, 4);   /* low half of the 64-bit back chain */
           uint32_t prev = __builtin_bswap32(t);
-          if (prev <= f || vm_oob(prev + 0x14, 4)) break;   /* stacks grow down */
+          if (prev <= f || gstk_ok(prev + 0x14, 4)) break;   /* stacks grow down */
           memcpy(&t, vm_base + prev + 0x14, 4);         /* low half of the saved lr */
           uint32_t ra = __builtin_bswap32(t);
           if (ra >= 0x10000 && ra < ppu_code_hi()) {
@@ -2342,7 +2364,7 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     char gs[1200]; int gp = snprintf(gs, sizeof gs, "[GSTACK:%s] sp=0x%08X:", tag ? tag : "?", sp);
     uint32_t last = 0;
     for (int i = 0; i < 700 && gp < 1100; i++) {
-        uint32_t a = sp + i*4; if (vm_oob(a,4)) break;
+        uint32_t a = sp + i*4; if (gstk_ok(a,4)) break;
         uint32_t t; memcpy(&t, vm_base + a, 4); uint32_t w = __builtin_bswap32(t);
         if (w < 0x10000 || w >= ppu_code_hi()) continue;
         uint32_t bg = 0;
