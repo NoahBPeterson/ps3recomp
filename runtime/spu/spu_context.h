@@ -340,6 +340,16 @@ typedef struct spu_context {
      * persistent workload-module image adopted at LS 0xA00, re-applied at
      * dispatch after a call-bracket image restore. */
     uint32_t host_depth;
+    /* spu_depth_guard's ring of recent drain sites (reported when the depth
+     * trips). Per context rather than thread-local: on macOS every
+     * thread-local access is a _tlv_get_addr call, and this runs on every
+     * lifted call return. */
+    uint32_t depth_ring[24];
+    uint32_t depth_ring_n;
+    /* The last 8 dispatched PCs (SPU_DRAIN step), for the resolver's
+     * unlifted-branch report. Per context for the same reason. */
+    uint32_t pch[8];
+    uint32_t pch_n;
 
     /* Trampoline steps taken since this context started running. Only needed
      * to tell a job's INITIAL entry at LS 0 from a later return to LS 0, which
@@ -904,8 +914,6 @@ void spu_indirect_branch(spu_context* ctx);
 /* Ring of the last PCs this SPU thread executed, for the unlifted-branch
  * report. The dispatcher records indirect branches; SPU_DRAIN records every
  * trampoline hop, which is the one that actually precedes a bad branch. */
-extern SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
-extern SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 
 /* Central per-transfer hooks (stubbed in spu_drain.c until their milestones). */
 void yz_lockstep_tick(spu_context* ctx);             /* round-robin token gate */
@@ -1005,7 +1013,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
                 (spu_ev_get((ctx)) & (ctx)->event_mask))      \
                 _tf = spu_take_interrupt((ctx), _tf);          \
             spu_pchist_tick(ctx);                              \
-            g_spu_pch[g_spu_pch_n++ & 7u] =                    \
+            (ctx)->pch[(ctx)->pch_n++ & 7u] =                  \
                 (uint32_t)((ctx)->pc & SPU_LS_MASK);           \
             _tf(ctx);                                          \
         }                                                      \

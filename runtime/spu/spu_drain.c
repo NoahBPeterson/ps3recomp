@@ -17,8 +17,6 @@ typedef struct spu_irq_frame {
 } spu_irq_frame;
 
 /* Pending cross-function transfer target for this host thread's SPU context. */
-SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
-SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 
 /* yz_lockstep_tick now has its real body in spu_lockstep.c (milestone 2). */
 
@@ -47,18 +45,8 @@ void* volatile    g_pm_flow_ctx = 0;
 extern void spu_halt(spu_context*);
 /* Last 32 drain steps on this host thread (pc), for post-mortems of a run that
  * ended where it should not have (spurs_policy.c, [pm-end]). */
-static _Thread_local uint32_t t_recent[32];
-static _Thread_local uint32_t t_recent_n;
-unsigned spu_recent_pcs(uint32_t* out, unsigned max)
-{
-    unsigned n = t_recent_n < 32 ? t_recent_n : 32, k = n < max ? n : max;
-    for (unsigned i = 0; i < k; i++) out[i] = t_recent[(t_recent_n - k + i) & 31];
-    return k;
-}
-
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
-    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
@@ -365,10 +353,9 @@ void spu_depth_guard(spu_context* ctx)
      * not "where are we" but "what cycle got us here" -- one pc names a point,
      * a ring names the loop. */
     enum { RING = 24 };
-    static SPU_THREAD_LOCAL uint32_t s_ring[RING];   /* per SPU thread: its own cycle */
-    static SPU_THREAD_LOCAL uint32_t s_n;
-    s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
-    s_n++;
+    uint32_t* const s_ring = ctx->depth_ring;     /* per SPU context: its own cycle */
+    const uint32_t s_n = ++ctx->depth_ring_n;
+    s_ring[(s_n - 1) % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
 
     if (ctx->host_depth < s_max) return;
     static _Atomic int s_reported = 0;
