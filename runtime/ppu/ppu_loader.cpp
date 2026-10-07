@@ -2312,8 +2312,8 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
                               (uint32_t)ctx->gpr[row * 8 + c]);
           fprintf(stderr, "%s\n", gr);
       } }
-    if (!gstk_ok(sp,4)) { char rw[600]; int rp=snprintf(rw,sizeof rw,"      rawstk:");
-        for (int i=0;i<24 && !gstk_ok(sp+i*4,4);i++){ uint32_t t; memcpy(&t,vm_base+sp+i*4,4); rp+=snprintf(rw+rp,sizeof(rw)-rp," %08X",__builtin_bswap32(t)); }
+    if (gstk_ok(sp,4)) { char rw[600]; int rp=snprintf(rw,sizeof rw,"      rawstk:");
+        for (int i=0;i<24 && gstk_ok(sp+i*4,4);i++){ uint32_t t; memcpy(&t,vm_base+sp+i*4,4); rp+=snprintf(rw+rp,sizeof(rw)-rp," %08X",__builtin_bswap32(t)); }
         fprintf(stderr,"%s\n",rw); }
     /* Identify the worker's dispatched method: func_000750A8 vcalls
      * [[arg+0xC]+0] (code) with toc [[arg+0xC]+4]. Dump for the known thread
@@ -2321,12 +2321,12 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
      * receive-loop function even though the thread stack has no return addrs. */
     { const uint32_t args[2] = {0x40003450u, 0x40003E80u};
       for (int j=0;j<2;j++){ uint32_t o=args[j];
-        if (gstk_ok(o+0x10,4)) continue;
+        if (!gstk_ok(o+0x10,4)) continue;
         uint32_t vt, code, toc; { uint32_t t;
           memcpy(&t,vm_base+o+0xC,4); vt=__builtin_bswap32(t);
           if (vt<0x600000 || vt>=0x50000000u) { /* vt could be a guest ptr */ }
         }
-        if (!gstk_ok(vt,8)) { uint32_t t; memcpy(&t,vm_base+vt,4); code=__builtin_bswap32(t);
+        if (gstk_ok(vt,8)) { uint32_t t; memcpy(&t,vm_base+vt,4); code=__builtin_bswap32(t);
           memcpy(&t,vm_base+vt+4,4); toc=__builtin_bswap32(t);
           fprintf(stderr,"      ARG[0x%08X] vtbl=0x%08X -> method code=0x%08X toc=0x%08X (worker body?)\n", o, vt, code, toc); }
       } }
@@ -2345,10 +2345,10 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     { char bc[900]; int bp = snprintf(bc, sizeof bc, "[GSTACK:%s] chain:", tag ? tag : "?");
       uint32_t f = sp;
       for (int d = 0; d < 24 && bp < 820; d++) {
-          if (gstk_ok(f, 8)) break;
+          if (!gstk_ok(f, 8)) break;
           uint32_t t; memcpy(&t, vm_base + f + 4, 4);   /* low half of the 64-bit back chain */
           uint32_t prev = __builtin_bswap32(t);
-          if (prev <= f || gstk_ok(prev + 0x14, 4)) break;   /* stacks grow down */
+          if (prev <= f || !gstk_ok(prev + 0x14, 4)) break;   /* stacks grow down */
           memcpy(&t, vm_base + prev + 0x14, 4);         /* low half of the saved lr */
           uint32_t ra = __builtin_bswap32(t);
           if (ra >= 0x10000 && ra < ppu_code_hi()) {
@@ -2364,7 +2364,7 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     char gs[1200]; int gp = snprintf(gs, sizeof gs, "[GSTACK:%s] sp=0x%08X:", tag ? tag : "?", sp);
     uint32_t last = 0;
     for (int i = 0; i < 700 && gp < 1100; i++) {
-        uint32_t a = sp + i*4; if (gstk_ok(a,4)) break;
+        uint32_t a = sp + i*4; if (!gstk_ok(a,4)) break;
         uint32_t t; memcpy(&t, vm_base + a, 4); uint32_t w = __builtin_bswap32(t);
         if (w < 0x10000 || w >= ppu_code_hi()) continue;
         uint32_t bg = 0;
@@ -3060,7 +3060,12 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
          * see where each link points (heap object vs game image vs garbage) and
          * pinpoint how the garbage code field (e.g. 0xC708C708) got there. */
         if (vm_base) {
+            /* Unreadable words print as 0: obj, vtable and the stack scan are
+             * all garbage-derived here, and an unchecked read into a guard
+             * page turned this report into the crash (see gstk_ok). */
+            gstk_ok_page = ~0ull;
             auto g32 = [](uint32_t ea)->uint32_t {
+                if (!gstk_ok(ea, 4)) return 0;
                 return __builtin_bswap32(*(volatile uint32_t*)(vm_base + ea));
             };
             uint32_t obj = (uint32_t)ctx->gpr[3];
@@ -3097,6 +3102,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
                 char gb[1400]; int gp = snprintf(gb, sizeof gb, "      GUEST-STACK(scan):");
                 uint32_t last = 0;
                 for (int i = 0; i < 700 && gp < 1300; i++) {
+                    if (!gstk_ok(sp + i*4, 4)) break;   /* top of this stack */
                     uint32_t w = g32(sp + i*4);
                     if (w < 0x10000 || w >= ppu_code_hi()) continue;
                     uint32_t bg = 0;
