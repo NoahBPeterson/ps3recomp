@@ -52,6 +52,7 @@
 #  import <AppKit/AppKit.h>
 #endif
 
+#include <unistd.h>
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
 #include "rsx_vertex_fetch.h"
@@ -2124,6 +2125,27 @@ static u32 s_eng_dropped;
 
 static u8* s_eng_stage;
 static u32 s_eng_stage_used, s_eng_stage_cap;
+/* The staging arena IS a shared MTLBuffer (T-0016). It used to be malloc'd
+ * memory that eng_encode_and_commit copied, every commit, into a fresh
+ * newBufferWithBytes buffer: a second full copy of the frame's vertex,
+ * index and constant data plus a buffer allocation per frame -- the largest
+ * single cost on the RSX thread (memmove under newBufferWithBytes, ~15% of
+ * it). On Apple silicon shared storage is the same memory for CPU and GPU,
+ * so the arena is written in place and the commit hands that buffer over.
+ *
+ * A ring of ENG_STAGE_SLOTS buffers: a windowed present leaves its command
+ * buffer in flight (at most MTL_MAX_INFLIGHT, bounded by s_inflight) and
+ * every other commit waits for completion, so the slot the CPU fills next is
+ * never one the GPU is still reading. Each slot also carries a busy flag,
+ * set at an asynchronous commit and cleared by its completion handler, and
+ * acquiring a busy slot waits for it -- belt and braces, counted if it ever
+ * happens. */
+#define ENG_STAGE_SLOTS (MTL_MAX_INFLIGHT + 1)
+static id<MTLBuffer> s_eng_slot_buf[ENG_STAGE_SLOTS];
+static volatile int s_eng_slot_busy[ENG_STAGE_SLOTS];
+static int s_eng_slot = -1;          /* slot the arena currently lives in; -1: none */
+static unsigned s_eng_slot_next;
+static unsigned long s_eng_slot_waits;
 
 /* What the bind_* calls have accumulated for the next draw. */
 static EngRecord s_eng_pending;
@@ -2244,12 +2266,28 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
         eng_encode_and_commit(nil);
         return eng_stage_reserve(bytes, out_off);
     }
+    if (s_eng_slot < 0) {                       /* first data of this submission: take a slot */
+        const int k = (int)(s_eng_slot_next++ % ENG_STAGE_SLOTS);
+        if (__atomic_load_n(&s_eng_slot_busy[k], __ATOMIC_ACQUIRE)) {
+            if ((++s_eng_slot_waits & (s_eng_slot_waits - 1)) == 0)    /* 1, 2, 4, ... */
+                fprintf(stderr, "[rsx engine/metal] staging slot still in flight: waited %lu time(s)\n",
+                        s_eng_slot_waits);
+            while (__atomic_load_n(&s_eng_slot_busy[k], __ATOMIC_ACQUIRE)) usleep(50);
+        }
+        s_eng_slot = k;
+        s_eng_stage = s_eng_slot_buf[k] ? (u8*)[s_eng_slot_buf[k] contents] : NULL;
+        s_eng_stage_cap = s_eng_slot_buf[k] ? (u32)[s_eng_slot_buf[k] length] : 0;
+    }
     if (start + bytes > s_eng_stage_cap) {
+        /* grow this slot: a new buffer, keeping what is already staged (the
+         * old one is not in flight -- this submission has not been committed) */
         u32 cap = s_eng_stage_cap ? s_eng_stage_cap : (4u << 20);
         while (start + bytes > cap) cap *= 2u;
-        u8* n = (u8*)realloc(s_eng_stage, cap);
-        if (!n) return 0;
-        s_eng_stage = n;
+        id<MTLBuffer> nb = [s_dev newBufferWithLength:cap options:MTLResourceStorageModeShared];
+        if (!nb) return 0;
+        if (s_eng_stage_used) memcpy([nb contents], s_eng_stage, s_eng_stage_used);
+        s_eng_slot_buf[s_eng_slot] = nb;
+        s_eng_stage = (u8*)[nb contents];
         s_eng_stage_cap = cap;
     }
     *out_off = start;
@@ -2301,7 +2339,9 @@ static void eng_shutdown(void* user)
     memset(s_eng_obj_retired, 0, sizeof s_eng_obj_retired);
     s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
     s_eng_rec_count = 0;
-    free(s_eng_stage); s_eng_stage = NULL;
+    for (int k = 0; k < ENG_STAGE_SLOTS; k++) { s_eng_slot_buf[k] = nil; s_eng_slot_busy[k] = 0; }
+    s_eng_slot = -1;
+    s_eng_stage = NULL;
     s_eng_stage_used = s_eng_stage_cap = 0;
     s_eng_helper_lib = nil;
     s_eng_blit_pso = nil;
@@ -3227,9 +3267,8 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         }
 
         id<MTLBuffer> stage = nil;
-        if (s_eng_stage_used)
-            stage = [s_dev newBufferWithBytes:s_eng_stage length:s_eng_stage_used
-                                      options:MTLResourceStorageModeShared];
+        const int slot = s_eng_slot;
+        if (s_eng_stage_used && slot >= 0) stage = s_eng_slot_buf[slot];
         /* PS3RECOMP_METAL_PASS_LOG=1: every 600th present, print the frame's
          * record stream grouped into passes (kind, targets, depth, count, and
          * the textures the first draw samples). */
@@ -3267,8 +3306,11 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         if (drawable) [cb presentDrawable:drawable];
         if (windowed_present) {
             dispatch_semaphore_t sem = s_inflight;
+            volatile int* busy = slot >= 0 ? &s_eng_slot_busy[slot] : NULL;
+            if (busy) __atomic_store_n(busy, 1, __ATOMIC_RELEASE);
             [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
                 (void)_unused;
+                if (busy) __atomic_store_n(busy, 0, __ATOMIC_RELEASE);
                 dispatch_semaphore_signal(sem);
             }];
             [cb commit];
@@ -3277,6 +3319,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
             [cb waitUntilCompleted];
         }
 
+
         if (s_eng_dropped) {
             fprintf(stderr, "[rsx engine/metal] dropped %u record(s) (cap %d)\n",
                     s_eng_dropped, ENG_MAX_RECORDS);
@@ -3284,6 +3327,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         }
         s_eng_rec_count  = 0;
         s_eng_stage_used = 0;
+        s_eng_slot = -1;                      /* the next submission stages into the next slot */
         eng_collect_retired_objects();
     }
 }
