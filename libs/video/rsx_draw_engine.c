@@ -166,7 +166,9 @@ static struct {
     u32* indices;
     u32 index_cap;
 
-    rsx_fp_constant_block fp_constants;
+    /* The draw's fragment-program constants: the program memo's block (see
+     * eng_fp_current), valid until the next draw's lookup. */
+    const rsx_fp_constant_block* fp_constants;
 } g;
 
 /* The decompilers' HLSL. The VP decompiler builds bodies up to 192 KB. */
@@ -969,41 +971,150 @@ static u32 eng_cube_mask(void)
     return mask;
 }
 
+/* ---- program memo ------------------------------------------------------ */
+
+/* Everything a draw derives from its programs' bytes -- the size, the input
+ * and constant analyses, the pipeline-key hashes, the FP's inline constants
+ * -- is a function of those bytes alone. A draw nearly always runs a program
+ * an earlier draw ran, so each memo entry keeps an exact copy of the bytes it
+ * was derived from: when the program's bytes compare equal the derivation is
+ * reused, and any difference at all (a patched constant, a new program at the
+ * same address) recomputes it. An identical prefix up to the stored size also
+ * means an identical size, since the size is found by scanning those bytes
+ * for the end flag. */
+#define ENG_PROG_MEMO 8
+
+typedef struct {
+    u32 start, instrs;          /* instrs == 0: unused entry */
+    u32 input_mask;             /* rsx_vp_analyze_inputs, 0xFFFF when unsure */
+    int vpc_full;
+    u32 vpc_lo, vpc_n;
+    u64 hash;                   /* of the program bytes */
+    u32 used;                   /* recency */
+    u8 bytes[RSX_DSP_VP_INSTR * 16u];
+} eng_vp_memo;
+
+typedef struct {
+    u32 loc, off, size;         /* size == 0: unused entry */
+    u64 structural;             /* rsx_fp_structural_hash; 0 = will not hash */
+    int constants_ok;
+    u32 tex_mask;               /* rsx_fp_texture_mask */
+    u32 used;
+    u8* bytes;
+    rsx_fp_constant_block constants;
+} eng_fp_memo;
+
+static eng_vp_memo s_vp_memo[ENG_PROG_MEMO];
+static eng_fp_memo s_fp_memo[ENG_PROG_MEMO];
+static u32 s_memo_clock;
+static u64 ds_memo_hit[2], ds_memo_miss[2];     /* drawstats: vp, fp */
+
+static u64 eng_fnv1a(const void* data, u32 n, u64 hash);
+
+static u32 eng_memo_victim_vp(void)
+{
+    u32 v = 0;
+    for (u32 i = 1; i < ENG_PROG_MEMO; i++)
+        if (s_vp_memo[i].used < s_vp_memo[v].used) v = i;
+    return v;
+}
+
+/* The resident vertex program's memo entry, or NULL when there is none. */
+static const eng_vp_memo* eng_vp_current(void)
+{
+    const u32 start = rsx_dsp_vp_start(&g.rsx);
+    if (start >= RSX_DSP_VP_INSTR) return NULL;
+    const u8* uc = (const u8*)(g.rsx.vp + start * 4);
+    for (u32 i = 0; i < ENG_PROG_MEMO; i++) {
+        eng_vp_memo* m = &s_vp_memo[i];
+        if (m->instrs && m->start == start && !memcmp(m->bytes, uc, m->instrs * 16u)) {
+            m->used = ++s_memo_clock;
+            ds_memo_hit[0]++;
+            return m;
+        }
+    }
+    ds_memo_miss[0]++;
+    const u32 instrs = rsx_vp_program_size_instrs(uc, (RSX_DSP_VP_INSTR - start) * 16u);
+    if (!instrs) return NULL;
+    eng_vp_memo* m = &s_vp_memo[eng_memo_victim_vp()];
+    m->start = start;
+    m->instrs = instrs;
+    memcpy(m->bytes, uc, instrs * 16u);
+    m->used = ++s_memo_clock;
+    m->hash = eng_fnv1a(uc, instrs * 16u, 1469598103934665603ull);
+
+    m->input_mask = 0xFFFFu;
+    rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
+    if (rsx_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
+        analysis.exact && analysis.input_mask)
+        m->input_mask = analysis.input_mask;
+    m->vpc_full = 1;
+    m->vpc_lo = m->vpc_n = 0;
+    rsx_vp_const_usage cu;
+    if (rsx_vp_analyze_constants(uc, instrs * 16u, &cu) >= 0 && cu.valid && !cu.relative) {
+        m->vpc_full = 0;
+        m->vpc_lo = cu.lo <= cu.hi ? cu.lo : 0;
+        m->vpc_n = cu.lo <= cu.hi ? cu.hi - cu.lo + 1u : 0;
+    }
+    return m;
+}
+
+/* The bound fragment program's memo entry, or NULL when there is none (no
+ * program, unmapped, or no end flag within ENG_FP_MAX_BYTES). */
+static const eng_fp_memo* eng_fp_current(void)
+{
+    /* A zero SET_SHADER_PROGRAM is "none", not "the program at offset 0": the
+     * register carries the location in its low two bits, so a real program can
+     * never read back as zero. */
+    if (!rsx_dsp_reg(&g.rsx, 0x08E4)) return NULL;
+    u32 loc = 0;
+    const u32 off = rsx_dsp_fragment_program(&g.rsx, &loc);
+    for (u32 i = 0; i < ENG_PROG_MEMO; i++) {
+        eng_fp_memo* m = &s_fp_memo[i];
+        if (!m->size || m->loc != loc || m->off != off) continue;
+        const u8* uc = eng_guest_ptr(NULL, loc, off, m->size);
+        if (uc && !memcmp(m->bytes, uc, m->size)) {
+            m->used = ++s_memo_clock;
+            ds_memo_hit[1]++;
+            return m;
+        }
+    }
+    ds_memo_miss[1]++;
+    const u8* uc = eng_guest_ptr(NULL, loc, off, 16);
+    u32 size = uc ? rsx_fp_program_size(uc, ENG_FP_MAX_BYTES) : 0;
+    if (size) uc = eng_guest_ptr(NULL, loc, off, size);
+    if (!uc || !size) return NULL;
+
+    u32 v = 0;
+    for (u32 i = 1; i < ENG_PROG_MEMO; i++)
+        if (s_fp_memo[i].used < s_fp_memo[v].used) v = i;
+    eng_fp_memo* m = &s_fp_memo[v];
+    u8* copy = (u8*)realloc(m->bytes, size);
+    if (!copy) return NULL;
+    m->bytes = copy;
+    memcpy(m->bytes, uc, size);
+    m->loc = loc;
+    m->off = off;
+    m->size = size;
+    m->used = ++s_memo_clock;
+    m->structural = rsx_fp_structural_hash(uc, size, 1469598103934665603ull);
+    m->constants.count = 0;
+    m->constants_ok = rsx_fp_collect_constants(uc, size, &m->constants) >= 0;
+    m->tex_mask = rsx_fp_texture_mask(uc, size);
+    return m;
+}
+
 /* Are both of the guest's own programs resident? One answer, used by the
  * layout and by the pipeline, because they must not disagree: the built-in
  * program declares all sixteen inputs, so narrowing the layout for it would
  * leave the pipeline's vertex descriptor short of what the shader reads. */
-static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
-                              const u8** out_fp, u32* out_fp_size)
+static int eng_guest_programs(const eng_vp_memo** out_vp, const eng_fp_memo** out_fp)
 {
-    const u8* vp_uc = NULL;
-    u32 vp_instrs = 0;
-    const u32 start = rsx_dsp_vp_start(&g.rsx);
-    if (start < RSX_DSP_VP_INSTR) {
-        vp_uc = (const u8*)(g.rsx.vp + start * 4);
-        vp_instrs = rsx_vp_program_size_instrs(
-            vp_uc, (RSX_DSP_VP_INSTR - start) * 16u);
-    }
-
-    /* A zero SET_SHADER_PROGRAM is "none", not "the program at offset 0": the
-     * register carries the location in its low two bits, so a real program can
-     * never read back as zero. */
-    const u8* fp_uc = NULL;
-    u32 fp_size = 0;
-    if (rsx_dsp_reg(&g.rsx, 0x08E4)) {
-        u32 fp_loc = 0;
-        const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
-        fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, 16);
-        fp_size = fp_uc ? rsx_fp_program_size(fp_uc, ENG_FP_MAX_BYTES) : 0;
-        if (fp_size) fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
-        if (!fp_uc) fp_size = 0;
-    }
-
-    if (out_vp) *out_vp = vp_uc;
-    if (out_vp_instrs) *out_vp_instrs = vp_instrs;
-    if (out_fp) *out_fp = fp_uc;
-    if (out_fp_size) *out_fp_size = fp_size;
-    return vp_instrs && fp_size;
+    const eng_vp_memo* vp = eng_vp_current();
+    const eng_fp_memo* fp = vp ? eng_fp_current() : NULL;
+    if (out_vp) *out_vp = vp;
+    if (out_fp) *out_fp = fp;
+    return vp && fp;
 }
 
 /* The layout the active vertex program actually reads. An uncertain analysis
@@ -1011,21 +1122,13 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
 static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
 {
     u32 mask = 0xFFFFu;
-    const u8* uc = NULL;
-    u32 instrs = 0;
+    const eng_vp_memo* vp = NULL;
     g.vpc_full = 1;
-    if (eng_guest_programs(&uc, &instrs, NULL, NULL)) {
-        rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
-        if (rsx_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
-            analysis.exact && analysis.input_mask)
-            mask = analysis.input_mask;
-        rsx_vp_const_usage cu;
-        if (rsx_vp_analyze_constants(uc, instrs * 16u, &cu) >= 0 &&
-            cu.valid && !cu.relative) {
-            g.vpc_full = 0;
-            g.vpc_lo = cu.lo <= cu.hi ? cu.lo : 0;
-            g.vpc_n = cu.lo <= cu.hi ? cu.hi - cu.lo + 1u : 0;
-        }
+    if (eng_guest_programs(&vp, NULL)) {
+        mask = vp->input_mask;
+        g.vpc_full = vp->vpc_full;
+        g.vpc_lo = vp->vpc_lo;
+        g.vpc_n = vp->vpc_n;
     }
     rsx_vertex_layout_plan_init(layout, mask);
 }
@@ -1086,6 +1189,12 @@ static const char* const kEngFixedPS =
 "};\n"
 "float4 main(PSInput input) : SV_TARGET { return input.col0; }\n";
 
+/* Drawstats split of eng_pipeline_get (defined with the rest of drawstats
+ * below): programs + FP constants, key hashing, table scan. */
+static u64 ds_pk_ns[3], ds_pk_scanned;
+static int eng_ds_enabled(void);
+static u64 eng_ds_now(void);
+
 /* The pipeline for this draw, built once per distinct key. A negative result
  * is cached too (handle 0), so a program pair that will not translate is not
  * retried on every draw of every frame. */
@@ -1094,33 +1203,37 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed)
 {
     *out_fixed = 1;
-    const u8* vp_uc = NULL;
-    const u8* fp_uc = NULL;
-    u32 vp_instrs = 0, fp_size = 0;
+    const eng_vp_memo* vp = NULL;
+    const eng_fp_memo* fp = NULL;
     /* No resident program pair means the built-in one; see kEngFixedVS. */
-    const int fixed = !eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size);
+    const u64 pk0 = eng_ds_enabled() ? eng_ds_now() : 0;
+    const int fixed = !eng_guest_programs(&vp, &fp);
+    const u8* vp_uc = fixed ? NULL : (const u8*)(g.rsx.vp + vp->start * 4);
+    const u8* fp_uc = fixed ? NULL : eng_guest_ptr(NULL, fp->loc, fp->off, fp->size);
+    const u32 vp_instrs = fixed ? 0 : vp->instrs, fp_size = fixed ? 0 : fp->size;
 
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     const u32 cube_mask = eng_cube_mask();
     const u32 vtex_mask = eng_vtex_mask();
 
-    memset(&g.fp_constants, 0, sizeof g.fp_constants);
-    if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
-        return 0;
+    static const rsx_fp_constant_block no_constants;
+    g.fp_constants = fixed ? &no_constants : &fp->constants;
+    if (!fixed && (!fp->constants_ok || !fp_uc)) return 0;
 
     /* Identity: the vertex program's own bytes, the fragment program's
      * STRUCTURE (its inline constants are hoisted into the buffered block, so
      * a constant change must not be a new pipeline), the export-width bit of
      * SHADER_CONTROL, the cube and vertex-texture masks, the input layout,
      * and the structural render state. */
+    const u64 pk1 = pk0 ? eng_ds_now() : 0;
     u64 key = 1469598103934665603ull;
     if (fixed) {
         static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
         key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
     } else {
-        key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
-        key = rsx_fp_structural_hash(fp_uc, fp_size, key);
-        if (!key) return 0;
+        if (!fp->structural) return 0;
+        key = eng_fnv1a(&vp->hash, sizeof vp->hash, key);
+        key = eng_fnv1a(&fp->structural, sizeof fp->structural, key);
         const u32 fp_ctrl_key = fp_ctrl & 0x40u;
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
@@ -1134,11 +1247,23 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     key = eng_fnv1a(&rt_count, sizeof rt_count, key);
     key = rsx_draw_engine_hash_render_state(rs, key);
 
-    for (u32 i = 0; i < g.n_pipelines; i++)
-        if (g.pipelines[i].key == key) {
+    const u64 pk2 = pk0 ? eng_ds_now() : 0;
+    /* Consecutive draws mostly share a pipeline: try the last hit first. */
+    static u32 last_hit;
+    for (u32 n = 0; n <= g.n_pipelines; n++) {   /* n = 0 is last_hit, then 0.. */
+        const u32 i = n ? n - 1u : last_hit;
+        if (n && i == last_hit) continue;
+        if (i < g.n_pipelines && g.pipelines[i].key == key) {
+            last_hit = i;
             *out_fixed = g.pipelines[i].fixed;
+            if (pk0) {
+                const u64 pk3 = eng_ds_now();
+                ds_pk_ns[0] += pk1 - pk0; ds_pk_ns[1] += pk2 - pk1; ds_pk_ns[2] += pk3 - pk2;
+                ds_pk_scanned += n + 1;
+            }
             return g.pipelines[i].handle;
         }
+    }
     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
 
     u32 handle = 0;
@@ -1153,7 +1278,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                                          sizeof s_vs_hlsl);
         fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
                                           s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
-        if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
+        if (fi > 0 && nconst != g.fp_constants->count) fi = -1;
         if (fi > 0 && rs->alpha_test_enable &&
             rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
                                              rs->alpha_func) < 0)
@@ -1275,7 +1400,7 @@ static void eng_ds_frame_end(u32 frame_draws)
 {
     static u32 wf;
     if (!eng_ds_enabled()) return;
-    if (frame_draws <= 1000) { memset(&ds, 0, sizeof ds); return; }
+    if (frame_draws <= 1000) { memset(&ds, 0, sizeof ds); memset(ds_pk_ns, 0, sizeof ds_pk_ns); ds_pk_scanned = 0; memset(ds_memo_hit, 0, sizeof ds_memo_hit); memset(ds_memo_miss, 0, sizeof ds_memo_miss); return; }
     if (wf++ % 30 == 0 && ds.draws) {
         const double us = 1e-3;
         fprintf(stderr,
@@ -1296,14 +1421,21 @@ static void eng_ds_frame_end(u32 frame_draws)
                 " pipeline %.0f us, constants+binds %.0f us, backend draw %.0f us\n",
                 ds.ns_layout * us, ds.ns_tex * us, ds.ns_pipe * us, ds.ns_bind * us,
                 ds.ns_draw * us);
-        static const char* tn[8] = { "?", "snorm16", "float", "half", "unorm8", "sint16", "cmp32", "uint8" };
+        fprintf(stderr,
+                "[drawstats] pipeline hits: programs+fp-consts %.0f us, key %.0f us,"
+                " scan %.0f us (%.1f entries/draw of %u); program memo vp %llu/%llu fp %llu/%llu hits\n",
+                ds_pk_ns[0] * us, ds_pk_ns[1] * us, ds_pk_ns[2] * us,
+                ds.draws ? (double)ds_pk_scanned / ds.draws : 0.0, g.n_pipelines,
+                (unsigned long long)ds_memo_hit[0], (unsigned long long)(ds_memo_hit[0] + ds_memo_miss[0]),
+                (unsigned long long)ds_memo_hit[1], (unsigned long long)(ds_memo_hit[1] + ds_memo_miss[1]));
+                static const char* tn[8] = { "?", "snorm16", "float", "half", "unorm8", "sint16", "cmp32", "uint8" };
         char line[600]; int p = snprintf(line, sizeof line, "[drawstats] formats (unique vtx):");
         for (int t = 0; t < 8; t++) for (int z = 1; z <= 4; z++)
             if (ds.fmt[t][z]) p += snprintf(line + p, sizeof line - p, " %sx%d=%llu", tn[t], z,
                                             (unsigned long long)ds.fmt[t][z]);
         fprintf(stderr, "%s\n", line);
     }
-    memset(&ds, 0, sizeof ds);
+    memset(&ds, 0, sizeof ds); memset(ds_pk_ns, 0, sizeof ds_pk_ns); ds_pk_scanned = 0; memset(ds_memo_hit, 0, sizeof ds_memo_hit); memset(ds_memo_miss, 0, sizeof ds_memo_miss);
 }
 
 /* Turn this group's batches into a reference list, recording a CUT rather
@@ -1512,9 +1644,9 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
  * snapshot is only worth taking for one the program reads. */
 static u32 eng_fp_tex_mask(void)
 {
-    const u8* fp = NULL; u32 fp_size = 0;
-    if (!eng_guest_programs(NULL, NULL, &fp, &fp_size) || !fp) return 0xFFFFu;
-    return rsx_fp_texture_mask(fp, fp_size);
+    const eng_fp_memo* fp = NULL;
+    if (!eng_guest_programs(NULL, &fp)) return 0xFFFFu;
+    return fp->tex_mask;
 }
 
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
@@ -1802,7 +1934,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     /* The buffered fragment constants, then fp_alpha: the layout
      * rsx_fp_decompile_buffered_ex compiled the shader against. */
-    const u32 nslots = g.fp_constants.count ? g.fp_constants.count : 1u;
+    const u32 nslots = g.fp_constants->count ? g.fp_constants->count : 1u;
     const u32 fp_bytes = (nslots + 1u) * 16u;
     if (g.fp_cb_cap < fp_bytes) {
         u8* n = (u8*)realloc(g.fp_cb, fp_bytes);
@@ -1811,8 +1943,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
         g.fp_cb_cap = fp_bytes;
     }
     memset(g.fp_cb, 0, fp_bytes);
-    if (g.fp_constants.count)
-        memcpy(g.fp_cb, g.fp_constants.values, g.fp_constants.count * 16u);
+    if (g.fp_constants->count)
+        memcpy(g.fp_cb, g.fp_constants->values, g.fp_constants->count * 16u);
     { float* alpha = (float*)(g.fp_cb + nslots * 16u);
       alpha[0] = rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format);
       /* WPOS y = pos.y * alpha[1] + alpha[2]: SHADER_WINDOW (0x1D88) bits
