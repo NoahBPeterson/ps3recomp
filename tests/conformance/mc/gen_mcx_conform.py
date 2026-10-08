@@ -29,6 +29,19 @@ on timing and RPCS3's output is the exact expectation.
      word's final count.
   X7 code the SPU writes. A routine copied within local store and run,
      patched and run again, and one DMA'd in from main memory and run.
+  X8 atomics across many lines (what a per-line lock must still get right).
+     a: six SPUs and the PPU each increment their own word of eight lines --
+        neighbours, and lines 32 KB and 64 KB apart -- N8A rounds; every
+        word's final count.
+     b: one SPU DMA-PUTs a 512-byte block of four lines over and over, each
+        line uniform (all 32 words equal), while three SPUs GETLLAR a line,
+        check it is uniform, add 1 to all of it and PUTLLC. A 128-byte line
+        is written whole on Cell, so no agent may ever see one torn: each
+        SPU's torn count, which must be 0.
+     c: one SPU takes a reservation and blocks on the lock-line-lost event
+        N8C times while the PPU breaks it each round and five SPUs run X8a's
+        increments on lines of their own; a lost event hangs the case. The
+        round count and the five SPUs' words.
 
 Records are hexdumps between MCXCONF BEGIN and MCXCONF END. The SPU images are
 also written to <out>_spu/ so a runner can lift them (--lifted).
@@ -56,6 +69,9 @@ SPU_WrEventMask, SPU_WrEventAck, SPU_RdEventStat = 1, 2, 0
 LR_EVENT = 0x400
 N_CHURN, N_CHURN_ATOMIC, N_TERM = 30, 50, 10
 N_MIX = 300
+N8A, N8B_PUTS, N8B_INC, N8C = 2000, 20000, 5000, 300
+X8_OFFS = [0x0, 0x80, 0x100, 0x180, 0x8000, 0x8080, 0x10000, 0x10080]
+X8_SPAN = 0x10100
 FUNCS = ["_start", "hexdump", "puts", "reset_scratch", "load_state", "save_state", "dump_scratch"]
 
 # X1 cases: (reservation width, SPU op, target offset from line L)
@@ -263,6 +279,110 @@ def spu_smc_prog():
     return a.bytes()
 
 
+def _llar(a, r_ea, lsa_reg=10):
+    a.wrch(S.MFC_LSA, lsa_reg); a.il(12, 0); a.wrch(S.MFC_EAH, 12); a.wrch(S.MFC_EAL, r_ea)
+    a.il(12, S.GETLLAR); a.wrch(S.MFC_Cmd, 12); a.rdch(12, S.MFC_RdAtomicStat)
+
+
+def _llc(a, r_ea, r_stat, lsa_reg=10):
+    a.wrch(S.MFC_LSA, lsa_reg); a.il(12, 0); a.wrch(S.MFC_EAH, 12); a.wrch(S.MFC_EAL, r_ea)
+    a.il(12, S.PUTLLC); a.wrch(S.MFC_Cmd, 12); a.rdch(r_stat, S.MFC_RdAtomicStat)
+
+
+def spu_mline_prog(word, tag):
+    """X8a/X8c. arg1 = EA of an X8_SPAN region: N8A rounds of GETLLAR/PUTLLC
+    increments of word `word` of each line at X8_OFFS. Exits tag | word."""
+    a = S.SpuAsm(0)
+    a.rotqbyi(3, 3, 4)
+    q, slot = divmod(word, 4)
+    a.ila(10, 0x10000); a.li32(20, N8A)
+    a.il(22, 1); a.fsmbi(23, 0xF000 >> (4 * slot)); a.and_(22, 22, 23)
+    a.label("round")
+    for k, off in enumerate(X8_OFFS):
+        a.li32(24, off); a.a(25, 3, 24)
+        a.label("again%d" % k)
+        _llar(a, 25)
+        a.lqd(21, 10, 16 * q); a.a(21, 21, 22); a.stqd(21, 10, 16 * q)
+        _llc(a, 25, 13)
+        a.brnz(13, "again%d" % k)
+    a.ai(20, 20, -1); a.brnz(20, "round")
+    a.li32(30, tag | word); a.wrch(S.SPU_WrOutMbox, 30); a.stop(0x102)
+    return a.bytes()
+
+
+def spu_putter_prog():
+    """X8b writer. arg1 = EA of the 512-byte block: N8B_PUTS times, fill four
+    uniform lines in LS (line j = round << 8 | j in every word) and PUT all
+    512 bytes at once. Exits 0x8B00."""
+    a = S.SpuAsm(0)
+    a.rotqbyi(3, 3, 4)
+    a.ila(11, 0x11000); a.il(20, 1)
+    a.label("round")
+    for j in range(4):
+        a.shli(21, 20, 8); a.ai(21, 21, j)                     # every word slot
+        for qd in range(8):
+            a.stqd(21, 11, 128 * j + 16 * qd)
+    a.ila(17, 512); a.mfc(S.PUT, 11, 3, 17, 4, 12); a.wait_tag(4, 12)
+    a.ai(20, 20, 1); a.li32(27, N8B_PUTS + 1); a.ceq(26, 20, 27); a.brz(26, "round")
+    a.li32(30, 0x8B00); a.wrch(S.SPU_WrOutMbox, 30); a.stop(0x102)
+    return a.bytes()
+
+
+def spu_tearcheck_prog(index):
+    """X8b peer. arg1 = EA of the block, arg2 = EA of its result quadword.
+    N8B_INC times: GETLLAR line (round + index) % 4, count it torn unless all
+    32 words are equal, add 1 to every word, PUTLLC (retry). PUT the torn
+    count. Exits 0x8B10 | index."""
+    a = S.SpuAsm(0)
+    a.rotqbyi(3, 3, 4); a.rotqbyi(4, 4, 4)
+    a.ila(10, 0x10000); a.li32(20, N8B_INC); a.il(60, 0); a.il(22, 1); a.il(61, index)
+    a.label("round")
+    a.andi(62, 61, 3); a.shli(62, 62, 7); a.a(25, 3, 62)     # line EA
+    a.label("again")
+    _llar(a, 25)
+    for i in range(8):
+        a.lqd(40 + i, 10, 16 * i)
+    a.rotqbyi(50, 40, 4); a.xor(50, 50, 40)
+    for i in range(1, 8):
+        a.xor(51, 40 + i, 40); a.or_(50, 50, 51)
+    a.rotqbyi(52, 50, 4); a.or_(52, 52, 50); a.rotqbyi(53, 52, 8); a.or_(52, 52, 53)
+    a.brz(52, "uniform")
+    a.ai(60, 60, 1)
+    a.label("uniform")
+    for i in range(8):
+        a.a(40 + i, 40 + i, 22); a.stqd(40 + i, 10, 16 * i)
+    _llc(a, 25, 13)
+    a.brnz(13, "again")
+    a.ai(61, 61, 1)
+    a.ai(20, 20, -1); a.brnz(20, "round")
+    a.ila(13, 0x12000); a.stqd(60, 13, 0); a.il(11, 16)
+    a.mfc(S.PUT, 13, 4, 11, 2, 12); a.wait_tag(2, 12)
+    a.li32(30, 0x8B10 | index); a.wrch(S.SPU_WrOutMbox, 30); a.stop(0x102)
+    return a.bytes()
+
+
+def spu_lrloop_prog():
+    """X8c. arg1 = EA of line L, arg2 = EA of a flag quadword (+0x80: result).
+    N8C times: GETLLAR L, enable the lock-line-lost event, publish the round in
+    the flag, block in rdch SPU_RdEventStat and acknowledge. PUT the round
+    count. Exits 0x8C00."""
+    a = S.SpuAsm(0)
+    a.rotqbyi(3, 3, 4); a.rotqbyi(4, 4, 4)
+    a.ila(10, 0x10000); a.il(22, 0)
+    a.il(12, LR_EVENT); a.wrch(SPU_WrEventMask, 12)
+    a.label("round")
+    _llar(a, 3)
+    a.ai(22, 22, 1); _put_flag(a, 22, 4, 12)
+    a.rdch(20, SPU_RdEventStat); a.wrch(SPU_WrEventAck, 20)
+    a.ceqi(26, 22, N8C); a.brz(26, "round")
+    a.il(12, 0); a.wrch(SPU_WrEventMask, 12)
+    a.ila(13, 0x12000); a.stqd(22, 13, 0)
+    a.il(28, 0x80); a.a(29, 4, 28); a.il(11, 16)
+    a.mfc(S.PUT, 13, 29, 11, 2, 12); a.wait_tag(2, 12)
+    a.li32(30, 0x8C00); a.wrch(S.SPU_WrOutMbox, 30); a.stop(0x102)
+    return a.bytes()
+
+
 def smc_routine():
     a = S.SpuAsm(0x21000)
     a.ai(3, 3, 100); a.bi(0); a.nop(); a.nop()
@@ -318,6 +438,14 @@ def build(out_path):
              "block": spu_block_prog(), "smc": spu_smc_prog()}
     for w in range(6):
         progs["atomw%d" % w] = spu_atomw_prog(w)
+    for w in range(6):
+        progs["mline%d" % w] = spu_mline_prog(w, 0x8A00)
+    for w in range(5):
+        progs["cline%d" % w] = spu_mline_prog(w, 0x8C10)
+    progs["putter"] = spu_putter_prog()
+    for i in range(3):
+        progs["tear%d" % i] = spu_tearcheck_prog(i)
+    progs["lrloop"] = spu_lrloop_prog()
     spu_dir = os.path.splitext(out_path)[0] + "_spu"
     os.makedirs(spu_dir, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix="mcxconf")
@@ -349,6 +477,9 @@ def build(out_path):
     D.take("x5_started", 128, 128); D.take("x5_trc", 4 * N_TERM, 16); D.take("x5_drc", 4 * N_TERM, 16)
     D.take("x6_line", 128, 128)
     D.take("x7_code", 16, 16, smc_routine()); D.take("x7_res", 64, 128)
+    D.take("x8a", X8_SPAN, 128); D.take("x8_gather", 32 * len(X8_OFFS), 128)
+    D.take("x8b_block", 512, 128); D.take("x8b_res", 16 * 3, 128)
+    D.take("x8c", X8_SPAN, 128); D.take("x8c_line", 128, 128); D.take("x8c_flag", 0x100, 128)
     HDR, END = b"MCXCONF BEGIN\n", b"MCXCONF END\n"
 
     def emit(d):
@@ -518,6 +649,56 @@ def build(out_path):
         group("smc", 1, lambda i: (d["x7_code"], d["x7_res"]))
         join(1)
         dump(d["x7_res"], 48)
+
+        # X8a: six SPUs and the PPU over eight lines
+        def ppu_mline(base, rounds_reg_init):
+            t.emit(P.li32(28, rounds_reg_init))
+            outer = L("x8r")
+            t.label(outer)
+            for off in X8_OFFS:
+                retry = L("x8w")
+                t.emit(P.li32(29, base + off + 28))
+                t.label(retry)
+                t.emit(lwarx(27, 29), P.addi(27, 27, 1), stwcx(27, 29))
+                t.bc(retry, 4, 2)
+            t.emit(P.addi(28, 28, -1), P.D(11, 0, 28, 0))
+            t.bc(outer, 4, 2)
+        group(lambda i: "mline%d" % i, 6, lambda i: (d["x8a"], 0))
+        ppu_mline(d["x8a"], N8A)
+        def gather_lines(base, res):
+            """Copy the first 32 bytes of each X8_OFFS line into one block and
+            dump that once: identical consecutive dumps would be one record
+            repeated, which a tty layer is free to collapse."""
+            for k, off in enumerate(X8_OFFS):
+                t.emit(P.li32(9, base + off), P.li32(8, res + 32 * k))
+                for w in range(8):
+                    t.emit(P.lwz(10, 9, 4 * w), P.stw(10, 8, 4 * w))
+            dump(res, 32 * len(X8_OFFS))
+        join(6)
+        gather_lines(d["x8a"], d["x8_gather"])
+
+        # X8b: a 512-byte PUT racing GETLLAR/PUTLLC on its lines
+        group(lambda i: "putter" if i == 0 else "tear%d" % (i - 1), 4,
+              lambda i: (d["x8b_block"], d["x8b_res"] + 16 * (i - 1) if i else 0))
+        join(4)
+        dump(d["x8b_res"], 16 * 3)
+
+        # X8c: lost-event wake-up while other lines churn
+        group(lambda i: "lrloop" if i == 0 else "cline%d" % (i - 1), 6,
+              lambda i: (d["x8c_line"], d["x8c_flag"]) if i == 0 else (d["x8c"], 0))
+        t.emit(P.li32(24, 1))
+        lab = L("x8c")
+        t.label(lab)
+        lab_spin = L("x8cs")
+        t.label(lab_spin)
+        t.emit(P.li32(9, d["x8c_flag"]), P.lwz(10, 9, 0), P.X(31, 0, 10, 24, 0))   # cmpw r10,r24
+        t.bc(lab_spin, 4, 2)
+        t.emit(P.li32(9, d["x8c_line"]), P.stw(24, 9, 0x40))
+        t.emit(P.addi(24, 24, 1), P.D(11, 0, 24, N8C + 1))
+        t.bc(lab, 4, 2)
+        join(6)
+        dump(d["x8c_flag"] + 0x80, 16)
+        gather_lines(d["x8c"], d["x8_gather"])
 
         puts(d["end"], len(END))
         t.emit(P.addi(3, 0, 0), P.addi(11, 0, SC["process_exit"]), P.sc(), P.b(0))
