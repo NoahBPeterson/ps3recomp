@@ -116,6 +116,7 @@ typedef struct {
     u64 content_hash;
     u32 last_hash_frame;
     u64 last_use_serial;
+    u32 levels, span;           /* eng_texture_span for these levels */
 } eng_texture;
 
 typedef struct { u64 key; u32 handle; u8 fixed; } eng_pipeline;
@@ -860,9 +861,9 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                             u32 levels, u32 pitch, int cube, u32 remap)
 {
     if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
-    const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
-    if (!span) return 0;
 
+    /* The span (a mip-chain walk) is kept with the entry: the key holds
+     * everything it depends on except the level count, which is checked. */
     for (u32 p = eng_tkey(location, offset, fmt, w, h, pitch, remap, (u32)(cube != 0));
          s_tidx[p]; p = (p + 1) & (ENG_TIDX_SIZE - 1u)) {
         eng_texture* e = &g.textures[s_tidx[p] - 1];
@@ -871,6 +872,12 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             e->pitch != pitch || e->remap != remap ||
             e->cubemap != (u32)(cube != 0))
             continue;
+        if (e->levels != levels) {
+            e->levels = levels;
+            e->span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+        }
+        const u32 span = e->span;
+        if (!span) return 0;
         if (e->handle && e->last_hash_frame != g.frames) {
             int readable = 0;
             const u64 hash = eng_texture_content_hash(location, offset, span,
@@ -890,6 +897,9 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         return e->handle;
     }
 
+    const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+    if (!span) return 0;
+
     u32 index;
     u32 evicted = 0;
     if (g.n_textures < ENG_MAX_TEXTURES) {
@@ -907,6 +917,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     e.location = location; e.offset = offset; e.format = fmt;
     e.width = w; e.height = h; e.pitch = pitch;
     e.remap = remap; e.cubemap = (u32)(cube != 0);
+    e.levels = levels; e.span = span;
     e.last_hash_frame = g.frames;
     e.last_use_serial = ++g.texture_use_serial;
     { int readable = 0;
@@ -2187,6 +2198,13 @@ static void eng_constlog_frame_end(void)
     s_cl_len = 0; s_cl_n = 0;
 }
 
+/* FPSLOG: where presents come from. 0 = the FIFO's flip (sink_flip), 1 = a
+ * host call (rsx_draw_engine_present / _present_buffer). */
+static int s_present_src;
+static u32 s_pres_n[2], s_pres_drew[2];
+static u64 s_pres_ns[2];
+static u64 eng_ds_now(void);
+
 static void eng_present(u32 buffer_id)
 {
     if (!g.ready) return;
@@ -2210,14 +2228,34 @@ static void eng_present(u32 buffer_id)
                     on = e ? 1 : 0; if (e) off = (u32)strtoul(e, NULL, 16); }
       if (on) for (u32 i = 0; i < g.n_surfaces; ++i)
           if (g.surfaces[i].offset == off) { g.be->present(g.be->user, g.surfaces[i].handle); goto presented; } }
-    g.be->present(g.be->user, g.surfaces[target].handle);
+    { const u64 t = eng_ds_now();
+      g.be->present(g.be->user, g.surfaces[target].handle);
+      const int src = s_present_src;
+      s_pres_n[src]++; s_pres_drew[src] += g.guest_draws != 0;
+      s_pres_ns[src] += eng_ds_now() - t; }
 presented:;
-    /* PS3RECOMP_ENG_FPSLOG=1: presents and world frames (>1000 draws) per 10 s. */
-    { static int on = -1; static u32 wf, pf; static time_t t0;
+    /* PS3RECOMP_ENG_FPSLOG=1: per 10 s, the frame rate -- presents that drew
+     * something since the previous present -- and every present bucketed by
+     * how many draws preceded it. A present with no draws re-shows an image
+     * the title already presented, so it is not a frame; "world" (>1000
+     * draws) separates a full 3D frame from a light 2D one. */
+    { static int on = -1; static u32 pf, b0, b1, bw; static time_t t0;
       if (on < 0) on = getenv("PS3RECOMP_ENG_FPSLOG") ? 1 : 0;
-      if (on) { pf++; if (g.guest_draws > 1000) wf++;
+      if (on) { pf++;
+          if (!g.guest_draws) b0++; else if (g.guest_draws > 1000) bw++; else b1++;
           time_t now = time(NULL); if (!t0) t0 = now;
-          if (now - t0 >= 10) { fprintf(stderr, "[rsx fps] %u world frames, %u presents in %lds (%.2f fps)\n", wf, pf, (long)(now - t0), pf / (double)(now - t0)); wf = 0; pf = 0; t0 = now; } } }
+          if (now - t0 >= 10) {
+              const double dt = (double)(now - t0);
+              fprintf(stderr, "[rsx fps] %.2f fps (%u frames in %lds: %u world, %u light);"
+                      " %u presents, %u with no draws\n",
+                      (b1 + bw) / dt, b1 + bw, (long)(now - t0), bw, b1, pf, b0);
+              fprintf(stderr, "[rsx fps] presents by source: fifo flip %u (%u drew, %.1f ms in present),"
+                      " host %u (%u drew, %.1f ms in present)\n",
+                      s_pres_n[0], s_pres_drew[0], s_pres_ns[0] / 1e6,
+                      s_pres_n[1], s_pres_drew[1], s_pres_ns[1] / 1e6);
+              memset(s_pres_n, 0, sizeof s_pres_n); memset(s_pres_drew, 0, sizeof s_pres_drew);
+              memset(s_pres_ns, 0, sizeof s_pres_ns);
+              pf = b0 = b1 = bw = 0; t0 = now; } } }
     /* PS3RECOMP_ENG_MEMDUMP=<hexEA>:<hexLen>:<worldframe>[:file]: at that world
      * frame, write the guest range as hex words, 16 bytes per line -- the same
      * format as the RPCS3 oracle's RPCS3_LP_DUMP, so the two diff directly. */
@@ -2418,13 +2456,17 @@ void rsx_draw_engine_present(void)
      * re-present a double-buffered title's OTHER scanout. Presenting twice is
      * harmless either way -- the engine never clears the surface, so a second
      * present just blits the same image again. */
+    s_present_src = 1;
     eng_present(g.last_flip_buffer);
+    s_present_src = 0;
 }
 
 void rsx_draw_engine_present_buffer(u32 buffer_id)
 {
     g.last_flip_buffer = buffer_id & 7u;
+    s_present_src = 1;
     eng_present(g.last_flip_buffer);
+    s_present_src = 0;
 }
 
 u32 rsx_draw_engine_guest_draws(void)

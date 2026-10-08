@@ -3361,18 +3361,44 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
  * in-flight semaphore instead, the same bound the vtable path uses, because
  * waiting on every frame is the one pattern where a driver cannot hide its
  * encoding work. */
+/* PS3RECOMP_ENG_FPSLOG: where a present's time goes, per 10 s. */
+static u64 s_pt_ns[4];          /* in-flight wait, nextDrawable, encode, commit */
+static u32 s_pt_n;
+static u64 eng_pt_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+}
+static void eng_pt_report(void)
+{
+    static int on = -1; static u64 t0;
+    if (on < 0) on = getenv("PS3RECOMP_ENG_FPSLOG") ? 1 : 0;
+    if (!on) return;
+    const u64 now = eng_pt_now();
+    if (!t0) t0 = now;
+    if (now - t0 < 10000000000ull) return;
+    fprintf(stderr, "[rsx present] %u presents: in-flight wait %.0f ms, nextDrawable %.0f ms,"
+            " encode %.0f ms, commit %.0f ms\n", s_pt_n,
+            s_pt_ns[0] / 1e6, s_pt_ns[1] / 1e6, s_pt_ns[2] / 1e6, s_pt_ns[3] / 1e6);
+    memset(s_pt_ns, 0, sizeof s_pt_ns); s_pt_n = 0; t0 = now;
+}
+
 static void eng_encode_and_commit(id<MTLTexture> present_dst)
 {
     @autoreleasepool {
         id<CAMetalDrawable> drawable = nil;
         id<MTLTexture> dst = nil;
         const int windowed_present = (present_dst && !s_headless);
+        u64 pt = eng_pt_now(), pt1;
         if (windowed_present) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+        pt1 = eng_pt_now(); if (windowed_present) s_pt_ns[0] += pt1 - pt; pt = pt1;
         if (present_dst) {
             if (s_headless) {
                 dst = s_offscreen;
             } else {
                 drawable = [s_layer nextDrawable];
+                pt1 = eng_pt_now(); s_pt_ns[1] += pt1 - pt; pt = pt1;
                 if (!drawable) {           /* compositor is busy; skip */
                     dispatch_semaphore_signal(s_inflight);
                     return;
@@ -3415,10 +3441,12 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 }
             }
         }
+        pt = eng_pt_now();
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         eng_encode_records(cb, stage);
         if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
         if (drawable) [cb presentDrawable:drawable];
+        if (windowed_present) { pt1 = eng_pt_now(); s_pt_ns[2] += pt1 - pt; pt = pt1; }
         if (windowed_present) {
             dispatch_semaphore_t sem = s_inflight;
             volatile int* busy = slot >= 0 ? &s_eng_slot_busy[slot] : NULL;
@@ -3429,6 +3457,9 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 dispatch_semaphore_signal(sem);
             }];
             [cb commit];
+            s_pt_ns[3] += eng_pt_now() - pt;
+            s_pt_n++;
+            eng_pt_report();
         } else {
             [cb commit];
             [cb waitUntilCompleted];
