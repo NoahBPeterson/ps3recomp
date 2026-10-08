@@ -777,6 +777,11 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
 extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
+extern "C" uint64_t spu_lockline_mask_ea(uint32_t ea);
+extern "C" uint64_t spu_lockline_mask_range(uint32_t ea, uint32_t len);
+extern "C" void spu_lockline_lock_mask(uint64_t mask);
+extern "C" void spu_lockline_unlock_mask(uint64_t mask);
+extern "C" uint32_t spu_coh_ppu_held_line(void);
 extern "C" void spu_coh_notify_write(uint32_t addr);
 extern "C" void spu_coh_notify_write_from_ppu(uint32_t addr);
 extern "C" void spu_coh_ppu_reserve(uint32_t ea);
@@ -951,9 +956,14 @@ static PPU_THREAD_LOCAL int t_resv_noted;
 
 extern "C" void ppu_resv_line_note(uint64_t ea)
 {
-    spu_lockline_lock();
+    /* This line's stripe, and the one this thread's previous reservation sits
+     * under: re-pointing it must exclude a notifier on the line it leaves. */
+    uint64_t m = spu_lockline_mask_ea((uint32_t)ea);
+    const uint32_t held = spu_coh_ppu_held_line();
+    if (held != ~0u) m |= spu_lockline_mask_ea(held);
+    spu_lockline_lock_mask(m);
     spu_coh_ppu_reserve((uint32_t)ea);
-    spu_lockline_unlock();
+    spu_lockline_unlock_mask(m);
     t_resv_noted = 1;
 }
 
@@ -986,14 +996,15 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
             if ((++n % 100000) == 1)
                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
                         n, (uint32_t)ea & ~127u); } }
-    if (coh) spu_lockline_lock();
+    const uint64_t llm = coh ? spu_lockline_mask_ea((uint32_t)ea) : 0;
+    if (coh) spu_lockline_lock_mask(llm);
     int ok = (noted && !spu_coh_ppu_holds((uint32_t)ea)) ? 0 :
              __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (noted) spu_coh_ppu_drop();
     if (coh) {
         if (ok) spu_coh_notify_write_from_ppu((uint32_t)ea);
-        spu_lockline_unlock();
+        spu_lockline_unlock_mask(llm);
     }
     /* The word-level break is for threads on the old (un-noted) path; with the
      * note, the coherence registry has already cleared every other thread's
@@ -1065,13 +1076,14 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     const int noted = t_resv_noted;
     t_resv_noted = 0;
     int coh = noted || spu_coh_is_reserved((uint32_t)ea);
-    if (coh) spu_lockline_lock();
+    const uint64_t llm = coh ? spu_lockline_mask_ea((uint32_t)ea) : 0;
+    if (coh) spu_lockline_lock_mask(llm);
     int ok = (noted && !spu_coh_ppu_holds((uint32_t)ea)) ? 0 :
              __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (noted) spu_coh_ppu_drop();
     if (coh) {
         if (ok) spu_coh_notify_write_from_ppu((uint32_t)ea);
-        spu_lockline_unlock();
+        spu_lockline_unlock_mask(llm);
     }
     if (ok && !noted) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
     resv_unlock(L);
@@ -1588,19 +1600,22 @@ static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
  * them, until SPU code runs) it is the plain memcpy it replaced. */
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
-        if (spu_coh_is_reserved((uint32_t)(a))) {                             \
-            spu_lockline_lock();                                              \
-            gm_store_bytes(vm_base + (uint32_t)(a), (src), (n));              \
-            spu_coh_notify_write_from_ppu((uint32_t)(a));                     \
-            spu_lockline_unlock();                                            \
+        const uint32_t _ca = (uint32_t)(a);                                  \
+        if (spu_coh_is_reserved(_ca)) {                                        \
+            const uint64_t _llm = spu_lockline_mask_range(_ca, (uint32_t)(n)); \
+            spu_lockline_lock_mask(_llm);                                     \
+            gm_store_bytes(vm_base + _ca, (src), (n));                           \
+            spu_coh_notify_write_from_ppu(_ca);                               \
+            spu_lockline_unlock_mask(_llm);                                   \
         } else {                                                              \
-            gm_store_bytes(vm_base + (uint32_t)(a), (src), (n));              \
+            gm_store_bytes(vm_base + _ca, (src), (n));                           \
             /* store, then re-check: see spu_coh_reserve */                  \
             __atomic_signal_fence(__ATOMIC_SEQ_CST);                          \
-            if (spu_coh_is_reserved((uint32_t)(a))) {                         \
-                spu_lockline_lock();                                          \
-                spu_coh_notify_write_from_ppu((uint32_t)(a));                 \
-                spu_lockline_unlock();                                        \
+            if (spu_coh_is_reserved(_ca)) {                                    \
+                const uint64_t _llm = spu_lockline_mask_range(_ca, (uint32_t)(n)); \
+                spu_lockline_lock_mask(_llm);                                 \
+                spu_coh_notify_write_from_ppu(_ca);                           \
+                spu_lockline_unlock_mask(_llm);                               \
             }                                                                 \
         }                                                                     \
     } while (0)

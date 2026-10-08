@@ -562,9 +562,29 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
  * completion. Chosen above the context/descriptor we park near the top of LS. */
 #define SPU_JOB_RETURN_LS   0x3FF00u
 
+/* A context's reservation, read and written atomically: a notifier holding
+ * another line's stripe reads it. The line is stored before `valid` is
+ * published (release), so a reader that sees valid sees the line it is for. */
+#define RESV_VALID(c)       __atomic_load_n(&(c)->resv_valid, __ATOMIC_ACQUIRE)
+#define RESV_EA(c)          __atomic_load_n(&(c)->resv_ea, __ATOMIC_RELAXED)
+#define RESV_SET(c, ea, v)  do { __atomic_store_n(&(c)->resv_ea, (ea), __ATOMIC_RELAXED); \
+                                 __atomic_store_n(&(c)->resv_valid, (v), __ATOMIC_RELEASE); } while (0)
+#define RESV_DROP(c)        __atomic_store_n(&(c)->resv_valid, 0, __ATOMIC_RELEASE)
+
+/* The stripes a transaction on `ea` holds: its own line's, and the line this
+ * context has reserved, if another -- moving or consuming a reservation must
+ * exclude a notifier on the line it leaves (spu_coherency.h). */
+static uint64_t ll_mask_for(spu_context* ctx, uint32_t ea)
+{
+    uint64_t m = spu_lockline_mask_ea(ea);
+    if (RESV_VALID(ctx)) m |= spu_lockline_mask_ea(RESV_EA(ctx));
+    return m;
+}
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
 {
+    uint64_t llm = 0;
     /* Classify FIRST. Every MFC_Cmd write lands here, and only the switch at
      * the bottom used to filter -- so the uncommitted-EA guard below reported
      * ORDINARY DMA as `[spu-atomic]`. A plain put (0x20) to a garbage EA read
@@ -632,7 +652,7 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
                     cmd, ea, (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id);
         if (cmd == MFC_GETLLAR_CMD) {
             memset(ls, 0, MFC_ATOMIC_LINE);
-            ctx->resv_ea = ea; ctx->resv_valid = 0; ctx->atomic_stat = 4;
+            RESV_SET(ctx, ea, 0); ctx->atomic_stat = 4;
         } else {
             ctx->atomic_stat = 1;   /* PUTLLC failure (line "moved") */
         }
@@ -699,7 +719,8 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
          * peer that must WRITE the line waits for it (canersaka ticks the
          * GETLLAR fast+slow paths for exactly this reason). */
         yz_lockstep_tick(ctx);
-        spu_lockline_lock();
+        llm = ll_mask_for(ctx, ea);
+        spu_lockline_lock_mask(llm);
         /* Tell the PPU store paths this line is live, so a store into it goes
          * through the lock and raises SPU_EVENT_LR here instead of landing
          * unannounced. Nothing else about this transaction changes. */
@@ -737,7 +758,7 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
         /* MFC_RdAtomicStat after a GETLLAR reads 4 (GETLLAR complete), not 0:
          * Havok's SPU allocator (GH3 collide task, LS 0xA66C) re-issues the
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
-        ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 4;
+        RESV_SET(ctx, ea, 1); ctx->atomic_stat = 4;
         ctx->dbg_getllar++;
         /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
          * that nobody is releasing (a ticket lock, a counter barrier). Say so
@@ -752,7 +773,7 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
                       ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
           } }
-        spu_lockline_unlock();
+        spu_lockline_unlock_mask(llm);
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *
@@ -815,8 +836,9 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
-        spu_lockline_lock();
-        if (ctx->resv_valid && ctx->resv_ea == ea &&
+        llm = ll_mask_for(ctx, ea);
+        spu_lockline_lock_mask(llm);
+        if (RESV_VALID(ctx) && RESV_EA(ctx) == ea &&
             gm_equal(mem, ctx->resv_line, MFC_ATOMIC_LINE)) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
@@ -833,7 +855,7 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
              * raise a self-LR: hardware CONSUMES the reservation on a
              * successful PUTLLC, it does not report it lost. Already under the
              * lock-line lock, which is what spu_coh_notify_write expects. */
-            ctx->resv_valid = 0;
+            RESV_DROP(ctx);
             { static _Atomic int s_w = -1;
               if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
               if (s_w) { static unsigned long long n;
@@ -864,8 +886,8 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
               if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
               if (s_w) {
                   static unsigned long long n_noresv, n_ea, n_line;
-                  if (!ctx->resv_valid)            n_noresv++;
-                  else if (ctx->resv_ea != ea)     n_ea++;
+                  if (!RESV_VALID(ctx))            n_noresv++;
+                  else if (RESV_EA(ctx) != ea)     n_ea++;
                   else                             n_line++;
                   static unsigned long long total;
                   if ((++total % 500000) == 0) {
@@ -874,7 +896,7 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
                                       " (last ea=0x%08X img=%d resv_ea=0x%08X"
                                       " getllar=%llu)\n",
                               total, n_noresv, n_ea, n_line, ea, ctx->image_id,
-                              ctx->resv_ea, (unsigned long long)ctx->dbg_getllar);
+                              RESV_EA(ctx), (unsigned long long)ctx->dbg_getllar);
                       fflush(stderr);
                   }
               } }
@@ -904,14 +926,15 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
               fprintf(stderr, "[atom-ea] PUTLLC %s lr=0x%05X ea=0x%08X\n",
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
-        ctx->resv_valid = 0;                           /* reservation consumed */
-        spu_lockline_unlock();
+        RESV_DROP(ctx);                                /* reservation consumed */
+        spu_lockline_unlock_mask(llm);
         if (ctx->atomic_stat == 0 && g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         return 1;
 
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
-        spu_lockline_lock();
+        llm = ll_mask_for(ctx, ea);
+        spu_lockline_lock_mask(llm);
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
         gm_copy_to(mem, ls, MFC_ATOMIC_LINE);          /* unconditional store */
@@ -921,8 +944,8 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
          * reservation here would commit a PUTLLC against a snapshot this store
          * has already overwritten. */
         spu_coh_notify_write(ea);
-        ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
-        spu_lockline_unlock();
+        RESV_DROP(ctx); ctx->atomic_stat = 2;        /* PUTLLUC complete */
+        spu_lockline_unlock_mask(llm);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         return 1;
 
@@ -1041,10 +1064,10 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * write the stale value back. The edge is then gone, and an SPU that
          * has just acknowledged the events it read goes back to sleep believing
          * it still holds a reservation it has already lost, which is the parked
-         * SPURS kernel this whole mechanism exists to wake. */
-        spu_lockline_lock();
+         * SPURS kernel this whole mechanism exists to wake. spu_ev_ack and
+         * spu_ev_raise are atomic read-modify-writes now, which closes that
+         * window on their own; no lock-line stripe is needed. */
         spu_ev_ack(ctx, v);
-        spu_lockline_unlock();
         break;
     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
     default:
@@ -1104,15 +1127,19 @@ static int yz_ch_block(void)
 static void spu_resv_lost_poll(spu_context* ctx)
 {
     if (!(ctx->event_mask & 0x400u) || !vm_base) return;
-    /* The reservation fields belong to the lock-line lock: a notifier on
-     * another thread clears them under it. */
-    spu_lockline_lock();
-    if (ctx->resv_valid && ctx->resv_ea != 0 &&
-        !gm_equal(vm_base + ctx->resv_ea, ctx->resv_line, 128)) {
-        ctx->resv_valid = 0;
+    /* The reservation belongs to its line's stripe: a notifier writing that
+     * line clears it under the same stripe. Only this thread re-points it. */
+    if (!RESV_VALID(ctx)) return;
+    const uint32_t rea = RESV_EA(ctx);
+    if (!rea) return;
+    const uint64_t m = spu_lockline_mask_ea(rea);
+    spu_lockline_lock_mask(m);
+    if (RESV_VALID(ctx) && RESV_EA(ctx) == rea &&
+        !gm_equal(vm_base + rea, ctx->resv_line, 128)) {
+        RESV_DROP(ctx);
         spu_ev_raise(ctx, 0x400u);
     }
-    spu_lockline_unlock();
+    spu_lockline_unlock_mask(m);
 }
 
 static int spu_ch_ready(spu_context* ctx, uint32_t channel)
@@ -1170,7 +1197,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
                 fprintf(stderr, "[ch-wait] spu=%X pc=0x%05X ch=%u waited=%llums evstat=0x%X evmask=0x%X resv[valid=%d ea=0x%08X]\n",
                         ctx->spu_id, ctx->pc & SPU_LS_MASK, channel, waited,
                         spu_ev_get(ctx), ctx->event_mask,
-                        ctx->resv_valid, ctx->resv_ea);
+                        RESV_VALID(ctx), RESV_EA(ctx));
                 fflush(stderr);
                 next_hb = ((waited / 2000) + 1) * 2000;
             }
@@ -1295,11 +1322,11 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
           lastsig[sp][0] = spu_channel_count(&ctx->ch_sig_notify[0]);
           lastsig[sp][1] = spu_channel_count(&ctx->ch_sig_notify[1]);
           lastmb[sp] = spu_channel_count(&ctx->ch_in_mbox);
-          lastrv[sp] = ctx->resv_valid; lastrea[sp] = ctx->resv_ea;
+          lastrv[sp] = RESV_VALID(ctx); lastrea[sp] = RESV_EA(ctx);
           lastlsa[sp] = ctx->mfc_lsa & SPU_LS_MASK;
           lastr90[sp] = ctx->gpr[90]._u32[0];
-          lastrd[sp] = (ctx->resv_valid && vm_base && ctx->resv_ea)
-                     ? !gm_equal(vm_base + ctx->resv_ea, ctx->resv_line, 128)
+          lastrd[sp] = (RESV_VALID(ctx) && vm_base && RESV_EA(ctx))
+                     ? !gm_equal(vm_base + RESV_EA(ctx), ctx->resv_line, 128)
                      : -1;
           { static _Atomic int s_ld2 = -2; static _Atomic uint32_t s_lo2;
             if (s_ld2 == -2) { const char* e5 = getenv("SPU_LSDUMP");

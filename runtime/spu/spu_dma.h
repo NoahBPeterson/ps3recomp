@@ -697,8 +697,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             extern int  spu_coh_is_reserved(uint32_t);
             extern void spu_coh_notify_write(uint32_t);
             extern void spu_coh_notify_write_except(uint32_t, const void*);
-            extern void spu_lockline_lock(void);
-            extern void spu_lockline_unlock(void);
+            extern uint64_t spu_lockline_mask_ea(uint32_t);
+            extern uint64_t spu_lockline_mask_range(uint32_t, uint32_t);
+            extern void spu_lockline_lock_mask(uint64_t);
+            extern void spu_lockline_unlock_mask(uint64_t);
             extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
             spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
             uint32_t a0 = (uint32_t)ea & ~127u;
@@ -709,20 +711,24 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 if (a == a1) break;
             }
             if (span_reserved) {
-                spu_lockline_lock();
+                /* Every line of the span, so no line is seen half-written: a
+                 * 128-byte line is written whole on Cell (mcx X8b). */
+                const uint64_t llm = spu_lockline_mask_range((uint32_t)ea, size);
+                spu_lockline_lock_mask(llm);
                 gm_copy_to((uint8_t*)ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
                     if (a == a1) break;
                 }
-                spu_lockline_unlock();
+                spu_lockline_unlock_mask(llm);
             } else {
                 gm_copy_to((uint8_t*)ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) {
-                        spu_lockline_lock();
+                        const uint64_t llm = spu_lockline_mask_ea(a);
+                        spu_lockline_lock_mask(llm);
                         spu_coh_notify_write_except(a, spu);
-                        spu_lockline_unlock();
+                        spu_lockline_unlock_mask(llm);
                     }
                     if (a == a1) break;
                 }
