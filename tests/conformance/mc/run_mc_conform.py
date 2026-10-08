@@ -164,19 +164,31 @@ def main():
         if got is None:
             print("run %d: our transcript has no %s block (see %s)" % (k, tag.decode(), errf))
             failed += 1; continue
-        bad = [(i, w, g) for i, (w, g) in enumerate(zip(want, got)) if w != g]
-        if len(want) != len(got):
-            bad.append((min(len(want), len(got)), "<%d lines>" % len(want), "<%d lines>" % len(got)))
-        for i, w, g in bad[:20]:
-            print("run %d line %d\n  oracle: %s\n  ours:   %s" % (k, i, w, g))
+        if a.suite == "spu":
+            # Judged per instruction by compare_spu.py: RPCS3's float results
+            # are not the Cell's in places, and that script checks those cases
+            # against the SPU ISA's single-precision model, not raw equality.
+            r = subprocess.run([py, os.path.join(HERE, "..", "spu", "compare_spu.py"),
+                                os.path.join(work, stem + ".manifest.json"), golden, ours],
+                               capture_output=True, text=True)
+            print(r.stdout.rstrip())
+            m = re.search(r"failing: (\d+)", r.stdout)
+            bad = [] if (m and m.group(1) == "0" and r.returncode == 0) else [(0, "compare_spu", "failed")]
+        else:
+            bad = [(i, w, g) for i, (w, g) in enumerate(zip(want, got)) if w != g]
+            if len(want) != len(got):
+                bad.append((min(len(want), len(got)), "<%d lines>" % len(want), "<%d lines>" % len(got)))
+            for i, w, g in bad[:20]:
+                print("run %d line %d\n  oracle: %s\n  ours:   %s" % (k, i, w, g))
         reports = sanitize.reports(errf) if a.sanitize else []
         for r in reports:
             print("run %d: %s" % (k, r))
         if bad or reports:
             failed += 1
     n = len(want)
-    print("IDENTICAL (%d lines)" % n if not failed and a.repeat == 1 else
-          "IDENTICAL (%d lines, %d/%d runs)" % (n, a.repeat, a.repeat) if not failed else
+    ok = "PASS (judged per instruction)" if a.suite == "spu" else "IDENTICAL"
+    print("%s (%d lines)" % (ok, n) if not failed and a.repeat == 1 else
+          "%s (%d lines, %d/%d runs)" % (ok, n, a.repeat, a.repeat) if not failed else
           "%d/%d run(s) differ or report" % (failed, a.repeat))
     sys.exit(1 if failed else 0)
 
