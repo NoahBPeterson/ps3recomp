@@ -652,6 +652,103 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
 }
 
 
+#ifndef _WIN32
+/* PS3_SPURS_NAMES=1: what each SPURS workload is. The SPURS library (libsre,
+ * run as firmware LLE) keeps its instance in guest memory, and the instance's
+ * address reaches the kernel in its SPU thread arguments; every argument word
+ * is kept as a candidate. A watcher thread then, every 10 s for ten minutes,
+ * prints each candidate that holds a plausible instance: its name prefix and,
+ * per workload, state, SPUs running it now, policy-module EA and the names the
+ * title gave it (nameClass / nameInstance). Diagnostic only; reads guest
+ * memory and changes nothing. */
+#include "../platform/win32_compat.h"
+#include "../../libs/spurs/spurs_instance.h"
+#define SPURS_NAME_CANDS 32
+static uint32_t s_spurs_cand[SPURS_NAME_CANDS];
+static int s_spurs_ncand;
+static pthread_mutex_t s_spurs_cand_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int spurs_names_readable(uint32_t ea, uint32_t n)
+{
+    return ea && (uint64_t)ea + n <= 0x100000000ull && !IsBadReadPtr(vm_base + ea, n);
+}
+static const char* spurs_names_str(uint64_t ea, char* buf, size_t cap)
+{
+    if (!ea || ea >= 0x100000000ull || !spurs_names_readable((uint32_t)ea, 1)) return "-";
+    size_t i = 0;
+    for (; i + 1 < cap && spurs_names_readable((uint32_t)ea + (uint32_t)i, 1); i++) {
+        const char ch = (char)vm_base[(uint32_t)ea + i];
+        if (!ch) break;
+        buf[i] = (ch >= 0x20 && ch < 0x7F) ? ch : '?';
+    }
+    buf[i] = 0;
+    return buf;
+}
+static void* spurs_names_watch(void* unused)
+{
+    (void)unused;
+    for (int round = 0; round < 60; round++) {   /* ten minutes: long enough to reach gameplay */
+        sleep(10);
+        pthread_mutex_lock(&s_spurs_cand_mu);
+        const int n = s_spurs_ncand;
+        uint32_t c[SPURS_NAME_CANDS];
+        memcpy(c, s_spurs_cand, sizeof c);
+        pthread_mutex_unlock(&s_spurs_cand_mu);
+        for (int k = 0; k < n; k++) {
+            const uint32_t ea = c[k];
+            if ((ea & 0x7F) || !spurs_names_readable(ea, SPURS_INST_SIZE)) continue;
+            const uint8_t* b = vm_base + ea;
+            const uint8_t nspus = b[SPURS_NSPUS];
+            if (!nspus || nspus > 8) continue;
+            char prefix[16] = {0};
+            uint32_t plen = b[SPURS_PREFIX_SIZE]; if (plen > 15) plen = 15;
+            for (uint32_t i = 0; i < plen; i++) {
+                const char ch = (char)b[SPURS_PREFIX + i];
+                prefix[i] = (ch >= 0x20 && ch < 0x7F) ? ch : '?';
+            }
+            fprintf(stderr, "[spurs names] t=%ds instance 0x%08X prefix \"%s\" spus=%u\n",
+                    (round + 1) * 10, ea, prefix, nspus);
+            for (uint32_t w = 0; w < SPURS_MAX_WKL; w++) {
+                const uint8_t st = b[SPURS_WKL_STATE1 + w];
+                if (st == WKL_STATE_NONE) continue;
+                const uint32_t info = ea + SPURS_WKL_INFO1 + w * SPURS_WKL_INFO_SZ;
+                const uint32_t pm  = vm_read_be32(info + 4);
+                const uint32_t arg = vm_read_be32(info + 12);
+                const uint32_t sz  = vm_read_be32(info + 0x10);
+                const uint64_t nc = ((uint64_t)vm_read_be32(ea + SPURS_WKL_H1 + 16 * w) << 32) |
+                                    vm_read_be32(ea + SPURS_WKL_H1 + 16 * w + 4);
+                const uint64_t ni = ((uint64_t)vm_read_be32(ea + SPURS_WKL_H1 + 16 * w + 8) << 32) |
+                                    vm_read_be32(ea + SPURS_WKL_H1 + 16 * w + 12);
+                char b1[64], b2[64];
+                fprintf(stderr, "[spurs names]   wid %2u state %u running-on %u pm 0x%08X size 0x%X arg 0x%08X"
+                        " class \"%s\" instance \"%s\"\n",
+                        w, st, b[SPURS_WKL_CURCONT + w], pm, sz, arg,
+                        spurs_names_str(nc, b1, sizeof b1), spurs_names_str(ni, b2, sizeof b2));
+            }
+        }
+    }
+    return NULL;
+}
+static void spurs_names_note_args(const uint64_t* args)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("PS3_SPURS_NAMES") ? 1 : 0;
+    if (!on) return;
+    static int started;
+    pthread_mutex_lock(&s_spurs_cand_mu);
+    for (int a = 0; a < 4; a++)
+        for (int h = 0; h < 2; h++) {
+            const uint32_t v = (uint32_t)(args[a] >> (h ? 0 : 32));
+            int seen = 0;
+            for (int k = 0; k < s_spurs_ncand; k++) if (s_spurs_cand[k] == v) seen = 1;
+            if (!seen && v && s_spurs_ncand < SPURS_NAME_CANDS) s_spurs_cand[s_spurs_ncand++] = v;
+        }
+    const int start = !started; started = 1;
+    pthread_mutex_unlock(&s_spurs_cand_mu);
+    if (start) { pthread_t th; pthread_create(&th, NULL, spurs_names_watch, NULL); pthread_detach(th); }
+}
+#endif
+
 /* sys_spu_thread_initialize(out_tid_ea, group_id, thread_num, img_ea, attr_ea, args_ea) */
 
 /* sys_spu_thread_initialize(thread*, group, spu_num, img*, attr*, arg*): the
@@ -719,6 +816,9 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
         uint64_t lo = vm_read_be32(args_ea + (uint32_t)a * 8 + 4);
         t->args[a] = (hi << 32) | lo;
     }
+#ifndef _WIN32
+    spurs_names_note_args(t->args);
+#endif
     g->thread_indices[thread_num] = (uint32_t)(t - s_spu_threads);
     g->init_mask |= 1u << thread_num;
     if ((uint32_t)__builtin_popcount(g->init_mask) == g->num_threads)
