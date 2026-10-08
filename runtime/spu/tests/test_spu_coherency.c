@@ -36,7 +36,10 @@
 /* ---------------------------------------------------------------------------
  * The runtime pieces a real build supplies, stubbed.
  * -----------------------------------------------------------------------*/
-static uint8_t g_guest_mem[1u << 20];
+/* Page-aligned, like the runtime's vm_base: 64-bit atomics (ldarx) on arm64
+ * fault on a misaligned address, and a plain byte array is only as aligned
+ * as whatever the linker put before it. */
+static _Alignas(4096) uint8_t g_guest_mem[1u << 20];
 uint8_t* vm_base = g_guest_mem;
 
 /* ppu_memory.h's inline stores reference these. Nothing here watches writes,
@@ -100,8 +103,7 @@ static void spu_getllar(spu_context* ctx, uint32_t ea)
     ea &= ~127u;
     spu_lockline_lock();
     spu_coh_reserve(ctx, ea);
-    ctx->resv_ea = ea;
-    ctx->resv_valid = 1;
+    SPU_RESV_SET(ctx, ea, 1);
     spu_lockline_unlock();
 }
 
@@ -151,7 +153,7 @@ static void test_ppu_store_raises_lr(void)
     CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
 
     TEST("...and drops the reservation, so the SPU's PUTLLC must fail");
-    CHECK(g_spu_a.resv_valid == 0);
+    CHECK(SPU_RESV_VALID(&g_spu_a) == 0);
 
     TEST("...and wakes the host thread parked on the event channel");
     CHECK(g_wakes == 1);
@@ -192,7 +194,7 @@ static void test_no_false_raise(void)
     TEST("a store to a DIFFERENT line leaves the reservation alone");
     vm_write32(LINE_B + 8, 0x33333333u);
     CHECK_EQ_U32(g_spu_a.event_status, 0);
-    CHECK(g_spu_a.resv_valid == 1);
+    CHECK(SPU_RESV_VALID(&g_spu_a) == 1);
     CHECK(g_wakes == 0);
 
     TEST("...even when that line is itself reserved by another SPU");
@@ -201,7 +203,7 @@ static void test_no_false_raise(void)
     vm_write32(LINE_B + 8, 0x44444444u);
     CHECK_EQ_U32(g_spu_b.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
     CHECK_EQ_U32(g_spu_a.event_status, 0);
-    CHECK(g_spu_a.resv_valid == 1);
+    CHECK(SPU_RESV_VALID(&g_spu_a) == 1);
 
     TEST("an SPU that holds NO reservation is never notified");
     spu_reset(&g_spu_b, 1);            /* registered, but resv_valid = 0 */
@@ -230,7 +232,7 @@ static void test_all_store_widths(void)
         case 3: vm_write64(LINE_C + 16, 0xA5A5A5A5A5A5A5A5ull);    break;
         }
         CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-        CHECK(g_spu_a.resv_valid == 0);
+        CHECK(SPU_RESV_VALID(&g_spu_a) == 0);
     }
 }
 
@@ -251,7 +253,7 @@ static void test_store_conditional(void)
     CHECK(ppu_stwcx(&ppu, LINE_A + 32, 0x1001u) == 1);
     CHECK_EQ_U32(vm_read32(LINE_A + 32), 0x1001u);
     CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_spu_a.resv_valid == 0);
+    CHECK(SPU_RESV_VALID(&g_spu_a) == 0);
     CHECK(g_wakes == 1);
 
     /* A stwcx that FAILS its compare stored nothing, so there is nothing to
@@ -264,12 +266,12 @@ static void test_store_conditional(void)
     ppu_lwarx(&ppu, LINE_A + 32);
     vm_write32(LINE_A + 64, 0x9999u);          /* elsewhere in the line */
     g_spu_a.event_status = 0;                  /* ignore that one */
-    g_spu_a.resv_valid = 1;
+    SPU_RESV_SET(&g_spu_a, SPU_RESV_EA(&g_spu_a), 1);
     g_wakes = 0;
     ppu.reserve_value = 0xFFFFFFFFu;           /* now the compare cannot match */
     CHECK(ppu_stwcx(&ppu, LINE_A + 32, 0x2002u) == 0);
     CHECK_EQ_U32(g_spu_a.event_status, 0);
-    CHECK(g_spu_a.resv_valid == 1);
+    CHECK(SPU_RESV_VALID(&g_spu_a) == 1);
     CHECK(g_wakes == 0);
 
     /* stdcx., the 8-byte commit. */
@@ -310,8 +312,8 @@ static void test_block_stores(void)
     CHECK(vm_read8(LINE_B + 9) == 0x77u);
     CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
     CHECK_EQ_U32(g_spu_b.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_spu_a.resv_valid == 0);
-    CHECK(g_spu_b.resv_valid == 0);
+    CHECK(SPU_RESV_VALID(&g_spu_a) == 0);
+    CHECK(SPU_RESV_VALID(&g_spu_b) == 0);
     CHECK(g_wakes == 2);
 
     TEST("a memcpy into a reserved line breaks it");
@@ -322,7 +324,7 @@ static void test_block_stores(void)
     CHECK(vm_read8(LINE_C + 120) == 0x5Au);
     CHECK(vm_read8(LINE_C + 135) == 0x5Au);
     CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
-    CHECK(g_spu_a.resv_valid == 0);
+    CHECK(SPU_RESV_VALID(&g_spu_a) == 0);
     CHECK(g_wakes == 1);
 
     TEST("a block that touches no reserved line raises nothing");
@@ -332,14 +334,14 @@ static void test_block_stores(void)
     vm_memcpy_to(LINE_D, buf, sizeof(buf));
     vm_memset(LINE_D, 0, 300);
     CHECK_EQ_U32(g_spu_a.event_status, 0);
-    CHECK(g_spu_a.resv_valid == 1);
+    CHECK(SPU_RESV_VALID(&g_spu_a) == 1);
     CHECK(g_wakes == 0);
 
     TEST("an empty block is not a store");
     vm_memset(LINE_C, 0, 0);
     vm_memcpy_to(LINE_C, buf, 0);
     CHECK_EQ_U32(g_spu_a.event_status, 0);
-    CHECK(g_spu_a.resv_valid == 1);
+    CHECK(SPU_RESV_VALID(&g_spu_a) == 1);
     CHECK(g_wakes == 0);
 }
 
@@ -365,7 +367,7 @@ static void test_unregister_after_slot_reuse(void)
     /* Out of the set, B must not be notified even holding a reservation
      * (its context could be gone: a stack local whose thread exited). */
     g_wakes = 0;
-    g_spu_b.resv_ea = LINE_B; g_spu_b.resv_valid = 1; g_spu_b.event_status = 0;
+    SPU_RESV_SET(&g_spu_b, LINE_B, 1); g_spu_b.event_status = 0;
     vm_write32(LINE_B + 8, 0x55555555u);
     CHECK_EQ_U32(g_spu_b.event_status, 0);
     CHECK(g_wakes == 0);

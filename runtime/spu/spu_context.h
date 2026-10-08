@@ -287,8 +287,12 @@ typedef struct spu_context {
      * SPU kernel threads share a lock-free queue in main memory; PUTLLC must
      * FAIL if the reserved 128-byte line changed since GETLLAR, or concurrent
      * claims corrupt the queue. */
-    uint32_t resv_ea;          /* reserved 128-byte line EA, aligned (0 = none) */
-    int      resv_valid;
+    /* The reservation: line EA (low 32 bits, 0 = none) and valid (bit 32) in
+     * ONE word, read and written only through SPU_RESV_* below. A notifier
+     * clears it by compare-and-swap from exactly the (line, valid) it saw, so
+     * an owner that has meanwhile re-reserved elsewhere keeps its new
+     * reservation: no lock is needed to move one (T-0015). */
+    uint64_t resv_word;
     uint32_t atomic_stat;      /* last atomic op result -> MFC_RdAtomicStat */
     uint64_t dbg_getllar;      /* SPU_PUTLLC_WHY: GETLLARs issued      */
     uint8_t  resv_line[128];   /* snapshot of the line at GETLLAR time */
@@ -748,6 +752,22 @@ static inline u128 spu_make_preferred_u32(uint32_t val)
  * Atomic at every access, so a raise can neither be lost to the SPU's
  * acknowledge nor be seen half-done. */
 #define spu_ev_get(c)        __atomic_load_n(&(c)->event_status, __ATOMIC_ACQUIRE)
+
+/* Reservation word accessors (see resv_word). */
+#define SPU_RESV_PACK(ea, v)   ((uint64_t)(uint32_t)(ea) | ((uint64_t)((v) != 0) << 32))
+#define SPU_RESV_LOAD(c)       __atomic_load_n(&(c)->resv_word, __ATOMIC_ACQUIRE)
+#define SPU_RESV_VALID(c)      ((int)(SPU_RESV_LOAD(c) >> 32))
+#define SPU_RESV_EA(c)         ((uint32_t)SPU_RESV_LOAD(c))
+#define SPU_RESV_SET(c, ea, v) __atomic_store_n(&(c)->resv_word, SPU_RESV_PACK((ea), (v)), __ATOMIC_RELEASE)
+#define SPU_RESV_DROP(c)       __atomic_store_n(&(c)->resv_word, SPU_RESV_LOAD(c) & 0xFFFFFFFFull, __ATOMIC_RELEASE)
+/* Break `c`'s reservation if it is live on `line`: 1 if this call broke it. */
+static inline int spu_resv_break(spu_context* c, uint32_t line)
+{
+    uint64_t v = SPU_RESV_LOAD(c);
+    if (!(v >> 32) || ((uint32_t)v & ~127u) != line) return 0;
+    return __atomic_compare_exchange_n(&c->resv_word, &v, v & 0xFFFFFFFFull, 0,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
 #define spu_ev_raise(c, b)   ((void)__atomic_fetch_or(&(c)->event_status, (uint32_t)(b), __ATOMIC_RELEASE))
 #define spu_ev_ack(c, b)     ((void)__atomic_fetch_and(&(c)->event_status, ~(uint32_t)(b), __ATOMIC_ACQ_REL))
 

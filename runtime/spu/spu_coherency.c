@@ -47,7 +47,7 @@ extern "C" {
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <windows.h>   /* SwitchToThread */
-typedef struct { __declspec(align(128)) volatile long v; char pad[124]; } ll_stripe;
+typedef struct { __declspec(align(128)) volatile long v; volatile long seq; char pad[120]; } ll_stripe;
 static ll_stripe g_ll[SPU_LL_STRIPES];
 static void ll_take(ll_stripe* s)
 {
@@ -58,12 +58,21 @@ static void ll_take(ll_stripe* s)
             if (++spins >= 4096) { spins = 0; SwitchToThread(); }
         } while (s->v);
     }
+    _InterlockedIncrement(&s->seq);                  /* odd: a writer is in */
 }
-static void ll_drop(ll_stripe* s) { _InterlockedExchange(&s->v, 0); }
+static void ll_drop(ll_stripe* s) { _InterlockedIncrement(&s->seq); _InterlockedExchange(&s->v, 0); }
+static uint32_t ll_seq_begin(ll_stripe* s)
+{
+    long q;
+    while ((q = s->seq) & 1) _mm_pause();
+    MemoryBarrier();
+    return (uint32_t)q;
+}
+static int ll_seq_valid(ll_stripe* s, uint32_t q) { MemoryBarrier(); return (uint32_t)s->seq == q; }
 #else
 #include <stdatomic.h>
 #include <sched.h>
-typedef struct { _Alignas(128) atomic_int v; char pad[124]; } ll_stripe;
+typedef struct { _Alignas(128) atomic_int v; atomic_uint seq; char pad[120]; } ll_stripe;
 static ll_stripe g_ll[SPU_LL_STRIPES];
 static inline void ll_pause(void)
 {
@@ -82,8 +91,29 @@ static void ll_take(ll_stripe* s)
             if (++spins >= 4096) { spins = 0; sched_yield(); }
         } while (atomic_load_explicit(&s->v, memory_order_relaxed));
     }
+    /* Seqlock writer: odd while held, and the increment ordered before any
+     * write the holder makes (Boehm's seqlock pattern). */
+    const unsigned q = atomic_load_explicit(&s->seq, memory_order_relaxed);
+    atomic_store_explicit(&s->seq, q + 1u, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
 }
-static void ll_drop(ll_stripe* s) { atomic_store_explicit(&s->v, 0, memory_order_release); }
+static void ll_drop(ll_stripe* s)
+{
+    const unsigned q = atomic_load_explicit(&s->seq, memory_order_relaxed);
+    atomic_store_explicit(&s->seq, q + 1u, memory_order_release);
+    atomic_store_explicit(&s->v, 0, memory_order_release);
+}
+static uint32_t ll_seq_begin(ll_stripe* s)
+{
+    unsigned q;
+    while ((q = atomic_load_explicit(&s->seq, memory_order_acquire)) & 1u) ll_pause();
+    return q;
+}
+static int ll_seq_valid(ll_stripe* s, uint32_t q)
+{
+    atomic_thread_fence(memory_order_acquire);
+    return atomic_load_explicit(&s->seq, memory_order_relaxed) == q;
+}
 #endif
 
 /* Which stripe guards a line: neighbouring lines and lines a power-of-two
@@ -146,6 +176,13 @@ void spu_lockline_unlock_mask(uint64_t mask)
         mask &= mask - 1u;
     }
 }
+
+static ll_stripe* ll_for_read(uint32_t ea)
+{
+    return ll_global() ? &g_ll_single : &g_ll[ll_stripe_of(ea)];
+}
+uint32_t spu_lockline_read_begin(uint32_t ea)          { return ll_seq_begin(ll_for_read(ea)); }
+int      spu_lockline_read_valid(uint32_t ea, uint32_t q) { return ll_seq_valid(ll_for_read(ea), q); }
 
 void spu_lockline_lock(void)   { spu_lockline_lock_mask(~0ull); }
 void spu_lockline_unlock(void) { spu_lockline_unlock_mask(~0ull); }
@@ -263,10 +300,13 @@ static void coh_mark_line(uint32_t ea)
 /* line/valid: written by the owner under the stripe(s) of the line(s) it
  * reserves, cleared by a notifier under the stripe of the line it writes,
  * read by every notifier -- so accessed atomically. used: claimed by CAS. */
-static struct { uint32_t line; uint32_t valid; uint32_t used; } s_ppu_resv[SPU_COH_MAX_PPU];
+/* lv: line (low 32) and valid (bit 32) in one word, cleared by CAS from the
+ * exact value a notifier saw -- the same protocol as spu_context.resv_word. */
+static struct { uint64_t lv; uint32_t used; uint32_t pad; } s_ppu_resv[SPU_COH_MAX_PPU];
 static int s_ppu_resv_hi;                         /* slots in use are below this */
-#define PSLOT_LINE(i)   __atomic_load_n(&s_ppu_resv[i].line, __ATOMIC_RELAXED)
-#define PSLOT_VALID(i)  __atomic_load_n(&s_ppu_resv[i].valid, __ATOMIC_ACQUIRE)
+#define PSLOT_LV(i)     __atomic_load_n(&s_ppu_resv[i].lv, __ATOMIC_ACQUIRE)
+#define PSLOT_LINE(i)   ((uint32_t)PSLOT_LV(i))
+#define PSLOT_VALID(i)  ((int)(PSLOT_LV(i) >> 32))
 #ifdef _WIN32
 static __declspec(thread) int t_ppu_slot = -1;
 #else
@@ -276,9 +316,13 @@ static __thread int t_ppu_slot = -1;
 static void ppu_resv_clear(uint32_t line, int except)
 {
     const int hi = __atomic_load_n(&s_ppu_resv_hi, __ATOMIC_ACQUIRE);
-    for (int i = 0; i < hi; i++)
-        if (i != except && PSLOT_VALID(i) && PSLOT_LINE(i) == line)
-            __atomic_store_n(&s_ppu_resv[i].valid, 0, __ATOMIC_RELEASE);
+    for (int i = 0; i < hi; i++) {
+        if (i == except) continue;
+        uint64_t v = PSLOT_LV(i);
+        if ((v >> 32) && (uint32_t)v == line)
+            __atomic_compare_exchange_n(&s_ppu_resv[i].lv, &v, v & 0xFFFFFFFFull, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    }
 }
 
 void spu_coh_ppu_reserve(uint32_t ea)
@@ -304,8 +348,7 @@ void spu_coh_ppu_reserve(uint32_t ea)
             return;
         }
     }
-    __atomic_store_n(&s_ppu_resv[t_ppu_slot].line, ea & ~127u, __ATOMIC_RELAXED);
-    __atomic_store_n(&s_ppu_resv[t_ppu_slot].valid, 1u, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_ppu_resv[t_ppu_slot].lv, (uint64_t)(ea & ~127u) | (1ull << 32), __ATOMIC_RELEASE);
 }
 
 /* The line this thread holds a PPU reservation on, or ~0u: a new lwarx elsewhere
@@ -324,14 +367,15 @@ int spu_coh_ppu_holds(uint32_t ea)
 
 void spu_coh_ppu_drop(void)
 {
-    if (t_ppu_slot >= 0) __atomic_store_n(&s_ppu_resv[t_ppu_slot].valid, 0u, __ATOMIC_RELEASE);
+    if (t_ppu_slot >= 0)
+        __atomic_store_n(&s_ppu_resv[t_ppu_slot].lv, PSLOT_LV(t_ppu_slot) & 0xFFFFFFFFull, __ATOMIC_RELEASE);
 }
 
 void spu_coh_ppu_thread_exit(void)
 {
     if (t_ppu_slot < 0) return;
     spu_lockline_lock();
-    __atomic_store_n(&s_ppu_resv[t_ppu_slot].valid, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_ppu_resv[t_ppu_slot].lv, 0ull, __ATOMIC_RELEASE);
     __atomic_store_n(&s_ppu_resv[t_ppu_slot].used, 0u, __ATOMIC_RELEASE);
     spu_lockline_unlock();
     t_ppu_slot = -1;
@@ -452,10 +496,8 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
         spu_context* c = __atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE);
         if (!c || (const void*)c == self) continue;
-        if (__atomic_load_n(&c->resv_valid, __ATOMIC_ACQUIRE) &&
-            (__atomic_load_n(&c->resv_ea, __ATOMIC_RELAXED) & ~127u) == line) {
+        if (spu_resv_break(c, line)) {
             spu_ev_raise(c, SPU_EVENT_LR);
-            __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELEASE);
             __atomic_fetch_add(&g_spu_lr_raise, 1ul, __ATOMIC_RELAXED);   /* raised under different stripes */
             spu_ch_wake(c);
         }
@@ -482,10 +524,8 @@ static void notify_spus(uint32_t line)
     for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
         spu_context* c = __atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE);
         if (!c) continue;
-        if (__atomic_load_n(&c->resv_valid, __ATOMIC_ACQUIRE) &&
-            (__atomic_load_n(&c->resv_ea, __ATOMIC_RELAXED) & ~127u) == line) {
+        if (spu_resv_break(c, line)) {        /* lost: PUTLLC must fail */
             spu_ev_raise(c, SPU_EVENT_LR);
-            __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELEASE);   /* lost: PUTLLC must fail */
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
              * always fails for "no reservation" is useless without knowing who
              * took it away -- a peer SPU, or the PPU committing to the line. */

@@ -562,23 +562,19 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
  * completion. Chosen above the context/descriptor we park near the top of LS. */
 #define SPU_JOB_RETURN_LS   0x3FF00u
 
-/* A context's reservation, read and written atomically: a notifier holding
- * another line's stripe reads it. The line is stored before `valid` is
- * published (release), so a reader that sees valid sees the line it is for. */
-#define RESV_VALID(c)       __atomic_load_n(&(c)->resv_valid, __ATOMIC_ACQUIRE)
-#define RESV_EA(c)          __atomic_load_n(&(c)->resv_ea, __ATOMIC_RELAXED)
-#define RESV_SET(c, ea, v)  do { __atomic_store_n(&(c)->resv_ea, (ea), __ATOMIC_RELAXED); \
-                                 __atomic_store_n(&(c)->resv_valid, (v), __ATOMIC_RELEASE); } while (0)
-#define RESV_DROP(c)        __atomic_store_n(&(c)->resv_valid, 0, __ATOMIC_RELEASE)
+/* The reservation word (spu_context.resv_word): a notifier breaks it by CAS
+ * from the exact (line, valid) it read, so moving or consuming a reservation
+ * needs no lock on the line it leaves. */
+#define RESV_VALID(c)       SPU_RESV_VALID(c)
+#define RESV_EA(c)          SPU_RESV_EA(c)
+#define RESV_SET(c, ea, v)  SPU_RESV_SET((c), (ea), (v))
+#define RESV_DROP(c)        SPU_RESV_DROP(c)
 
-/* The stripes a transaction on `ea` holds: its own line's, and the line this
- * context has reserved, if another -- moving or consuming a reservation must
- * exclude a notifier on the line it leaves (spu_coherency.h). */
+/* A transaction that WRITES `ea`'s line holds its stripe. */
 static uint64_t ll_mask_for(spu_context* ctx, uint32_t ea)
 {
-    uint64_t m = spu_lockline_mask_ea(ea);
-    if (RESV_VALID(ctx)) m |= spu_lockline_mask_ea(RESV_EA(ctx));
-    return m;
+    (void)ctx;
+    return spu_lockline_mask_ea(ea);
 }
 
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
@@ -719,12 +715,26 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
          * peer that must WRITE the line waits for it (canersaka ticks the
          * GETLLAR fast+slow paths for exactly this reason). */
         yz_lockstep_tick(ctx);
-        llm = ll_mask_for(ctx, ea);
-        spu_lockline_lock_mask(llm);
-        /* Tell the PPU store paths this line is live, so a store into it goes
-         * through the lock and raises SPU_EVENT_LR here instead of landing
-         * unannounced. Nothing else about this transaction changes. */
+        /* A lock-free read (T-0015): SPUs polling one line -- every SPURS
+         * kernel on the instance's control line -- used to serialize on its
+         * lock. The previous reservation is dropped first, so a write from now
+         * on raises no event for it; then the line is marked, so every writer
+         * from here goes through its stripe and breaks what we publish below. */
+        RESV_DROP(ctx);
         spu_coh_reserve(ctx, ea);
+        { unsigned tries = 0;
+          for (;;) {
+            if (++tries > 64) {
+                /* Writers keep the stripe busy: read under it instead. */
+                llm = ll_mask_for(ctx, ea);
+                spu_lockline_lock_mask(llm);
+                gm_copy_from(ls, mem, MFC_ATOMIC_LINE);
+                memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);
+                RESV_SET(ctx, ea, 1);
+                spu_lockline_unlock_mask(llm);
+                break;
+            }
+            const uint32_t q = spu_lockline_read_begin(ea);
 
         /* ONE read of guest memory, then the snapshot from that copy.
          *
@@ -743,7 +753,8 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
          * same instant. Copying the snapshot from `ls` restores that property,
          * and a store that lands after the read now leaves BOTH stale -- which
          * is what makes the lost-reservation event fire. */
-        gm_copy_from(ls, mem, MFC_ATOMIC_LINE);        /* line -> local store */
+            gm_copy_from(ls, mem, MFC_ATOMIC_LINE);    /* line -> local store */
+            if (!spu_lockline_read_valid(ea, q)) continue;     /* torn: a writer was in */
         /* Snapshot from `ls`, NOT a second read of `mem`. Hardware GETLLAR is a
          * single atomic 128-byte read, so the reserved data and the reservation
          * come from the same instant. Reading guest memory twice lets a PPU store
@@ -754,11 +765,18 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
          * the new value, finds no difference, and never raises the event. Nobody
          * wakes anybody. Snapshotting from `ls` makes a later store leave BOTH
          * stale, which is exactly what makes the lost-reservation event fire. */
-        memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);   /* snapshot for compare */
+            memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);   /* snapshot for compare */
+            RESV_SET(ctx, ea, 1);
+            /* A writer that took the stripe after the read either saw the
+             * reservation and broke it (an event, as on hardware: it wrote
+             * after this GETLLAR) or came before the publish and did not: then
+             * the snapshot may be stale and unannounced, so read again. */
+            if (spu_lockline_read_valid(ea, q) || !RESV_VALID(ctx)) break;
+          } }
         /* MFC_RdAtomicStat after a GETLLAR reads 4 (GETLLAR complete), not 0:
          * Havok's SPU allocator (GH3 collide task, LS 0xA66C) re-issues the
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
-        RESV_SET(ctx, ea, 1); ctx->atomic_stat = 4;
+        ctx->atomic_stat = 4;
         ctx->dbg_getllar++;
         /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
          * that nobody is releasing (a ticket lock, a counter barrier). Say so
@@ -773,7 +791,6 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
                       ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
           } }
-        spu_lockline_unlock_mask(llm);
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *
@@ -1132,14 +1149,16 @@ static void spu_resv_lost_poll(spu_context* ctx)
     if (!RESV_VALID(ctx)) return;
     const uint32_t rea = RESV_EA(ctx);
     if (!rea) return;
-    const uint64_t m = spu_lockline_mask_ea(rea);
-    spu_lockline_lock_mask(m);
-    if (RESV_VALID(ctx) && RESV_EA(ctx) == rea &&
-        !gm_equal(vm_base + rea, ctx->resv_line, 128)) {
-        RESV_DROP(ctx);
-        spu_ev_raise(ctx, 0x400u);
+    /* A seqlock read like GETLLAR's: a poll takes no lock, and a torn
+     * compare is simply repeated. */
+    int changed;
+    for (;;) {
+        const uint32_t q = spu_lockline_read_begin(rea);
+        changed = !gm_equal(vm_base + rea, ctx->resv_line, 128);
+        if (spu_lockline_read_valid(rea, q)) break;
     }
-    spu_lockline_unlock_mask(m);
+    if (changed && spu_resv_break(ctx, rea & ~127u))
+        spu_ev_raise(ctx, 0x400u);
 }
 
 static int spu_ch_ready(spu_context* ctx, uint32_t channel)

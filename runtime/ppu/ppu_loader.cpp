@@ -956,14 +956,11 @@ static PPU_THREAD_LOCAL int t_resv_noted;
 
 extern "C" void ppu_resv_line_note(uint64_t ea)
 {
-    /* This line's stripe, and the one this thread's previous reservation sits
-     * under: re-pointing it must exclude a notifier on the line it leaves. */
-    uint64_t m = spu_lockline_mask_ea((uint32_t)ea);
-    const uint32_t held = spu_coh_ppu_held_line();
-    if (held != ~0u) m |= spu_lockline_mask_ea(held);
-    spu_lockline_lock_mask(m);
+    /* No lock (T-0015): the slot is one (line, valid) word that a notifier
+     * breaks by CAS from exactly what it read, so re-pointing it cannot be
+     * undone by a notifier for the line it leaves. liblv2's lwmutex spins
+     * issue this on every iteration. */
     spu_coh_ppu_reserve((uint32_t)ea);
-    spu_lockline_unlock_mask(m);
     t_resv_noted = 1;
 }
 

@@ -60,6 +60,13 @@ uint64_t spu_lockline_mask_range(uint32_t ea, uint32_t len);
 void     spu_lockline_lock_mask(uint64_t mask);
 void     spu_lockline_unlock_mask(uint64_t mask);
 
+/* A lock-free read of `ea`'s line, seqlock style: every stripe holder bumps
+ * the stripe's sequence (odd while held). begin waits for an even value and
+ * returns it; the read is good if valid() still sees that value. A GETLLAR
+ * reads this way, so SPUs polling one line no longer serialize on its lock. */
+uint32_t spu_lockline_read_begin(uint32_t ea);
+int      spu_lockline_read_valid(uint32_t ea, uint32_t seq);
+
 /* Mark `ea`'s 128-byte line as SPU-reserved and remember `ctx` as a possible
  * reservation holder. Called from the SPU's GETLLAR with the lock held.
  *
