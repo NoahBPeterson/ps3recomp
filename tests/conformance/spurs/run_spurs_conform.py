@@ -28,6 +28,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, ".."))
+import golden  # noqa: E402
 sys.path.insert(0, os.path.join(HERE, "..", "ppu"))
 from run_ppu_conform import DEFAULT_RPCS3, run_oracle, sh  # noqa: E402
 import spurs_lib  # noqa: E402
@@ -69,7 +71,10 @@ def main():
     ap.add_argument("--work", required=True)
     ap.add_argument("--only", default="")
     ap.add_argument("--rpcs3", default=DEFAULT_RPCS3)
-    ap.add_argument("--skip-oracle", action="store_true")
+    ap.add_argument("--regen-oracle", action="store_true",
+                    help="run RPCS3 and save each test's transcript as its golden")
+    ap.add_argument("--skip-oracle", action="store_true",
+                    help="no-op: the committed goldens are the default")
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 8)
@@ -98,9 +103,14 @@ def main():
         json.dump(lines, open(os.path.join(tdir, "manifest.json"), "w"), indent=1)
         print("== %s: %d records" % (name, len(lines)), flush=True)
 
-        if not a.skip_oracle:
+        gdir = os.path.join(HERE, "golden")
+        if a.regen_oracle:
             run_oracle(a.rpcs3, elf, tdir, a.timeout, marker=(TAG + " END").encode())
-        want = transcript(os.path.join(tdir, "oracle.txt"))
+            golden.save(gdir, name, elf, os.path.join(tdir, "oracle.txt"), TAG)
+        gpath = golden.find(gdir, name, elf)
+        if not gpath:
+            summary.append((name, "NO GOLDEN")); continue
+        want = transcript(gpath)
         if want is None:
             print("   oracle produced no transcript (see ~/Library/Caches/rpcs3/RPCS3.log)")
             summary.append((name, "NO ORACLE")); continue

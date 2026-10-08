@@ -104,7 +104,10 @@ def main():
     ap.add_argument("--only", default="")
     ap.add_argument("--scale", type=int, default=1)
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--skip-oracle", action="store_true")
+    ap.add_argument("--regen-oracle", action="store_true",
+                    help="run RPCS3 and save its transcript as this ELF's golden")
+    ap.add_argument("--skip-oracle", action="store_true",
+                    help="no-op: the committed golden is the default")
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--ignore", default="r1,fpscr")
     ap.add_argument("--show", type=int, default=3)
@@ -124,8 +127,17 @@ def main():
     if sh(gen).returncode:
         sys.exit(2)
 
-    if not a.skip_oracle:
+    sys.path.insert(0, os.path.join(HERE, ".."))
+    import golden
+    gdir = os.path.join(HERE, "golden")
+    if a.regen_oracle:
         run_oracle(a.rpcs3, elf, work, a.timeout)
+        if not golden.save(gdir, "ppu_conform", elf, os.path.join(work, "oracle.txt"), "PPUCONF",
+                           replace_others=False):
+            print("oracle transcript has no PPUCONF block"); sys.exit(2)
+    oracle = golden.find(gdir, "ppu_conform", elf)
+    if not oracle:
+        sys.exit(2)
 
     rec = os.path.join(work, "recompiled")
     bld = os.path.join(work, "build")
@@ -158,7 +170,7 @@ def main():
         except subprocess.TimeoutExpired:
             print("lifted run: TIMEOUT")
 
-    r = sh([py, os.path.join(HERE, "compare.py"), man, os.path.join(work, "oracle.txt"), ours,
+    r = sh([py, os.path.join(HERE, "compare.py"), man, oracle, ours,
             "--ignore", a.ignore, "--show", str(a.show), "--json", os.path.join(work, "result.json")])
     sys.exit(r.returncode)
 
