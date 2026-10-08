@@ -4,9 +4,14 @@ Differential test of SPU thread groups and PPU<->SPU interaction: RPCS3
 (headless, same oracle config as `../ppu`) against ps3recomp, on the same ELF.
 
 ```
-python3 tests/conformance/mc/run_mc_conform.py --work /tmp/mcconf
-python3 tests/conformance/mc/run_mc_conform.py --work /tmp/mcconf --skip-oracle   # reuse oracle.txt
+python3 tests/conformance/mc/run_mc_conform.py --work /tmp/mcconf                  # against golden/, no RPCS3
+python3 tests/conformance/mc/run_mc_conform.py --work /tmp/mcconf --regen-oracle   # rerun RPCS3, rewrite golden/
 ```
+
+The expected transcripts are committed in `golden/<stem>.txt`: RPCS3's output
+for the generated ELF whose SHA-256 heads the file. The generators are
+deterministic, so a normal run needs no RPCS3; if a generator changes, the
+hash no longer matches and the runner asks for `--regen-oracle`.
 
 `gen_mc_conform.py` writes a bare lv2 ELF (raw syscalls, no imports) whose PPU
 side creates thread groups from three SPU images assembled by `spu_asm.py`:

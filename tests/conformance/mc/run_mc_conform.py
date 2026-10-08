@@ -8,9 +8,16 @@ MFC DMA, atomics and PPU<->SPU mailboxes/signals.
      as resident, concurrent threads with blocking channels
   4. the MCCONF BEGIN..END transcripts must be identical
 
-usage: run_mc_conform.py --work DIR [--suite mc|spurs] [--rpcs3 PATH] [--skip-oracle] [--skip-build]
+The expected transcript is committed: golden/<stem>.txt, RPCS3's output for
+the ELF whose SHA-256 heads the file. Generators are deterministic, so a run
+needs no RPCS3; one whose ELF no longer matches the golden's (a changed
+generator) stops and says to regenerate. --regen-oracle runs RPCS3 and
+rewrites the golden.
+
+usage: run_mc_conform.py --work DIR [--suite mc|mcx|spurs|spu] [--regen-oracle [--rpcs3 PATH]] [--skip-build]
   --suite spurs runs gen_spurs_conform.py instead (SPURS through firmware imports).
 """
+import hashlib
 import argparse
 import os
 import re
@@ -55,7 +62,10 @@ def main():
     ap.add_argument("--work", required=True)
     ap.add_argument("--suite", choices=sorted(SUITES), default="mc")
     ap.add_argument("--rpcs3", default=DEFAULT_RPCS3)
-    ap.add_argument("--skip-oracle", action="store_true")
+    ap.add_argument("--regen-oracle", action="store_true",
+                    help="run RPCS3 and rewrite golden/<stem>.txt from its transcript")
+    ap.add_argument("--skip-oracle", action="store_true",
+                    help="no-op: the golden transcript is the default (kept for old command lines)")
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 8)
@@ -76,8 +86,24 @@ def main():
 
     if sh([py, os.path.join(HERE, gen), "-o", elf]).returncode:
         sys.exit(2)
-    if not a.skip_oracle:
+    elf_sha = hashlib.sha256(open(elf, "rb").read()).hexdigest()
+    golden = os.path.join(HERE, "golden", stem + ".txt")
+    if a.regen_oracle:
         run_oracle(a.rpcs3, elf, work, a.timeout, marker=tag + b" END", extra=ORACLE_EXTRA.get(a.suite))
+        lines = cut(os.path.join(work, "oracle.txt"), tag)
+        if lines is None:
+            print("oracle transcript has no %s block" % tag.decode()); sys.exit(2)
+        os.makedirs(os.path.dirname(golden), exist_ok=True)
+        with open(golden, "w") as f:
+            f.write("# elf-sha256 %s (RPCS3 transcript; regenerate with --regen-oracle)\n" % elf_sha)
+            f.write("\n".join(lines) + "\n")
+        print("wrote %s (%d lines)" % (os.path.relpath(golden, ROOT), len(lines)))
+    if not os.path.exists(golden):
+        print("no golden transcript %s: run with --regen-oracle (needs RPCS3)" % golden); sys.exit(2)
+    gl = open(golden).read().splitlines()
+    if not gl or not gl[0].startswith("# elf-sha256 ") or gl[0].split()[2] != elf_sha:
+        print("golden %s was made from a different %s.elf (the generator changed): "
+              "rerun with --regen-oracle" % (os.path.relpath(golden, ROOT), stem)); sys.exit(2)
 
     rec = os.path.join(work, "recompiled")
     bld = sanitize.build_dir(os.path.join(work, "build_lifted" if a.lifted else "build"), a.sanitize)
@@ -112,9 +138,7 @@ def main():
             print("\n".join(l for l in (r.stdout + r.stderr).split("\n") if " error" in l or "Error" in l)[:4000])
             sys.exit(2)
 
-    want = cut(os.path.join(work, "oracle.txt"), tag)
-    if want is None:
-        print("oracle transcript has no %s block" % tag.decode()); sys.exit(2)
+    want = gl[1:]
     # Records the architecture decides where the oracle is known to deviate
     # (written by the generator; see gen_mcx_conform.x1_spec).
     spec_path = os.path.join(work, stem + ".spec.json")
