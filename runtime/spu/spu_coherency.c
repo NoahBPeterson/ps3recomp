@@ -55,9 +55,32 @@ void spu_lockline_lock(void)
 void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
 #else
 #include <stdatomic.h>
-static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
-void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
-void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
+#include <sched.h>
+/* The same test-and-test-and-set as above. This side was still the bare
+ * exchange loop, and on a many-core host it cost the most: every waiter wrote
+ * the lock's line on every spin, so the holder's release and the next
+ * acquire queued behind them -- 10% of all busy CPU in inFamous gameplay,
+ * most of it PPU lwarx spins in liblv2 waiting on each other (T-0015). */
+static atomic_int g_lockline = 0;
+static inline void lockline_pause(void)
+{
+#if defined(__aarch64__) || defined(__arm64__)
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#endif
+}
+void spu_lockline_lock(void)
+{
+    unsigned spins = 0;
+    while (atomic_exchange_explicit(&g_lockline, 1, memory_order_acquire)) {
+        do {
+            lockline_pause();
+            if (++spins >= 4096) { spins = 0; sched_yield(); }
+        } while (atomic_load_explicit(&g_lockline, memory_order_relaxed));
+    }
+}
+void spu_lockline_unlock(void) { atomic_store_explicit(&g_lockline, 0, memory_order_release); }
 #endif
 
 /* ===========================================================================
