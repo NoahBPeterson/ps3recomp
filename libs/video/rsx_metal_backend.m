@@ -2104,6 +2104,7 @@ typedef struct {
     u32 vb_off, stride, vertex_count;
     u32 ib_off, index_count;
     u32 vs_cb_off, vs_cb_bytes;
+    float vs_xf[8];             /* VPXform (buffer 2): vp_posscale, vp_posoffset */
     u32 ps_cb_off, ps_cb_bytes;
     u32 tex[RSX_BE_MAX_TEXTURES];
     int samp[RSX_BE_MAX_TEXTURES];
@@ -2257,14 +2258,18 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
 
 static void eng_encode_and_commit(id<MTLTexture> present_dst);
 
-static int eng_stage_reserve(u32 bytes, u32* out_off)
+/* `headroom`: bytes past the reservation that must also lie inside the slot
+ * buffer, though they are not claimed -- for a binding whose declared size
+ * reaches past the data actually written there (see
+ * eng_bind_vs_constants_range). */
+static int eng_stage_reserve_ex(u32 bytes, u32 headroom, u32* out_off)
 {
     const u32 start = (s_eng_stage_used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u);
-    if ((u64)start + bytes > ENG_STAGE_MAX) {
+    if ((u64)start + bytes + headroom > ENG_STAGE_MAX) {
         /* Submit and wait rather than drop the rest of the frame; everything
          * already recorded has been encoded, so the arena is free again. */
         eng_encode_and_commit(nil);
-        return eng_stage_reserve(bytes, out_off);
+        return eng_stage_reserve_ex(bytes, headroom, out_off);
     }
     if (s_eng_slot < 0) {                       /* first data of this submission: take a slot */
         const int k = (int)(s_eng_slot_next++ % ENG_STAGE_SLOTS);
@@ -2278,11 +2283,11 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
         s_eng_stage = s_eng_slot_buf[k] ? (u8*)[s_eng_slot_buf[k] contents] : NULL;
         s_eng_stage_cap = s_eng_slot_buf[k] ? (u32)[s_eng_slot_buf[k] length] : 0;
     }
-    if (start + bytes > s_eng_stage_cap) {
+    if (start + bytes + headroom > s_eng_stage_cap) {
         /* grow this slot: a new buffer, keeping what is already staged (the
          * old one is not in flight -- this submission has not been committed) */
         u32 cap = s_eng_stage_cap ? s_eng_stage_cap : (4u << 20);
-        while (start + bytes > cap) cap *= 2u;
+        while (start + bytes + headroom > cap) cap *= 2u;
         id<MTLBuffer> nb = [s_dev newBufferWithLength:cap options:MTLResourceStorageModeShared];
         if (!nb) return 0;
         if (s_eng_stage_used) memcpy([nb contents], s_eng_stage, s_eng_stage_used);
@@ -2293,6 +2298,11 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
     *out_off = start;
     s_eng_stage_used = start + bytes;
     return 1;
+}
+
+static int eng_stage_reserve(u32 bytes, u32* out_off)
+{
+    return eng_stage_reserve_ex(bytes, 0, out_off);
 }
 
 static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
@@ -2621,6 +2631,40 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
     return fn;
 }
 
+/* Engine pipelines take the viewport epilogue from a block of its own:
+ * buffer 0 then holds only the 512 rows, which lets a draw stage just the
+ * rows its program reads (eng_bind_vs_constants_range). The VPConst text is
+ * the one the VP decompiler and the engine's fixed-function shader both
+ * emit; anything else is refused rather than run against the wrong layout. */
+static const char kEngVPConstJoined[] =
+    "cbuffer VPConst : register(b0) {\n"
+    "    float4 vp_c[512];\n"
+    "    float4 vp_posscale;\n"
+    "    float4 vp_posoffset;\n"
+    "};\n";
+static const char kEngVPConstSplit[] =
+    "cbuffer VPConst : register(b0) {\n"
+    "    float4 vp_c[512];\n"
+    "};\n"
+    "cbuffer VPXform : register(b2) {\n"
+    "    float4 vp_posscale;\n"
+    "    float4 vp_posoffset;\n"
+    "};\n";
+
+static char* eng_split_vpconst(const char* hlsl)
+{
+    const char* at = hlsl ? strstr(hlsl, kEngVPConstJoined) : NULL;
+    if (!at) return NULL;
+    const size_t head = (size_t)(at - hlsl), jl = sizeof kEngVPConstJoined - 1;
+    const size_t sl = sizeof kEngVPConstSplit - 1, rest = strlen(at + jl);
+    char* out = (char*)malloc(head + sl + rest + 1);
+    if (!out) return NULL;
+    memcpy(out, hlsl, head);
+    memcpy(out + head, kEngVPConstSplit, sl);
+    memcpy(out + head + sl, at + jl, rest + 1);
+    return out;
+}
+
 static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                const rsx_be_render_state* rs,
                                const rsx_vertex_layout_plan* layout,
@@ -2641,7 +2685,17 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     if (!rt_count) rt_count = 1;
     if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
     if (s_eng_pipe_count >= ENG_MAX_PIPES) return 0;
-    id<MTLFunction> vs = eng_function(vs_hlsl, RSX_SHADER_STAGE_VERTEX, "vp");
+    char* vs_split = eng_split_vpconst(vs_hlsl);
+    if (!vs_split) {
+        static int warned;
+        if (!warned++)
+            fprintf(stderr, "[rsx engine/metal] pipeline_create: vertex shader has no "
+                    "VPConst block in the expected form; refusing it (the viewport "
+                    "epilogue is bound separately)\n");
+        return 0;
+    }
+    id<MTLFunction> vs = eng_function(vs_split, RSX_SHADER_STAGE_VERTEX, "vp");
+    free(vs_split);
     if (!vs) return 0;
     id<MTLFunction> fs = eng_function(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, "fp");
     if (!fs) return 0;
@@ -2816,11 +2870,71 @@ static void eng_bind_targets(void* user, const u32* surfaces, u32 count,
 static void eng_bind_pipeline(void* user, u32 pipeline)
 { (void)user; s_eng_pending.pipeline = pipeline; }
 
+/* The engine's VPConst block is 512 rows then the viewport epilogue at row
+ * 512. Engine pipelines read the epilogue from its own VPXform block
+ * (buffer 2, see eng_split_vpconst), so it travels by setVertexBytes and the
+ * rows alone are staged. */
+#define ENG_VP_ROWS_BYTES (512u * 16u)
+#define ENG_VP_XF_INDEX   2
+
 static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
+    memset(s_eng_pending.vs_xf, 0, sizeof s_eng_pending.vs_xf);
+    if (data && bytes >= ENG_VP_ROWS_BYTES + sizeof s_eng_pending.vs_xf) {
+        memcpy(s_eng_pending.vs_xf, (const u8*)data + ENG_VP_ROWS_BYTES,
+               sizeof s_eng_pending.vs_xf);
+        bytes = ENG_VP_ROWS_BYTES;
+    }
     if (!eng_stage_copy(data, bytes, &s_eng_pending.vs_cb_off)) bytes = 0;
     s_eng_pending.vs_cb_bytes = bytes;
+}
+
+/* Stage only rows [first, first + count), densely, and bind buffer 0 at
+ * `rows - 16 * first` so vp_c[first] lands on them. Rows below `first` and
+ * above the range then alias whatever else is staged there, which this
+ * program never reads.
+ *
+ * Writing the rows into an 8 KB-per-draw reservation instead -- the whole
+ * block's footprint, mostly untouched -- cost more than the copy it saved:
+ * every draw's few hundred bytes landed on fresh pages (T-0016). The bind
+ * offset stays ENG_ALIGN-aligned, and the slot buffer is kept at least one
+ * full block past it, so the binding never runs off the buffer's end. */
+static void eng_bind_vs_constants_range(void* user, const void* rows, u32 first,
+                                        u32 count, const void* tail,
+                                        u32 tail_bytes, u32 total_bytes)
+{
+    (void)user;
+    (void)total_bytes;
+    memset(s_eng_pending.vs_xf, 0, sizeof s_eng_pending.vs_xf);
+    s_eng_pending.vs_cb_bytes = 0;
+    if (first > 512u || count > 512u - first ||
+        tail_bytes > sizeof s_eng_pending.vs_xf)
+        return;
+    memcpy(s_eng_pending.vs_xf, tail, tail_bytes);
+
+    /* A row offset that is congruent to 16*first mod ENG_ALIGN makes the base
+     * aligned: base = rows_at - 16*first. */
+    const u32 lead = (first * 16u) % ENG_ALIGN;
+    const u32 bytes = lead + (count ? count * 16u : 16u);
+    u32 at;
+    if (!eng_stage_reserve_ex(bytes, ENG_VP_ROWS_BYTES, &at))
+        return;
+    const u32 rows_at = at + lead;
+    if (rows_at < first * 16u) {
+        /* Too near the start of the arena to reach back: stage the block
+         * whole (rows only), as eng_bind_vs_constants does. */
+        u32 off;
+        if (!eng_stage_reserve(ENG_VP_ROWS_BYTES, &off)) return;
+        memcpy(s_eng_stage + off, rows, ENG_VP_ROWS_BYTES);
+        s_eng_pending.vs_cb_off = off;
+        s_eng_pending.vs_cb_bytes = ENG_VP_ROWS_BYTES;
+        return;
+    }
+    if (count)
+        memcpy(s_eng_stage + rows_at, (const u8*)rows + first * 16u, count * 16u);
+    s_eng_pending.vs_cb_off = rows_at - first * 16u;
+    s_eng_pending.vs_cb_bytes = ENG_VP_ROWS_BYTES;
 }
 
 static void eng_bind_ps_constants(void* user, const void* data, u32 bytes)
@@ -2959,6 +3073,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
         [enc setScissorRect:(MTLScissorRect){ r->sc[0], r->sc[1], r->sc[2], r->sc[3] }];
     [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX];
     if (r->vs_cb_bytes) [enc setVertexBuffer:stage offset:r->vs_cb_off atIndex:0];
+    [enc setVertexBytes:r->vs_xf length:sizeof r->vs_xf atIndex:ENG_VP_XF_INDEX];
     if (r->ps_cb_bytes) [enc setFragmentBuffer:stage offset:r->ps_cb_off atIndex:1];
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         id<MTLTexture> t = eng_obj(r->tex[u]);
@@ -3522,6 +3637,7 @@ static const rsx_draw_backend s_engine_backend = {
     .bind_targets         = eng_bind_targets,
     .bind_pipeline        = eng_bind_pipeline,
     .bind_vs_constants    = eng_bind_vs_constants,
+    .bind_vs_constants_range = eng_bind_vs_constants_range,
     .bind_ps_constants    = eng_bind_ps_constants,
     .bind_textures        = eng_bind_textures,
     .bind_vertex_textures = eng_bind_vertex_textures,

@@ -214,6 +214,15 @@ typedef struct rsx_draw_backend {
     void (*present)(void* user, u32 surface);
     void (*readback)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
                      void* out, u32 out_pitch);
+
+    /* Optional. bind_vs_constants for a block of `total_bytes` (the full
+     * VPConst layout) of which only rows [first, first + count) of `rows` and
+     * the `tail_bytes` at row 512 (the viewport epilogue) are read by the
+     * bound program, so only those need to reach the GPU. A backend that
+     * leaves this NULL gets the whole block through bind_vs_constants. */
+    void (*bind_vs_constants_range)(void* user, const void* rows, u32 first,
+                                    u32 count, const void* tail,
+                                    u32 tail_bytes, u32 total_bytes);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

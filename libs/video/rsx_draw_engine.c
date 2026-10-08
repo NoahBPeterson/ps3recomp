@@ -156,6 +156,11 @@ static struct {
     u8* tex_staging;
     u32 tex_staging_cap;
     u8* vp_cb;
+    /* The vp_c[] rows the current vertex program can read (eng_vertex_layout):
+     * vpc_full when it reads any row (relative addressing, no end flag, or no
+     * guest program), else [vpc_lo, vpc_lo + vpc_n). */
+    int vpc_full;
+    u32 vpc_lo, vpc_n;
     u8* fp_cb;
     u32 fp_cb_cap;
     u32* indices;
@@ -1008,11 +1013,19 @@ static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
     u32 mask = 0xFFFFu;
     const u8* uc = NULL;
     u32 instrs = 0;
+    g.vpc_full = 1;
     if (eng_guest_programs(&uc, &instrs, NULL, NULL)) {
         rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
         if (rsx_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
             analysis.exact && analysis.input_mask)
             mask = analysis.input_mask;
+        rsx_vp_const_usage cu;
+        if (rsx_vp_analyze_constants(uc, instrs * 16u, &cu) >= 0 &&
+            cu.valid && !cu.relative) {
+            g.vpc_full = 0;
+            g.vpc_lo = cu.lo <= cu.hi ? cu.lo : 0;
+            g.vpc_n = cu.lo <= cu.hi ? cu.hi - cu.lo + 1u : 0;
+        }
     }
     rsx_vertex_layout_plan_init(layout, mask);
 }
@@ -1184,16 +1197,25 @@ static void dc_reset(void)
     dc.inl_bytes = 0;
 }
 
+static int dc_reserve_refs(u64 need)
+{
+    if (need <= dc.cap_refs) return 1;
+    if (need > 0xFFFFFFFFull) return 0;
+    u64 next = dc.cap_refs ? dc.cap_refs : 4096u;
+    while (next < need) next *= 2u;
+    if (next > 0xFFFFFFFFull) next = need;
+    rsx_vertex_ref* r = (rsx_vertex_ref*)realloc(dc.refs,
+                                                 (size_t)next * sizeof(*r));
+    if (!r) return 0;
+    dc.refs = r;
+    dc.cap_refs = (u32)next;
+    return 1;
+}
+
 static int dc_push_ref(u32 vertex_id, u32 base_index)
 {
-    if (dc.n_refs >= dc.cap_refs) {
-        const u32 next = dc.cap_refs ? dc.cap_refs * 2u : 4096u;
-        rsx_vertex_ref* r = (rsx_vertex_ref*)realloc(dc.refs,
-                                                     (size_t)next * sizeof(*r));
-        if (!r) return 0;
-        dc.refs = r;
-        dc.cap_refs = next;
-    }
+    if (dc.n_refs >= dc.cap_refs && !dc_reserve_refs((u64)dc.n_refs + 1u))
+        return 0;
     dc.refs[dc.n_refs].vertex_id = vertex_id;
     dc.refs[dc.n_refs].base_index = base_index;
     dc.n_refs++;
@@ -1224,12 +1246,74 @@ static int dc_reserve_indices(u32 count)
     return 1;
 }
 
+/* PS3RECOMP_ENG_DRAWSTATS=1: per world frame (every 30th), what the draw
+ * path does and where its time goes -- the numbers T-0016's vertex work is
+ * prioritised by. Draws and references, how much the dedup collapses, the
+ * attribute formats actually fetched (weighted by unique vertices), the bytes
+ * handed to the backend, how many draws reused the previous draw's vertex
+ * constants unchanged, and wall time per stage of sink_end. */
+typedef struct {
+    u64 draws, refs, uniq, slots, vbytes, ibytes, cbytes, cb_same, cb_range;
+    u64 fmt[8][5];                       /* [type][size], unique-vertex weighted */
+    u64 ns_refs, ns_remap, ns_plan, ns_fetch, ns_rest;
+    u64 ns_layout, ns_tex, ns_pipe, ns_bind, ns_draw;   /* parts of the above + layout */
+} eng_drawstats;
+static eng_drawstats ds;
+static int ds_on = -1;
+static int eng_ds_enabled(void)
+{
+    if (ds_on < 0) ds_on = getenv("PS3RECOMP_ENG_DRAWSTATS") ? 1 : 0;
+    return ds_on;
+}
+static u64 eng_ds_now(void)
+{
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+}
+static void eng_ds_frame_end(u32 frame_draws)
+{
+    static u32 wf;
+    if (!eng_ds_enabled()) return;
+    if (frame_draws <= 1000) { memset(&ds, 0, sizeof ds); return; }
+    if (wf++ % 30 == 0 && ds.draws) {
+        const double us = 1e-3;
+        fprintf(stderr,
+                "[drawstats] draws=%llu refs=%llu unique=%llu (%.0f%%) attrs/vtx=%.2f"
+                " staged: vtx %.1f MB idx %.1f MB vs-const %.1f MB (ranged %llu); vs-const unchanged %llu/%llu\n",
+                (unsigned long long)ds.draws, (unsigned long long)ds.refs,
+                (unsigned long long)ds.uniq, ds.refs ? 100.0 * ds.uniq / ds.refs : 0.0,
+                ds.uniq ? (double)ds.slots / ds.uniq : 0.0,
+                ds.vbytes / 1e6, ds.ibytes / 1e6, ds.cbytes / 1e6,
+                (unsigned long long)ds.cb_range, (unsigned long long)ds.cb_same, (unsigned long long)ds.draws);
+        fprintf(stderr,
+                "[drawstats] time/frame: refs %.0f us, remap %.0f us, plan %.0f us,"
+                " fetch+decode %.0f us, rest of sink_end %.0f us\n",
+                ds.ns_refs * us, ds.ns_remap * us, ds.ns_plan * us,
+                ds.ns_fetch * us, ds.ns_rest * us);
+        fprintf(stderr,
+                "[drawstats] time/frame: layout+analysis %.0f us; in rest: textures %.0f us,"
+                " pipeline %.0f us, constants+binds %.0f us, backend draw %.0f us\n",
+                ds.ns_layout * us, ds.ns_tex * us, ds.ns_pipe * us, ds.ns_bind * us,
+                ds.ns_draw * us);
+        static const char* tn[8] = { "?", "snorm16", "float", "half", "unorm8", "sint16", "cmp32", "uint8" };
+        char line[600]; int p = snprintf(line, sizeof line, "[drawstats] formats (unique vtx):");
+        for (int t = 0; t < 8; t++) for (int z = 1; z <= 4; z++)
+            if (ds.fmt[t][z]) p += snprintf(line + p, sizeof line - p, " %sx%d=%llu", tn[t], z,
+                                            (unsigned long long)ds.fmt[t][z]);
+        fprintf(stderr, "%s\n", line);
+    }
+    memset(&ds, 0, sizeof ds);
+}
+
 /* Turn this group's batches into a reference list, recording a CUT rather
  * than fetching a phantom vertex wherever the restart sentinel appears, then
  * collapse repeated references and fetch each unique vertex once.
  * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
 static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 {
+    const int dso = eng_ds_enabled();
+    u64 t0 = dso ? eng_ds_now() : 0, t1;
     for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
         for (u32 i = 0; i < dc.arr[b].count && dc.fetch_ok; i++)
             if (!dc_push_ref(dc.arr[b].first + i, 0)) dc.fetch_ok = 0;
@@ -1253,6 +1337,33 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
             if (count && start <= 0xFFFFFFFFull && bytes <= 0xFFFFFFFFull &&
                 start + bytes <= 0x100000000ull)
                 run = eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes);
+            /* The common case -- the whole run mapped -- in one tight loop
+             * per index width: room for every reference reserved up front,
+             * no per-index resolver or capacity check. Cuts land at the
+             * same reference positions as below. */
+            if (run && count) {
+                if (!dc_reserve_refs((u64)dc.n_refs + count)) { dc.fetch_ok = 0; break; }
+                rsx_vertex_ref* out = dc.refs;
+                u32 n = dc.n_refs;
+                for (u32 i = 0; i < count; i++) {
+                    const u8* p = run + (size_t)i * esz;
+                    const u32 index = ia.is_u32
+                        ? (((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3])
+                        : (u32)((p[0] << 8) | p[1]);
+                    if (restart_en && index == restart_val) {
+                        if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, n)) {
+                            dc.fetch_ok = 0;
+                            break;
+                        }
+                        continue;
+                    }
+                    out[n].vertex_id = index;
+                    out[n].base_index = base_index;
+                    n++;
+                }
+                dc.n_refs = n;
+                continue;
+            }
             for (u32 i = 0; i < count && dc.fetch_ok; i++) {
                 const u8* p = run ? run + (size_t)i * esz
                     : eng_guest_ptr(NULL, ia_loc, ia.offset + (first + i) * esz, esz);
@@ -1273,6 +1384,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     if (!dc.fetch_ok) return;
 
     dc.n_source_refs = dc.n_refs;
+    if (dso) { t1 = eng_ds_now(); ds.ns_refs += t1 - t0; t0 = t1; }
     /* Only a topology this engine rebuilds through an index buffer may share
      * repeated references. A line strip or a point list is drawn in the order
      * it arrived, so collapsing duplicates would reorder it. */
@@ -1284,22 +1396,35 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         }
     }
 
+    if (dso) { t1 = eng_ds_now(); ds.ns_remap += t1 - t0; t0 = t1; }
     dc.layout = *layout;
     rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
     rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
+    if (dso) { t1 = eng_ds_now(); ds.ns_plan += t1 - t0; t0 = t1; }
     if (!dc_reserve_verts((u64)dc.n_refs * layout->stride)) {
         dc.fetch_ok = 0;
         return;
     }
-    for (u32 i = 0; i < dc.n_refs; i++) {
-        u8* dst = layout->stride ? dc.verts + (u64)i * layout->stride : NULL;
-        if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i], dst)) {
-            dc.fetch_ok = 0;
-            return;
-        }
+    /* Attribute by attribute with per-format loops; bit-identical to
+     * rsx_vertex_fetch_one per reference (tests/test_vertex_fetch.c). */
+    if (!rsx_vertex_fetch_all(&dc.fetch_plan, dc.refs, dc.n_refs,
+                              layout->stride ? dc.verts : NULL)) {
+        dc.fetch_ok = 0;
+        return;
     }
     dc.n_verts = dc.n_refs;
+    if (dso) {
+        ds.ns_fetch += eng_ds_now() - t0;
+        ds.refs += dc.n_source_refs;
+        ds.uniq += dc.n_refs;
+        ds.slots += (u64)dc.n_refs * layout->count;
+        for (u32 slot = 0; slot < layout->count; slot++) {
+            const rsx_vertex_fetch_attr* f = &dc.fetch_plan.attr[layout->attrs[slot]];
+            const u32 t = f->desc.type < 8 ? f->desc.type : 0, z = f->desc.size <= 4 ? f->desc.size : 0;
+            ds.fmt[t][z] += dc.n_refs;
+        }
+    }
 }
 
 /* ---- sink ---------------------------------------------------------------- */
@@ -1573,8 +1698,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
     }
 
     rsx_vertex_layout_plan layout;
+    const u64 ds_tl = eng_ds_enabled() ? eng_ds_now() : 0;
     eng_vertex_layout(&layout);
+    if (ds_tl) ds.ns_layout += eng_ds_now() - ds_tl;
     dc_fetch(&layout, rebuild);
+    const u64 ds_t0 = eng_ds_enabled() ? eng_ds_now() : 0;
+    u64 ds_m = ds_t0;   /* stage marks within the rest of sink_end */
+#define DS_MARK(field) do { if (ds_t0) { const u64 _t = eng_ds_now(); ds.field += _t - ds_m; ds_m = _t; } } while (0)
     if (!dc.n_verts || !dc.fetch_ok) { eng_drop("fetch", prim); return; }
 
     int indexed = 0;
@@ -1613,6 +1743,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     memset(samplers, 0, sizeof samplers);
     memset(vtextures, 0, sizeof vtextures);
     memset(vsamplers, 0, sizeof vsamplers);
+    DS_MARK(ns_bind);   /* render state, targets, zeta: counted with binds */
     const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot,
                                             textures, samplers);
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
@@ -1622,11 +1753,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * is dropped, as the reference engine drops it. Substituting the built-in
      * program would draw the geometry in the wrong colours, which is harder to
      * see than a missing object and hides the translation failure. */
+    DS_MARK(ns_tex);
     int pipeline_is_fixed = 1;
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed);
     if (!pipeline) { eng_drop("pipeline", prim); return; }
+    DS_MARK(ns_pipe);
 
     if (indexed) {
         if (!dc_reserve_indices(n_draw)) { eng_drop("reserve_indices", prim); return; }
@@ -1653,8 +1786,18 @@ static void sink_end(void* user, const rsx_dispatch* r)
         xf[5] = -((vp.translate[1] - H * 0.5f) / (H * 0.5f));
         xf[6] = vp.translate[2];
     }
-    memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
-    memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+    /* Only the rows the program reads go to the GPU when the backend can
+     * take a range: copying all 512 rows twice per draw was ~240 MB of
+     * memcpy per world frame in inFamous (T-0016). */
+    /* PS3RECOMP_ENG_VPC_FULL=1: always upload the whole block (A/B, bisect). */
+    static int vpc_force_full = -1;
+    if (vpc_force_full < 0) vpc_force_full = getenv("PS3RECOMP_ENG_VPC_FULL") ? 1 : 0;
+    const int vpc_range = g.be->bind_vs_constants_range && !g.vpc_full && !vpc_force_full;
+    if (!vpc_range) {
+        if (ds_t0 && !memcmp(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u)) ds.cb_same++;
+        memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
+        memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+    }
     eng_constlog_draw(sf.color_offset[0], sf.clip_w, sf.clip_h, n_draw, indexed);
 
     /* The buffered fragment constants, then fp_alpha: the layout
@@ -1696,7 +1839,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
     for (u32 i = 0; i < n_targets; i++) handles[i] = g.surfaces[targets[i]].handle;
     g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
     g.be->bind_pipeline(g.be->user, pipeline);
-    g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
+    if (vpc_range)
+        g.be->bind_vs_constants_range(g.be->user, g.rsx.constants, g.vpc_lo,
+                                      g.vpc_n, xf, sizeof xf, ENG_VP_CB_BYTES);
+    else
+        g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
@@ -1729,12 +1876,23 @@ static void sink_end(void* user, const rsx_dispatch* r)
                           rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
 
     const u32 uploaded = indexed ? dc.n_verts : n_draw;
+    DS_MARK(ns_bind);
     g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                indexed ? g.indices : NULL, indexed ? n_draw : 0);
+    DS_MARK(ns_draw);
+#undef DS_MARK
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */
     if (!pipeline_is_fixed) g.guest_draws++;
+    if (ds_t0) {
+        ds.draws++;
+        ds.vbytes += (u64)uploaded * layout.stride;
+        ds.ibytes += indexed ? (u64)n_draw * 4u : 0;
+        ds.cbytes += vpc_range ? g.vpc_n * 16u + sizeof xf : ENG_VP_CB_BYTES;
+        if (vpc_range) ds.cb_range++;
+        ds.ns_rest += eng_ds_now() - ds_t0;
+    }
 
     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write)
         g.zdepths[zslot].had_write = 1;
@@ -1992,6 +2150,7 @@ presented:;
           } } }
     eng_constlog_frame_end();
     g.frames++;
+    eng_ds_frame_end(g.guest_draws);
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
 }
