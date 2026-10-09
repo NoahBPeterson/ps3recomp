@@ -758,21 +758,22 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
 {
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
-    /* Four independent FNV-style lanes: one serial multiply chain capped the
+    /* Eight independent FNV-style lanes: one serial multiply chain capped the
      * hash at ~2 bytes/cycle, and every texture in use is hashed each frame.
-     * The value is only ever compared with another hash from this run. */
-    u64 h0 = 1469598103934665603ull, h1 = h0 ^ 0x9E3779B97F4A7C15ull,
-        h2 = h0 ^ 0xC2B2AE3D27D4EB4Full, h3 = h0 ^ 0x165667B19E3779F9ull;
+     * Four lanes ran 21 GB/s on an M1 Pro, eight 36 GB/s -- about what one
+     * core can read (T-0016). The value is only ever compared with another
+     * hash from this run. */
+    u64 h[8];
+    for (int k = 0; k < 8; k++)
+        h[k] = 1469598103934665603ull ^ (0x9E3779B97F4A7C15ull * (u64)(k + 1));
     u32 i = 0;
-    for (; i + 32 <= span; i += 32) {
-        u64 w[4];
+    for (; i + 64 <= span; i += 64) {
+        u64 w[8];
         memcpy(w, src + i, sizeof w);
-        h0 = (h0 ^ w[0]) * 1099511628211ull;
-        h1 = (h1 ^ w[1]) * 1099511628211ull;
-        h2 = (h2 ^ w[2]) * 1099511628211ull;
-        h3 = (h3 ^ w[3]) * 1099511628211ull;
+        for (int k = 0; k < 8; k++) h[k] = (h[k] ^ w[k]) * 1099511628211ull;
     }
-    u64 hash = h0 ^ (h1 * 31u) ^ (h2 * 1009u) ^ (h3 * 65599u);
+    u64 hash = 0;
+    for (int k = 0; k < 8; k++) hash ^= h[k] * (u64)(2 * k + 1);
     for (; i < span; i++) { hash ^= src[i]; hash *= 1099511628211ull; }
     *readable = 1;
     return hash;
@@ -1463,6 +1464,7 @@ typedef struct {
     u64 fmt[8][5];                       /* [type][size], unique-vertex weighted */
     u64 ns_refs, ns_remap, ns_plan, ns_fetch, ns_rest;
     u64 ns_layout, ns_tex, ns_pipe, ns_bind, ns_draw;   /* parts of the above + layout */
+    u64 span_draws, span_sum, span_uniq, span_refs, span_dense;   /* index-range density */
 } eng_drawstats;
 static eng_drawstats ds;
 static int ds_on = -1;
@@ -1509,7 +1511,13 @@ static void eng_ds_frame_end(u32 frame_draws)
                 ds.draws ? (double)ds_pk_scanned / ds.draws : 0.0, g.n_pipelines,
                 (unsigned long long)ds_memo_hit[0], (unsigned long long)(ds_memo_hit[0] + ds_memo_miss[0]),
                 (unsigned long long)ds_memo_hit[1], (unsigned long long)(ds_memo_hit[1] + ds_memo_miss[1]));
-                static const char* tn[8] = { "?", "snorm16", "float", "half", "unorm8", "sint16", "cmp32", "uint8" };
+                if (ds.span_draws)
+            fprintf(stderr, "[drawstats] index ranges: %llu draws, span %.0f vs unique %.0f vertices"
+                    " (%.2fx), refs %.0f; %llu draws (%.0f%%) dense (span <= 1.25 x unique)\n",
+                    (unsigned long long)ds.span_draws, (double)ds.span_sum, (double)ds.span_uniq,
+                    ds.span_uniq ? (double)ds.span_sum / ds.span_uniq : 0.0, (double)ds.span_refs,
+                    (unsigned long long)ds.span_dense, 100.0 * ds.span_dense / ds.span_draws);
+        static const char* tn[8] = { "?", "snorm16", "float", "half", "unorm8", "sint16", "cmp32", "uint8" };
         char line[600]; int p = snprintf(line, sizeof line, "[drawstats] formats (unique vtx):");
         for (int t = 0; t < 8; t++) for (int z = 1; z <= 4; z++)
             if (ds.fmt[t][z]) p += snprintf(line + p, sizeof line - p, " %sx%d=%llu", tn[t], z,
@@ -1586,7 +1594,35 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
      * it arrived, so collapsing duplicates would reorder it. */
     if (allow_remap && dc.n_refs > 1) {
         u32 unique = dc.n_refs;
-        if (rsx_vertex_remap_build(&dc.ref_remap, dc.refs, dc.n_refs, &unique)) {
+        /* Drawstats: how dense each draw's index range is -- the span from its
+         * lowest to highest vertex against the unique vertices it uses. A
+         * dense range could be fetched whole without deduplicating. */
+        u32 span_lo = ~0u, span_hi = 0; int span_same_base = 1;
+        if (dso) {
+            for (u32 i = 0; i < dc.n_refs; i++) {
+                const u32 v = dc.refs[i].vertex_id;
+                if (v < span_lo) span_lo = v;
+                if (v > span_hi) span_hi = v;
+                span_same_base &= dc.refs[i].base_index == dc.refs[0].base_index;
+            }
+        }
+        /* The draw's whole index range first: meshes cover it (see
+         * rsx_vertex_remap_build_range), and fetching it in address order
+         * skips deduplication, 11.6% of the RSX thread (T-0016).
+         * PS3RECOMP_ENG_DEDUP=1 deduplicates always, for an A/B. */
+        static int dedup = -1;
+        if (dedup < 0) dedup = getenv("PS3RECOMP_ENG_DEDUP") ? 1 : 0;
+        u32 ranged = 0;
+        if (!dedup && rsx_vertex_remap_build_range(&dc.ref_remap, dc.refs, dc.n_refs, &ranged)) {
+            dc.refs_remapped = 1;
+            dc.n_refs = ranged;
+        } else if (rsx_vertex_remap_build(&dc.ref_remap, dc.refs, dc.n_refs, &unique)) {
+            if (dso && span_same_base) {
+                const u64 span = (u64)span_hi - span_lo + 1u;
+                ds.span_draws++; ds.span_sum += span; ds.span_uniq += unique;
+                ds.span_refs += dc.n_source_refs;
+                if (span <= (u64)unique + unique / 4u) ds.span_dense++;
+            }
             dc.refs_remapped = unique < dc.n_refs;
             dc.n_refs = unique;
         }

@@ -141,6 +141,20 @@ int rsx_vertex_remap_build(
 u32 rsx_vertex_remap_index(
     const rsx_vertex_remap* remap, u32 occurrence);
 
+/* The draw's whole index range instead of its unique vertices: when every
+ * reference shares one base_index and the range lo..hi of vertex ids is no
+ * longer than the reference count, refs becomes lo, lo+1, ..., hi (*out_count
+ * = hi - lo + 1) and occurrence i maps to vertex_id - lo. Returns 0, leaving
+ * refs untouched, when that does not apply (use rsx_vertex_remap_build).
+ *
+ * A mesh's indices cover its vertex range almost exactly (inFamous: span 1.00x
+ * the unique count, every draw), so this fetches the same vertices without
+ * deduplicating, in address order. Occurrence i always satisfies
+ * refs[rsx_vertex_remap_index(remap, i)] == the original refs[i]. */
+int rsx_vertex_remap_build_range(
+    rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+    u32* out_count);
+
 /* The hash-table form of rsx_vertex_remap_build, always. The ordinary call
  * takes a direct table when the references allow it; this is the reference
  * that path is tested against. */

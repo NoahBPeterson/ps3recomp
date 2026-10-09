@@ -73,6 +73,53 @@ int main(void)
                 break;
             }
     }
+    /* rsx_vertex_remap_build_range: applies exactly when every reference
+     * shares a base and the id range fits in the reference count; then the
+     * refs are lo..hi and every occurrence maps back to its own reference. */
+    int range_ok = 0, range_no = 0;
+    for (int n = 0; n < RUNS; n++) {
+        const u32 count = 1 + rnd() % MAXN;
+        const u32 lo = rnd() % 70000u;
+        const u32 span = rnd() % 3 ? 1 + rnd() % count : 1 + rnd() % (2u * count);
+        const u32 base = rnd() % 100u;
+        const int mixed = rnd() % 10 == 0;
+        u32 vlo = 0xFFFFFFFFu, vhi = 0;
+        int bases_differ = 0;
+        for (u32 i = 0; i < count; i++) {
+            in[i].vertex_id = lo + rnd() % span;
+            in[i].base_index = (mixed && rnd() % 7 == 0) ? base + 1 : base;
+            if (in[i].vertex_id < vlo) vlo = in[i].vertex_id;
+            if (in[i].vertex_id > vhi) vhi = in[i].vertex_id;
+            bases_differ |= in[i].base_index != in[0].base_index;
+        }
+        const int expect = !bases_differ && (u64)vhi - vlo + 1u <= count;
+        memcpy(a, in, count * sizeof *in);
+        u32 out = 0;
+        const int ok = rsx_vertex_remap_build_range(&ra, a, count, &out);
+        CHECK(ok == expect, "range run %d: applied %d, expected %d", n, ok, expect);
+        if (!ok) {
+            range_no++;
+            CHECK(!memcmp(a, in, count * sizeof *in), "range run %d: refs changed on refusal", n);
+            continue;
+        }
+        range_ok++;
+        CHECK(out == vhi - vlo + 1u, "range run %d: count %u, span %u", n, out, vhi - vlo + 1u);
+        for (u32 i = 0; i < out; i++)
+            if (a[i].vertex_id != vlo + i || a[i].base_index != in[0].base_index) {
+                CHECK(0, "range run %d: ref %u is %u/%u", n, i, a[i].vertex_id, a[i].base_index);
+                break;
+            }
+        for (u32 i = 0; i < count; i++) {
+            const u32 m = rsx_vertex_remap_index(&ra, i);
+            if (m >= out || a[m].vertex_id != in[i].vertex_id || a[m].base_index != in[i].base_index) {
+                CHECK(0, "range run %d: occurrence %u maps to %u", n, i, m);
+                break;
+            }
+        }
+    }
+    printf("test_vertex_remap: range mode %d applied, %d refused\n", range_ok, range_no);
+    CHECK(range_ok > RUNS / 4 && range_no > RUNS / 10, "too few cases on one side of range mode");
+
     /* count 0 and 1 */
     u32 u = 99;
     CHECK(rsx_vertex_remap_build(&ra, a, 0, &u) && u == 0, "count 0");

@@ -443,6 +443,42 @@ static u64 rsx_vertex_remap_hash(u64 value)
  * index buffer always fits; a span past this goes to the hash table. */
 #define RSX_REMAP_DIRECT_MAX (1u << 20)
 
+int rsx_vertex_remap_build_range(
+    rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+    u32* out_count)
+{
+    if (!remap || !refs || !count || !out_count)
+        return 0;
+    const u32 base = refs[0].base_index;
+    u32 lo = refs[0].vertex_id, hi = lo;
+    for (u32 i = 1; i < count; i++) {
+        const u32 v = refs[i].vertex_id;
+        if (refs[i].base_index != base) return 0;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    const u64 span = (u64)hi - lo + 1u;
+    if (span > count)
+        return 0;
+    if (count > remap->occurrence_capacity) {
+        u32* occurrences = (u32*)realloc(
+            remap->occurrence_to_unique, (size_t)count * sizeof(u32));
+        if (!occurrences)
+            return 0;
+        remap->occurrence_to_unique = occurrences;
+        remap->occurrence_capacity = count;
+    }
+    u32* map = remap->occurrence_to_unique;
+    for (u32 i = 0; i < count; i++)
+        map[i] = refs[i].vertex_id - lo;
+    for (u32 i = 0; i < (u32)span; i++) {
+        refs[i].vertex_id = lo + i;
+        refs[i].base_index = base;
+    }
+    *out_count = (u32)span;
+    return 1;
+}
+
 static int rsx_vertex_remap_build_impl(
     rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
     u32* unique_count, int allow_direct);
