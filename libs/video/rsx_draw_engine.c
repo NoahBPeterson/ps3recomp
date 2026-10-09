@@ -1237,15 +1237,38 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      * SHADER_CONTROL, the cube and vertex-texture masks, the input layout,
      * and the structural render state. */
     const u64 pk1 = pk0 ? eng_ds_now() : 0;
-    u64 key = 1469598103934665603ull;
+    /* Consecutive draws nearly always repeat every input of the key: reuse
+     * the last key when they all compare equal. The render state is zeroed
+     * before it is decoded (rsx_draw_engine_decode_render_state), so a byte
+     * compare of it is a field compare. The hash over the render state was
+     * 2.7% of the RSX thread per draw (T-0016). */
+    static struct {
+        int valid, fixed;
+        u64 vp_hash, fp_struct;
+        u32 fp_ctrl_key, cube_mask, vtex_mask, layout_mask, layout_stride, rt_count;
+        rsx_be_format rt_fmt;
+        rsx_be_render_state rs;
+        u64 key;
+    } kmemo;
+    const u32 fp_ctrl_key = fp_ctrl & 0x40u;
+    const u64 in_vp = fixed ? 0 : vp->hash, in_fp = fixed ? 0 : fp->structural;
+    if (!fixed && !in_fp) return 0;
+    u64 key;
+    if (kmemo.valid && kmemo.fixed == fixed && kmemo.vp_hash == in_vp && kmemo.fp_struct == in_fp &&
+        kmemo.fp_ctrl_key == fp_ctrl_key && kmemo.cube_mask == cube_mask &&
+        kmemo.vtex_mask == vtex_mask && kmemo.layout_mask == layout->mask &&
+        kmemo.layout_stride == layout->stride && kmemo.rt_count == rt_count &&
+        kmemo.rt_fmt == rt_fmt && !memcmp(&kmemo.rs, rs, sizeof *rs)) {
+        key = kmemo.key;
+        goto key_done;
+    }
+    key = 1469598103934665603ull;
     if (fixed) {
         static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
         key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
     } else {
-        if (!fp->structural) return 0;
         key = eng_fnv1a(&vp->hash, sizeof vp->hash, key);
         key = eng_fnv1a(&fp->structural, sizeof fp->structural, key);
-        const u32 fp_ctrl_key = fp_ctrl & 0x40u;
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
@@ -1257,6 +1280,12 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      * a host API matches the two against each other. */
     key = eng_fnv1a(&rt_count, sizeof rt_count, key);
     key = rsx_draw_engine_hash_render_state(rs, key);
+    kmemo.valid = 1; kmemo.fixed = fixed; kmemo.vp_hash = in_vp; kmemo.fp_struct = in_fp;
+    kmemo.fp_ctrl_key = fp_ctrl_key; kmemo.cube_mask = cube_mask; kmemo.vtex_mask = vtex_mask;
+    kmemo.layout_mask = layout->mask; kmemo.layout_stride = layout->stride;
+    kmemo.rt_count = rt_count; kmemo.rt_fmt = rt_fmt; memcpy(&kmemo.rs, rs, sizeof *rs);
+    kmemo.key = key;
+key_done:;
 
     const u64 pk2 = pk0 ? eng_ds_now() : 0;
     /* Consecutive draws mostly share a pipeline: try the last hit first. */
@@ -1320,6 +1349,47 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     *out_fixed = fixed;
     return handle;
 }
+
+/* ---- index decoding --------------------------------------------------------- */
+
+/* A mapped run of big-endian indices into dc.refs (room already reserved),
+ * restart indices becoming cuts at the reference position they fall on.
+ *
+ * Out of line and specialised per width and restart mode: inlined into
+ * sink_end, the loop's base index, width and shift lived on the stack, the
+ * width was tested per index and each index was assembled byte by byte --
+ * 11.6% of the RSX thread in inFamous, for reading indices (T-0016). */
+#define DC_DECODE(T, BSWAP, RESTART)                                              \
+    for (u32 i = 0; i < count; i++) {                                             \
+        T raw; memcpy(&raw, run + (size_t)i * sizeof(T), sizeof(T));             \
+        const u32 index = (u32)BSWAP(raw);                                        \
+        if (RESTART && index == restart_val) {                                    \
+            if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, n)) {   \
+                dc.n_refs = n; return 0;                                          \
+            }                                                                     \
+            continue;                                                             \
+        }                                                                         \
+        out[n].vertex_id = index;                                                 \
+        out[n].base_index = base_index;                                           \
+        n++;                                                                      \
+    }
+static __attribute__((noinline)) int dc_decode_indices(const u8* run, u32 count, int is_u32,
+                                                       int restart_en, u32 restart_val,
+                                                       u32 base_index)
+{
+    rsx_vertex_ref* const out = dc.refs;
+    u32 n = dc.n_refs;
+    if (is_u32) {
+        if (restart_en) { DC_DECODE(u32, __builtin_bswap32, 1) }
+        else            { DC_DECODE(u32, __builtin_bswap32, 0) }
+    } else {
+        if (restart_en) { DC_DECODE(u16, __builtin_bswap16, 1) }
+        else            { DC_DECODE(u16, __builtin_bswap16, 0) }
+    }
+    dc.n_refs = n;
+    return 1;
+}
+#undef DC_DECODE
 
 /* ---- draw accumulation --------------------------------------------------- */
 
@@ -1486,25 +1556,8 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
              * same reference positions as below. */
             if (run && count) {
                 if (!dc_reserve_refs((u64)dc.n_refs + count)) { dc.fetch_ok = 0; break; }
-                rsx_vertex_ref* out = dc.refs;
-                u32 n = dc.n_refs;
-                for (u32 i = 0; i < count; i++) {
-                    const u8* p = run + (size_t)i * esz;
-                    const u32 index = ia.is_u32
-                        ? (((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3])
-                        : (u32)((p[0] << 8) | p[1]);
-                    if (restart_en && index == restart_val) {
-                        if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, n)) {
-                            dc.fetch_ok = 0;
-                            break;
-                        }
-                        continue;
-                    }
-                    out[n].vertex_id = index;
-                    out[n].base_index = base_index;
-                    n++;
-                }
-                dc.n_refs = n;
+                if (!dc_decode_indices(run, count, ia.is_u32, restart_en, restart_val, base_index))
+                    dc.fetch_ok = 0;
                 continue;
             }
             for (u32 i = 0; i < count && dc.fetch_ok; i++) {
