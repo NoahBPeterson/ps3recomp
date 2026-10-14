@@ -261,6 +261,17 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
  * on its fence sees the GPU catch up. */
 void rsx_draw_engine_flush(void);
 
+/* GPU -> guest memory. The 2D engine's reads and the SPUs see guest memory,
+ * which never holds what the GPU drew. Write the newest colour target or the
+ * depth buffer whose rows cover (local, offset) back into it as the RSX would
+ * have stored it -- A8R8G8B8 as bytes A,R,G,B, Z24S8 as the big-endian
+ * D << 8 | S word -- `pitch` bytes per row (0: the target's own width). Pending
+ * work is submitted and waited for first. A target already written back since
+ * it was last drawn is skipped. Returns 1 when guest memory was written.
+ * inFAMOUS 2 NV3089-copies its normal and depth buffers to main memory every
+ * frame for the SPUs' deferred lighting; without this the SPUs lit nothing. */
+int rsx_draw_engine_write_back(int local, u32 offset, u32 pitch);
+
 /* Present whatever the frame has recorded, for a host that drives the flip
  * itself rather than through the FIFO's 0xE944. */
 void rsx_draw_engine_present(void);

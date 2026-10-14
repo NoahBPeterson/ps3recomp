@@ -864,6 +864,12 @@ static void nv3089_blit(void)
     u32 in_pitch = s_nv3089.in_fmt & 0xFFFF;
     u32 dst_pitch = s_gcm2d.pitch >> 16;
     if (!out_w || !out_h || !in_pitch || !dst_pitch) return;
+    /* The source may be a target the register-file engine drew, which exists
+     * only on the GPU until it is written back: bring guest memory up to date
+     * before the copies below read it. */
+    { static int eng = -1;
+      if (eng < 0) eng = rsx_draw_engine_enabled();
+      if (eng) rsx_draw_engine_write_back(s_nv3089.src_dma != 0xFEED0001u, s_nv3089.in_off, in_pitch); }
     /* NV3089_GATE=<file>: log every blit's geometry while <file> exists, so a
      * capture covers the scene of interest instead of the first N since boot. */
     { static const char* gate = (const char*)-1; static unsigned poll; static int open_gate;

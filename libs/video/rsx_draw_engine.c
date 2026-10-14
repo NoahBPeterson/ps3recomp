@@ -95,6 +95,7 @@ typedef struct {
     rsx_be_format fmt;
     u32 handle;
     u32 stamp;           /* last time it was bound as a target (LRU, newest-wins) */
+    u32 wb_stamp;        /* stamp at the last write-back into guest memory */
 } eng_surface;
 static u32 s_surf_clock;
 
@@ -108,6 +109,8 @@ typedef struct {
     int snapshot_valid;
     u32 snapshot_rgba;     /* colour-format (depth bytes) copy, or 0      */
     int snapshot_rgba_valid;
+    u32 stamp;             /* last depth write (s_surf_clock)             */
+    u32 wb_stamp;          /* stamp at the last write-back into guest memory */
 } eng_zdepth;
 
 typedef struct {
@@ -683,6 +686,8 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->had_write = 0;
     z->snapshot_valid = 0;
     z->snapshot_rgba_valid = 0;
+    z->stamp = ++s_surf_clock;
+    z->wb_stamp = 0;
     if (slot == g.n_zdepths) g.n_zdepths++;
     return slot;
 }
@@ -2126,8 +2131,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
         ds.ns_rest += eng_ds_now() - ds_t0;
     }
 
-    if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write)
+    if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
         g.zdepths[zslot].had_write = 1;
+        g.zdepths[zslot].stamp = ++s_surf_clock;
+    }
 }
 
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
@@ -2529,6 +2536,95 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
     d->width = width;
     d->height = height;
     d->valid = width && height;
+}
+
+/* ---- GPU -> guest memory ------------------------------------------------- */
+
+/* Host R,G,B,A rows into the guest's A8R8G8B8 (bytes A,R,G,B, the big-endian
+ * 0xAARRGGBB word). The depth decode uses the same shuffle: its RGBA8 is
+ * a = D[23:16], r = D[15:8], g = D[7:0], b = stencil, which lands as the
+ * big-endian Z24S8 word D << 8 | S. */
+static void eng_rgba_to_guest_argb(u8* dst, u32 dst_pitch, const u8* src,
+                                   u32 w, u32 h)
+{
+    for (u32 y = 0; y < h; y++) {
+        const u8* sp = src + (size_t)y * w * 4u;
+        u8* dp = dst + (size_t)y * dst_pitch;
+        for (u32 x = 0; x < w; x++, sp += 4, dp += 4) {
+            dp[0] = sp[3]; dp[1] = sp[0]; dp[2] = sp[1]; dp[3] = sp[2];
+        }
+    }
+}
+
+int rsx_draw_engine_write_back(int local, u32 offset, u32 pitch)
+{
+    if (!g.ready || !g.be->readback || !g.be->submit_and_wait) return 0;
+    /* PS3RECOMP_ENG_WRITEBACK=0 turns the write-back off, 1 writes colour
+     * targets only, 2 depth only (bisecting); unset or 3 is both. */
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_WRITEBACK"); on = e ? atoi(e) : 3; }
+    if (!on) return 0;
+    const u32 location = local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+    int wrote = 0;
+    static int log_on = -1, logged;
+    if (log_on < 0) log_on = getenv("PS3RECOMP_ENG_TEXLOG") ? 1 : 0;
+
+    /* The newest colour target that starts at the offset, or within whose
+     * first row it lies: a blit may start inside a row (inFAMOUS 2 copies its
+     * 1280-wide G-buffer as 1024 + 256 columns) but never deeper, and a looser
+     * match let the phantom 1280x720 target at offset 0 (the zeroed surface
+     * registers at boot) claim the depth buffer at 0x10000 and overwrite VRAM
+     * 0..0x384000. Only 8-bit targets are stored the way the guest expects. */
+    u32 best = ENG_INVALID;
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        const eng_surface* sf = &g.surfaces[i];
+        if (!sf->handle || sf->location != location || sf->fmt != RSX_BE_FMT_R8G8B8A8) continue;
+        const u32 row = pitch ? pitch : sf->w * 4u;
+        if (offset < sf->offset || offset >= sf->offset + row) continue;
+        if (best == ENG_INVALID || sf->stamp > g.surfaces[best].stamp) best = i;
+    }
+    if ((on & 1) && best != ENG_INVALID && g.surfaces[best].wb_stamp != g.surfaces[best].stamp) {
+        eng_surface* sf = &g.surfaces[best];
+        const u32 row = pitch ? pitch : sf->w * 4u;
+        u8* dst = (u8*)eng_guest_ptr(NULL, location, sf->offset, row * sf->h);
+        if (dst && eng_staging_reserve(sf->w * sf->h * 4u)) {
+            g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+            g.be->readback(g.be->user, sf->handle, 0, 0, sf->w, sf->h, g.tex_staging, sf->w * 4u);
+            eng_rgba_to_guest_argb(dst, row, g.tex_staging, sf->w, sf->h);
+            sf->wb_stamp = sf->stamp;
+            wrote = 1;
+            if (log_on && logged < 40) { logged++;
+                fprintf(stderr, "[rsx engine] write-back colour %u:0x%08X %ux%u pitch %u -> guest\n",
+                        location, sf->offset, sf->w, sf->h, row); }
+        }
+    }
+
+    /* The depth buffer at the offset, stored as the RSX stores Z24S8. */
+    for (u32 i = 0; (on & 2) && i < g.n_zdepths; i++) {
+        eng_zdepth* z = &g.zdepths[i];
+        if (!z->handle || !z->had_write || z->location != location) continue;
+        const u32 row = pitch ? pitch : z->w * 4u;
+        if (offset < z->offset || offset >= z->offset + row) continue;
+        if (z->wb_stamp == z->stamp) break;
+        z->snapshot_rgba_valid = 0;   /* the decode must follow the latest depth write */
+        const u32 snap = eng_zdepth_snapshot_rgba8(i);   /* queues the decode */
+        u8* dst = (u8*)eng_guest_ptr(NULL, location, z->offset, row * z->h);
+        if (!snap || !dst || !eng_staging_reserve(z->w * z->h * 4u)) break;
+        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        g.be->readback(g.be->user, snap, 0, 0, z->w, z->h, g.tex_staging, z->w * 4u);
+        eng_rgba_to_guest_argb(dst, row, g.tex_staging, z->w, z->h);
+        /* This decode served the write-back only: a texture consumer later in
+         * the frame must resolve at its own point in the stream, after the
+         * depth written in between, as it did before. */
+        z->snapshot_rgba_valid = 0;
+        z->wb_stamp = z->stamp;
+        wrote = 1;
+        if (log_on && logged < 40) { logged++;
+            fprintf(stderr, "[rsx engine] write-back depth %u:0x%08X %ux%u pitch %u -> guest\n",
+                    location, z->offset, z->w, z->h, row); }
+        break;
+    }
+    return wrote;
 }
 
 void rsx_draw_engine_flush(void)
