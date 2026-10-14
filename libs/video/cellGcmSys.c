@@ -1335,8 +1335,12 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 
 static void gcm_fifo_dump_around(u32 getoff)
 {
+    /* Only ever called on a recovery (bad branch, stuck get), and capped, so
+     * it no longer hides behind GCM_RECDBG: the words the walker stopped on
+     * are the one thing a run that wedged once in three can still tell us,
+     * and GCM_RECDBG is far too loud to leave on for a 15-minute run. */
     static int d = 0;
-    if (!getenv("GCM_RECDBG") || d++ >= 3) return;
+    if (d++ >= 3) return;
     for (u32 t = 0; t < GCM_TRACE_N; t++) {
         u32 k = (s_tr_i + t) % GCM_TRACE_N;
         if (!s_tr_w[k]) continue;
