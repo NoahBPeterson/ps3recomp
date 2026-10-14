@@ -4191,9 +4191,41 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                         pass
         def _ends_block(x):     # a branch that does not return to the next insn
             return x.mnemonic.startswith('b') and x.mnemonic not in ('bl', 'bctrl', 'blrl')
+        # An epilogue that ends in a TAIL CALL leaves the function exactly as
+        # one that ends in `blr` does, and restores the same registers on the
+        # way out. inFAMOUS 2 func_000B9BD0 loads its table base register in
+        # the prologue (`lwz r30,-0x7E90(r2)`), has an early exit `ld r30,
+        # 0xE0(r1); ...; b 0xB8570`, and dispatches 19 instructions later
+        # through `lwz r11,-0x7F80(r30)`: the restore read as r30's nearest
+        # definition, no base resolved, and the switch lifted to an unresolved
+        # indirect call. A `b` leaves the function when it goes back past the
+        # function's entry, or forward past the dispatcher to another
+        # function's entry. Both need the real entries: without func_starts
+        # the scan is bounded by the nearest `blr`, which an early return puts
+        # in the middle of a function, so only `blr` is trusted there.
+        _lo_addr = all_insns[_scan_lo(i)].addr if func_starts else 0
+        _hi_addr = all_insns[i].addr
+        def _leaves(x):
+            if x.mnemonic == 'blr':
+                return True
+            if x.mnemonic != 'b' or not func_starts:
+                return False
+            last = x.operands.split(',')[-1].strip()
+            if not last.startswith('0x'):
+                return False
+            try:
+                t = int(last, 16)
+            except ValueError:
+                return False
+            if t < _lo_addr:
+                return True
+            if t > _hi_addr and func_starts:
+                k2 = _bisect.bisect_left(func_starts, t)
+                return k2 < len(func_starts) and func_starts[k2] == t
+            return False
         out, k = [], len(seg) - 1
         while k >= 0:
-            if seg[k].mnemonic == 'blr':
+            if _leaves(seg[k]):
                 # back to the block's first insn: a branch target, or the insn
                 # right after another branch (fallthrough entry)
                 while k > 0 and seg[k].addr not in targets and not _ends_block(seg[k - 1]):
