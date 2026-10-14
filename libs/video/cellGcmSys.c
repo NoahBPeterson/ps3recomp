@@ -782,6 +782,9 @@ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
 #define GCM_FIFO_CATCHUP_BYTES 0x10000u
+/* How long a self-JUMP park may stand with `put` somewhere else before the
+ * drain gives up on it being patched and follows `put` instead. */
+#define GCM_PARK_GRACE_MS 50ull
 /* How close `current` must get to `end` before the runtime will recycle a ring
  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
  * title that is merely near the end from being touched. */
@@ -1690,8 +1693,32 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    * park standing -- it only patches a park when it reuses that
                    * block. Waiting for a patch that will not come freezes the
                    * FIFO for the rest of the run, so follow the write head. */
-                  if (put != s_fifo_getoff) { gcm_fifo_dump_around(s_fifo_getoff);
-                                              gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put); }
+                  /* ...but not at once. A title that links its segments by
+                   * patching the park moves `put` first and patches second:
+                   * inFAMOUS 2 ends each of its main-memory command blocks in
+                   * a park, writes the next commands at the ring start, sets
+                   * put, and only then rewrites the park as a JUMP to them. A
+                   * drain that lands between the two saw put elsewhere, went
+                   * straight to it, and dropped everything from the ring
+                   * start to put -- the frame's fence with it, so the title
+                   * waited on that label for the rest of the run. Give the
+                   * patch time to arrive, and resync only for a park that
+                   * has stood with the same put for longer than any title
+                   * takes between the two stores. */
+                  if (put != s_fifo_getoff) {
+                      extern unsigned long long ps3_ms_now(void);
+                      static u32 park_off, park_put;
+                      static unsigned long long park_since;
+                      const unsigned long long now = ps3_ms_now();
+                      if (park_off != s_fifo_getoff || park_put != put) {
+                          park_off = s_fifo_getoff; park_put = put; park_since = now;
+                      } else if (now - park_since >= GCM_PARK_GRACE_MS) {
+                          park_off = 0;
+                          gcm_fifo_dump_around(s_fifo_getoff);
+                          gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
+                      }
+                  }
+                  why = "parked";
                   break;
               }
               s_fifo_getoff = tgt; }
