@@ -586,9 +586,9 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->stamp = ++s_surf_clock;
     if (slot == g.n_surfaces) g.n_surfaces++;
     { static u32 logs = 0; if (__atomic_fetch_add(&logs, 1, __ATOMIC_RELAXED) < 16)
-        fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
+        fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s -> h%u\n",
                 location, offset, want_w, want_h, (int)want_fmt,
-                seed ? " (seeded from guest memory)" : ""); }
+                seed ? " (seeded from guest memory)" : "", handle); }
     return slot;
 }
 
@@ -925,6 +925,12 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
       e.content_hash = eng_texture_content_hash(location, offset, span, &readable); }
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                   cube, remap);
+    /* PS3RECOMP_ENG_TEXLOG=1: one line per texture the engine creates (guest
+     * location/offset, format byte, size, levels, pitch, cube, crossbar) and
+     * the backend handle it got, so a pass log's tex= numbers can be read. */
+    { static int on = -1; if (on < 0) on = getenv("PS3RECOMP_ENG_TEXLOG") ? 1 : 0;
+      if (on) fprintf(stderr, "[rsx texlog] h%u <- loc %u off 0x%08X fmt 0x%02X %ux%u mips %u pitch %u cube %d remap 0x%04X span %u\n",
+                      e.handle, location, offset, fmt, w, h, levels, pitch, cube, remap, span); }
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
     if (e.handle || !evicted) { g.textures[index] = e; eng_tidx_rebuild(); }
     return e.handle;
@@ -1805,6 +1811,17 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                      t.remap & 0xFFFFu, t.format)
                 : 0;
             textures[u] = view ? view : g.surfaces[sampled].handle;
+            /* PS3RECOMP_ENG_TEXLOG=1 also names the first 300 render-target
+             * reads: which target a unit's address resolved to, and whether
+             * the texture's size matched it. */
+            { static int on = -1; static int n;
+              if (on < 0) on = getenv("PS3RECOMP_ENG_TEXLOG") ? 1 : 0;
+              if (on && n < 300) { n++;
+                  fprintf(stderr, "[rsx texlog] draw into 0x%08X: unit %u fmt 0x%02X %ux%u remap 0x%04X loc %u off 0x%08X -> surface %ux%u h%u view h%u%s\n",
+                          n_targets ? g.surfaces[target_slots[0]].offset : 0u, u, t.format, t.width, t.height,
+                          t.remap & 0xFFFFu, t.location, t.offset, g.surfaces[sampled].w, g.surfaces[sampled].h,
+                          g.surfaces[sampled].handle, view,
+                          (g.surfaces[sampled].w == t.width && g.surfaces[sampled].h == t.height) ? "" : " SIZE MISMATCH"); } }
             continue;
         }
         const u32 base_fmt = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
