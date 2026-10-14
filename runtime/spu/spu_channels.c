@@ -709,6 +709,51 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
       } }
     switch (cmd) {
     case MFC_GETLLAR_CMD:
+        /* SPU_ATOMICSTAT=1: GETLLARs per SPU every ~5 s with the last line
+         * polled and its first words. A job spinning on a line it reads but
+         * nobody writes (Edge's output ring waiting for an RSX label) shows up
+         * as one SPU with a huge rate and a constant line. */
+        { static _Atomic int s_on = -1; if (s_on < 0) s_on = getenv("SPU_ATOMICSTAT") ? 1 : 0;
+          if (s_on) {
+              enum { ASTAT_MAX = 8 };
+              static struct { spu_context* c; unsigned n; uint32_t ea; } s_st[ASTAT_MAX];
+              static uint64_t s_last_ns;
+              static pthread_mutex_t s_mx = PTHREAD_MUTEX_INITIALIZER;
+              pthread_mutex_lock(&s_mx);
+              int k = 0;
+              for (; k < ASTAT_MAX; k++) if (s_st[k].c == ctx || !s_st[k].c) break;
+              if (k < ASTAT_MAX) { s_st[k].c = ctx; s_st[k].n++; s_st[k].ea = ea; }
+              const uint64_t now = spu_host_ns();
+              if (!s_last_ns) s_last_ns = now;
+              if (now - s_last_ns >= 5000000000ull) {
+                  const double secs = (double)(now - s_last_ns) / 1e9;
+                  for (int i = 0; i < ASTAT_MAX; i++) {
+                      if (!s_st[i].c || !s_st[i].n) continue;
+                      const uint8_t* p = vm_base + s_st[i].ea;
+                      fprintf(stderr, "[atomic-stat] spu=%X img=%d pc=0x%05X %.0f getllar/s, last line 0x%08X:",
+                              s_st[i].c->spu_id, s_st[i].c->image_id, (unsigned)(s_st[i].c->pc & SPU_LS_MASK),
+                              s_st[i].n / secs, s_st[i].ea);
+                      for (int o = 0; o < 48; o += 4)
+                          fprintf(stderr, " %02X%02X%02X%02X", p[o],p[o+1],p[o+2],p[o+3]);
+                      /* A word that looks like a pointer into guest memory: the
+                       * item it names, so a cursor circling a list shows the list. */
+                      for (int o = 0; o < 16; o += 4) {
+                          const uint32_t w = ((uint32_t)p[o]<<24)|((uint32_t)p[o+1]<<16)|((uint32_t)p[o+2]<<8)|p[o+3];
+                          if (w >= 0x10000u && w < 0x20000000u && !(w & 3u)) {
+                              const uint8_t* q = vm_base + w;
+                              fprintf(stderr, " | [0x%08X]:", w);
+                              for (int k = 0; k < 32; k += 4)
+                                  fprintf(stderr, " %02X%02X%02X%02X", q[k],q[k+1],q[k+2],q[k+3]);
+                              break;
+                          }
+                      }
+                      fprintf(stderr, "\n");
+                      s_st[i].n = 0;
+                  }
+                  s_last_ns = now;
+              }
+              pthread_mutex_unlock(&s_mx);
+          } }
         /* Lockstep tick: a guest GETLLAR..PUTLLC poll loop is intra-function
          * (all gotos), so it never crosses the SPU_DRAIN tick site -- without a
          * tick here a polling SPU would hold the run token forever while the
@@ -2633,15 +2678,19 @@ static __attribute__((noinline)) void spu_indirect_branch_slow(spu_context* ctx)
     }
 
     if (!fn && !ctx->policy_mode && ctx->pc >= SPU_JM2_KERNEL_BASE) {
-        /* First sighting of each target (up to 16), reported in one write so
-         * several SPU threads hitting it at once cannot interleave lines. */
-        static uint32_t seen[16]; static int n_seen = 0;
+        /* First sighting of each target (up to 64), reported in one write so
+         * several SPU threads hitting it at once cannot interleave lines. 64,
+         * not 16: a 100 KB job module whose lift missed a whole region shows
+         * a new target every few seconds, and each run should name as many of
+         * them as it can for the next re-lift. */
+        enum { UNLIFTED_SEEN_MAX = 64 };
+        static uint32_t seen[UNLIFTED_SEEN_MAX]; static int n_seen = 0;
         int known = 0, n = __atomic_load_n(&n_seen, __ATOMIC_ACQUIRE);
-        for (int i = 0; i < n && i < 16; i++)
+        for (int i = 0; i < n && i < UNLIFTED_SEEN_MAX; i++)
             if (__atomic_load_n(&seen[i], __ATOMIC_RELAXED) == ctx->pc) { known = 1; break; }
-        if (!known && n < 16) {
+        if (!known && n < UNLIFTED_SEEN_MAX) {
             int slot = __atomic_fetch_add(&n_seen, 1, __ATOMIC_ACQ_REL);
-            if (slot < 16) __atomic_store_n(&seen[slot], ctx->pc, __ATOMIC_RELAXED);
+            if (slot < UNLIFTED_SEEN_MAX) __atomic_store_n(&seen[slot], ctx->pc, __ATOMIC_RELAXED);
             uint32_t p0 = ctx->pc & SPU_LS_MASK;
             uint32_t w0 = ((uint32_t)ctx->ls[p0] << 24) | ((uint32_t)ctx->ls[p0+1] << 16) |
                           ((uint32_t)ctx->ls[p0+2] << 8) | ctx->ls[p0+3];
