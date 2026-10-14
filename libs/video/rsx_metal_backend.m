@@ -3471,16 +3471,28 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         /* PS3RECOMP_METAL_PASS_LOG=1: every 600th present, print the frame's
          * record stream grouped into passes (kind, targets, depth, count, and
          * the textures the first draw samples). */
-        if (present_dst && getenv("PS3RECOMP_METAL_PASS_LOG")) {
+        /* =2: split a pass at every change of pipeline or bound textures, so
+         * each line is one material's run of draws instead of one line per
+         * pass with only its first draw described. */
+        { static int s_pl = -1; static unsigned s_pl_min = 1000, s_pl_every = 300;
+          if (s_pl < 0) { const char* e = getenv("PS3RECOMP_METAL_PASS_LOG"); s_pl = e ? atoi(e) : 0;
+              /* _MIN: a frame counts when it has more records than this;
+               * _EVERY: print every nth such frame. A cutscene frame has fewer
+               * records than a busy menu, so the defaults can skip it. */
+              e = getenv("PS3RECOMP_METAL_PASS_LOG_MIN");   if (e && atoi(e) > 0) s_pl_min = (unsigned)atoi(e);
+              e = getenv("PS3RECOMP_METAL_PASS_LOG_EVERY"); if (e && atoi(e) > 0) s_pl_every = (unsigned)atoi(e); }
+        if (present_dst && s_pl) {
             static unsigned s_pf;
-            if (s_eng_rec_count > 1000 && (s_pf++ % 300) == 0) {
+            if (s_eng_rec_count > s_pl_min && (s_pf++ % s_pl_every) == 0) {
                 fprintf(stderr, "[pass] ---- frame %u: %u records ----\n", s_pf, s_eng_rec_count);
                 u32 i = 0;
                 while (i < s_eng_rec_count) {
                     const EngRecord* r = &s_eng_rec[i];
                     u32 j = i + 1;
                     while (j < s_eng_rec_count && s_eng_rec[j].kind == r->kind && s_eng_rec[j].nrt == r->nrt &&
-                           !memcmp(s_eng_rec[j].rt, r->rt, sizeof r->rt) && s_eng_rec[j].depth == r->depth) j++;
+                           !memcmp(s_eng_rec[j].rt, r->rt, sizeof r->rt) && s_eng_rec[j].depth == r->depth &&
+                           (s_pl < 2 || (s_eng_rec[j].pipeline == r->pipeline &&
+                                         !memcmp(s_eng_rec[j].tex, r->tex, sizeof r->tex)))) j++;
                     fprintf(stderr, "[pass] %5u x%-4u kind=%d rt=", i, j - i, (int)r->kind);
                     for (u32 k = 0; k < r->nrt; k++) fprintf(stderr, "%s%u", k ? "," : "", r->rt[k]);
                     fprintf(stderr, " depth=%u", r->depth);
@@ -3498,7 +3510,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                     i = j;
                 }
             }
-        }
+        } }
         pt = eng_pt_now();
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         eng_encode_records(cb, stage);
@@ -3672,7 +3684,10 @@ static void eng_present(void* user, u32 surface)
     const u32 nrec = s_eng_rec_count;
     eng_encode_and_commit(src);
     eng_dump_frame(src);
-    if (nrec > 1000) eng_dump_surfaces();   /* world frames only */
+    { static unsigned s_sd_min = 1000; static int s_sd_init;
+      if (!s_sd_init) { s_sd_init = 1; const char* e = getenv("PS3RECOMP_METAL_SURF_DUMP_MIN");
+          if (e && atoi(e) > 0) s_sd_min = (unsigned)atoi(e); }
+      if (nrec > s_sd_min) eng_dump_surfaces(); }   /* world frames only (_MIN records) */
 }
 
 static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
