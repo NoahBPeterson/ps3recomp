@@ -1705,6 +1705,15 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
         for (unsigned slot = 0; slot < 4 && !f; ++slot)
             if (ctx->resident_code[slot].image_id)
                 f = (spu_lifted_fn)spu_lookup(lsa, ctx->resident_code[slot].image_id);
+    /* ...and the resident overlay, as spu_indirect_branch retries a miss. A
+     * WWS job module is resident that way (registered by signature, not as a
+     * code region), and the job manager interrupts the running job to service
+     * its next load: the register-save stub it then runs at the top of local
+     * store returns into the job on the interpreter. Without this the probe
+     * never found the job's own lift, so the rest of every interrupted job --
+     * 83,000 instructions on average in inFAMOUS 2's menu -- was interpreted. */
+    if (ctx && !f && ctx->resident_ovl)
+        f = (spu_lifted_fn)spu_lookup(lsa, ctx->resident_ovl);
     return f;
 }
 
