@@ -827,20 +827,32 @@ skip_inject: ;
      * started -- which can leave the subject of the demo off-screen or too far
      * away to make out. Legit input simulation, same footing as YDKJ_INJECT_PAD. */
     { static int s_st = -1;
-      static unsigned char s_v[4] = {128,128,128,128};
       /* Optional 5th/6th fields: the seconds the hold starts and ends, so the menus
-       * before gameplay are not driven by it (PAD_STICK="128,0,128,128,300,320"). */
-      static double s_from = 0, s_until = 1e30; static unsigned long long s_t0 = 0;
+       * before gameplay are not driven by it (PAD_STICK="128,0,128,128,300,320").
+       * Several holds, separated by ';', drive a tutorial that asks for one
+       * stick after another in a single run ("...;128,128,128,0,450,456"). */
+      enum { STICK_MAX = 16 };
+      static unsigned char s_v[STICK_MAX][4];
+      static double s_from[STICK_MAX], s_until[STICK_MAX]; static int s_n = 0;
+      static unsigned long long s_t0 = 0;
       if (!s_t0) s_t0 = GetTickCount64();
       if (s_st < 0) { const char* e = getenv("PAD_STICK");
         s_st = e ? 1 : 0;
-        if (e) { int a=128,b=128,c=128,d=128;
-                 sscanf(e, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&s_from,&s_until);
-                 s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
-                 s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
-      if (s_st && (double)(GetTickCount64() - s_t0) / 1000.0 >= s_from && (double)(GetTickCount64() - s_t0) / 1000.0 < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
-                  hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
-                  hs->connected = 1; }
+        for (const char* q = e; q && *q && s_n < STICK_MAX; ) {
+            int a=128,b=128,c=128,d=128; double f = 0, u = 1e30;
+            if (sscanf(q, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&f,&u) < 4) break;
+            s_v[s_n][0]=(unsigned char)a; s_v[s_n][1]=(unsigned char)b;
+            s_v[s_n][2]=(unsigned char)c; s_v[s_n][3]=(unsigned char)d;
+            s_from[s_n] = f; s_until[s_n] = u; s_n++;
+            q = strchr(q, ';'); if (q) q++;
+        }
+        if (s_n) printf("[cellPad] PAD_STICK: %d hold(s)\n", s_n); }
+      if (s_st) { const double now = (double)(GetTickCount64() - s_t0) / 1000.0;
+        for (int i = 0; i < s_n; i++)
+            if (now >= s_from[i] && now < s_until[i]) {
+                hs->analog_lx = s_v[i][0]; hs->analog_ly = s_v[i][1];
+                hs->analog_rx = s_v[i][2]; hs->analog_ry = s_v[i][3];
+                hs->connected = 1; break; } }
       /* PAD_SWEEP=<seconds per step>: walk the sticks through a fixed set of
        * deflections instead of holding one. Guessing a single stick position and
        * re-running costs ~5 minutes a try; a sweep answers "can input move the
