@@ -3521,6 +3521,15 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         } else {
             [cb commit];
             [cb waitUntilCompleted];
+            /* A faulted command buffer (GPU hang, a bad resource) completes
+             * with an error and nothing says so; the next frame then renders
+             * on a device that may have been lost. Name it, with its code. */
+            if ([cb status] == MTLCommandBufferStatusError) {
+                static int n;
+                if (n++ < 8)
+                    fprintf(stderr, "[rsx engine/metal] command buffer failed: %s (code %ld)\n",
+                            [[[cb error] localizedDescription] UTF8String], (long)[[cb error] code]);
+            }
         }
 
 
