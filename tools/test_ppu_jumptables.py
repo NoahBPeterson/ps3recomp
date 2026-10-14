@@ -52,6 +52,7 @@ def w_li(rt, si):          return (14 << 26) | (rt << 21) | (si & 0xFFFF)
 def w_addis(rt, ra, si):   return (15 << 26) | (rt << 21) | (ra << 16) | (si & 0xFFFF)
 def w_stdu(rs, ra, d):     return (62 << 26) | (rs << 21) | (ra << 16) | (d & 0xFFFC) | 1
 def w_bc(bo, bi, rel):     return (16 << 26) | (bo << 21) | (bi << 16) | (rel & 0xFFFC)
+def w_b(rel):              return (18 << 26) | (rel & 0x3FFFFFC)
 
 
 def w_mtctr(rs):
@@ -192,6 +193,60 @@ def test_two_level_base_past_early_return():
           [0x11100, 0x11200])
 
 
+def test_two_level_base_past_tail_call():
+    """Same as above, but the early exit leaves by a tail call, not a blr.
+
+        lwz    r30, 8(r2)        <- prologue: the base's base
+        cmplwi cr0, r3, 2
+        bc     (le) -> +12       <- to the dispatch
+        ld     r30, 0(r1)        <- early-exit epilogue restores r30...
+        b      elsewhere         <- ...and tail-calls another function
+        lwz    r11, -16(r30)     <- the table base, through r30
+        slwi r9,r3,2; lwzx r0,r9,r11; add r0,r0,r11; mtctr r0; bctr
+
+    inFAMOUS 2 func_000B9BD0: the exit block ends in `b 0xB8570`, a function
+    before this one. `_live` only dropped blocks ending in `blr`, so the
+    epilogue's `ld r30` was taken as the base register's nearest definition,
+    nothing resolved, and the switch lifted to an unresolved indirect call.
+    A `b` that goes back past the function's entry, or forward to another
+    function's entry, leaves the function the same way a `blr` does. Without
+    func_starts there is no entry to compare against, so only `blr` counts.
+    """
+    mid, table = 0x200A00, 0x11000
+    mem = {TOC + 8: mid, mid - 16: table,
+           table + 0: 0x100, table + 4: 0x200, table + 8: 0xFFFFFFFF}
+
+    def words(tail_rel):
+        return [w_lwz(30, 2, 8), w_cmplwi(0, 3, 2), w_bc(4, 1, 12),
+                w_ld(30, 1, 0), w_b(tail_rel),
+                w_lwz(11, 30, -16), w_slwi(9, 3, 2), w_lwzx(0, 9, 11),
+                w_add(0, 0, 11), w_mtctr(0), w_bctr()]
+
+    # Backward, to a function before this one (the inFAMOUS 2 shape). The `b`
+    # is at TEXT_LO + 16, so -0x110 lands at TEXT_LO - 0x100.
+    insns = decode_all(words(-0x110))
+    tables = discover_jump_tables(insns, lambda a: mem.get(a & 0xFFFFFFFF),
+                                  [TOC], TEXT_LO, TEXT_HI, func_starts=[TEXT_LO])
+    check("two-level base past a backward tail call", tables.get(insns[-1].addr),
+          [0x11100, 0x11200])
+
+    # Forward, to the entry of the next function.
+    insns = decode_all(words(0x100 - 16))
+    tables = discover_jump_tables(insns, lambda a: mem.get(a & 0xFFFFFFFF),
+                                  [TOC], TEXT_LO, TEXT_HI,
+                                  func_starts=[TEXT_LO, TEXT_LO + 0x100])
+    check("two-level base past a forward tail call", tables.get(insns[-1].addr),
+          [0x11100, 0x11200])
+
+    # Control: with no function entries to compare against, a `b` is not
+    # trusted to leave the function, and the restore still hides the base.
+    insns = decode_all(words(-0x110))
+    tables = discover_jump_tables(insns, lambda a: mem.get(a & 0xFFFFFFFF),
+                                  [TOC], TEXT_LO, TEXT_HI)
+    check("tail call needs func_starts to count as an exit",
+          tables.get(insns[-1].addr), None)
+
+
 def test_base_before_fallthrough_split():
     """The table base is loaded before a split point that is not an entry.
 
@@ -254,6 +309,7 @@ def main() -> int:
     test_offset_both_operands_r2_loaded()
     test_tie_keeps_first_candidate()
     test_two_level_base_past_early_return()
+    test_two_level_base_past_tail_call()
     test_base_before_fallthrough_split()
     test_const_base_no_table()
     test_const_base_needs_constant()
