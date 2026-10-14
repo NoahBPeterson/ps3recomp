@@ -7,6 +7,8 @@
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
 #include <setjmp.h>
+#include <pthread.h>   /* SPU_IRQSTAT counters */
+#include <time.h>
 
 /* See spu_context.h `irq_frame`. */
 typedef struct spu_irq_frame {
@@ -316,6 +318,39 @@ void (*spu_take_interrupt(spu_context* ctx,
     ctx->srr0 = ctx->pc;             /* resume point for iret */
     ctx->int_enable = 0;
     spu_irq_regs_save(ctx);          /* hardware contract: handler preserves regs */
+    /* SPU_IRQSTAT=1: interrupt rate per SPU, a line every ~5 s while any are
+     * taken. The TAKE/IRET traces above are capped and spent on boot; an
+     * interrupt storm ten minutes in (a handler that resumes a job the same
+     * event interrupts again at once) only shows as a rate. */
+    { static _Atomic int s_on = -1; if (s_on < 0) s_on = getenv("SPU_IRQSTAT") ? 1 : 0;
+      if (s_on) {
+          enum { IRQSTAT_MAX = 8 };
+          static struct { spu_context* c; unsigned takes; uint32_t srr0, ev; } s_st[IRQSTAT_MAX];
+          static uint64_t s_last_ns;
+          static pthread_mutex_t s_mx = PTHREAD_MUTEX_INITIALIZER;
+          pthread_mutex_lock(&s_mx);
+          int k = 0;
+          for (; k < IRQSTAT_MAX; k++) if (s_st[k].c == ctx || !s_st[k].c) break;
+          if (k < IRQSTAT_MAX) {
+              s_st[k].c = ctx; s_st[k].takes++;
+              s_st[k].srr0 = ctx->srr0 & SPU_LS_MASK; s_st[k].ev = spu_ev_get(ctx);
+          }
+          struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+          const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+          if (!s_last_ns) s_last_ns = now;
+          if (now - s_last_ns >= 5000000000ull) {
+              const double secs = (double)(now - s_last_ns) / 1e9;
+              for (int i = 0; i < IRQSTAT_MAX; i++) {
+                  if (!s_st[i].c || !s_st[i].takes) continue;
+                  fprintf(stderr, "[irq-stat] spu=%X img=%d %.0f takes/s, last srr0=0x%05X events=0x%X stall=0x%X\n",
+                          s_st[i].c->spu_id, s_st[i].c->image_id, s_st[i].takes / secs,
+                          s_st[i].srr0, s_st[i].ev, s_st[i].c->list_stall_stat);
+                  s_st[i].takes = 0;
+              }
+              s_last_ns = now;
+          }
+          pthread_mutex_unlock(&s_mx);
+      } }
     { static _Atomic int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
       if (s_it) { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 200)
         fprintf(stderr, "[irq] TAKE srr0=0x%05X depth=%d r13=%08X r15=%08X\n",

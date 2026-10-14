@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
+#include <time.h>     /* RSX_LABELSTAT */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 
 /* ---------------------------------------------------------------------------
@@ -365,6 +366,21 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
          * Apply the same swap the hardware does so the pre-swap cancels out. */
         u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
+        /* RSX_LABELSTAT=1: label writes per ~5 s with the last one, so an SPU
+         * job spinning on a label (Edge's output ring) can be checked against
+         * what the RSX side is still producing. */
+        { static int s_on = -1; if (s_on < 0) s_on = getenv("RSX_LABELSTAT") ? 1 : 0;
+          if (s_on) {
+              static unsigned n; static u32 last_off, last_val; static unsigned long long t0;
+              struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+              const unsigned long long now = (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
+              n++; last_off = s_sem_off; last_val = val;
+              if (!t0) t0 = now;
+              if (now - t0 >= 5000) {
+                  fprintf(stderr, "[label-stat] %u label writes in %.1fs, last @0x%08X = 0x%08X\n",
+                          n, (now - t0) / 1000.0, VM_HLE_INJECT_BASE + (last_off & 0x00FFFFFFu), last_val);
+                  n = 0; t0 = now;
+              } } }
         { static int _l=0; if(__atomic_fetch_add(&_l, 1, __ATOMIC_RELAXED)<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
         return 0;
       }
