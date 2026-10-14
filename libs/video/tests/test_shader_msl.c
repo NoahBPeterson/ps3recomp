@@ -14,6 +14,8 @@
  *   FP  MOV r0, COL0 (END)                 colour out
  *   FP  MOV r0, COL0.zyxw (END)            colour out, red and blue swapped:
  *                                          what the host's --shader mode runs
+ *   FP  PK4UB r0, COL0 ; UPG r0, r0 (END)  pack to 8-bit, unpack sRGB->linear:
+ *                                          what a character material does
  *   FP  TEX r0, TC0 unit 0 (END)           texture unit 0 sampled at texcoord0
  *   FP  TEX r0, TC0 unit 0, CUBE (END)     ... with unit 0 a cube map
  *   VP  MOV o0, v0 ; TXL o1, v8 (END)      a vertex texture sampled at t16
@@ -44,6 +46,17 @@ static void check(const char* what, const char* text, const char* needle)
     } else {
         printf("[FAIL] %s -- missing \"%s\"\n", what, needle);
         if (!g_verbose && text) printf("----\n%s\n----\n", text);
+        g_fail++;
+    }
+}
+
+static void check_absent(const char* what, const char* text, const char* needle)
+{
+    if (text && !strstr(text, needle)) {
+        printf("[PASS] %s -- no \"%s\"\n", what, needle);
+        g_pass++;
+    } else {
+        printf("[FAIL] %s -- found \"%s\"\n", what, needle);
         g_fail++;
     }
 }
@@ -151,6 +164,36 @@ int main(int argc, char** argv)
         check("swizzled FP HLSL", g_hlsl, "r[0].xyzw = _v.xyzw;");
         if (translate("swizzled FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
             check("swizzled FP MSL", g_msl, "fragment ");
+        /* No pack/unpack opcode, so none of the helpers: the text of a program
+         * that does not use them is the same as before they existed. */
+        check_absent("swizzled FP HLSL", g_hlsl, "_rsx_pk4ub");
+    }
+
+    /* ---- fragment program: PK4UB r0, COL0 ; UPG r0, r0 ---------------------
+     * The pack/unpack pair a character material uses for its sRGB<->linear
+     * conversion. The packed word is carried in r0's bits (asfloat), and the
+     * unpack reads them back (asuint): the two must round-trip through
+     * glslang and spirv-cross, which is where a bitcast can go wrong. */
+    {
+        u8 fp[32];
+        rsx_test_fp_instr(fp,
+                          RSX_TEST_FP_OPC(0x27 /* PK4UB */) | RSX_TEST_FP_MASK_XYZW |
+                          RSX_TEST_FP_INSRC_COL0 | RSX_TEST_FP_OUTREG(0),
+                          RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        rsx_test_fp_instr(fp + 16,
+                          RSX_TEST_FP_OPC(0x2D /* UPG */) | RSX_TEST_FP_MASK_XYZW |
+                          RSX_TEST_FP_OUTREG(0) | RSX_TEST_FP_END,
+                          /* src0 reg_type 0 (temp), reg 0 */ RSX_TEST_FP_SWZ_IDENT);
+        check_count("pack FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                            g_hlsl, sizeof g_hlsl, NULL), 2);
+        check("pack FP HLSL", g_hlsl, "asfloat(_rsx_pk4ub((input.col0).xyzw))");
+        check("pack FP HLSL", g_hlsl, "_rsx_srgb2lin(_rsx_up4ub(((r[0]).xyzw).x))");
+        check("pack FP HLSL", g_hlsl, "uint   _rsx_pk4ub(float4 v)");
+        check("pack FP HLSL", g_hlsl, "float4 _rsx_srgb2lin(float4 cs)");
+        if (translate("pack FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("pack FP MSL", g_msl, "fragment ");
+            check("pack FP MSL", g_msl, "[[color(0)]]");
+        }
     }
 
     /* ---- fragment program: TEX r0, TC0 (unit 0) --------------------------- */

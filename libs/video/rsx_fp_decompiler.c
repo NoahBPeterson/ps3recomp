@@ -71,7 +71,7 @@ enum {
     OP_TXD=0x19, OP_RCP=0x1A, OP_RSQ=0x1B, OP_EX2=0x1C, OP_LG2=0x1D,
     OP_LIT=0x1E, OP_LRP=0x1F, OP_STR=0x20, OP_SFL=0x21, OP_COS=0x22,
     OP_SIN=0x23, OP_PK2H=0x24, OP_UP2H=0x25, OP_POW=0x26, OP_PK4UB=0x27,
-    OP_UP4UB=0x28, OP_PK2US=0x29, OP_UP2US=0x2A, OP_DP2A=0x2E, OP_TXL=0x2F,
+    OP_UP4UB=0x28, OP_PK2US=0x29, OP_UP2US=0x2A, OP_PKG=0x2C, OP_UPG=0x2D, OP_DP2A=0x2E, OP_TXL=0x2F,
     OP_TXB=0x31, OP_RFL=0x36, OP_DP2=0x38, OP_NRM=0x39, OP_DIV=0x3A,
     OP_DIVSQ=0x3B, OP_LIF=0x3C, OP_FENCT=0x3D, OP_FENCB=0x3E
 };
@@ -94,6 +94,10 @@ const char* rsx_fp_opcode_name(u32 op)
     case OP_TXL: return "TXL"; case OP_TXB: return "TXB"; case OP_RFL: return "RFL";
     case OP_DIV: return "DIV"; case OP_DP2: return "DP2"; case OP_NRM: return "NRM";
     case OP_DIVSQ: return "DIVSQ"; case OP_LIF: return "LIF";
+    case OP_PK4B: return "PK4B"; case OP_UP4B: return "UP4B"; case OP_PK2H: return "PK2H";
+    case OP_UP2H: return "UP2H"; case OP_PK4UB: return "PK4UB"; case OP_UP4UB: return "UP4UB";
+    case OP_PK2US: return "PK2US"; case OP_UP2US: return "UP2US"; case OP_PKG: return "PKG";
+    case OP_UPG: return "UPG";
     case OP_FENCT: return "FENCT"; case OP_FENCB: return "FENCB";
     default:     return "?";
     }
@@ -470,6 +474,7 @@ static int rsx_fp_decompile_internal(
      * Emitting the preamble here would mean guessing it. */
     Out o = { out, out_size, 0, 1 };
     out[0] = '\0';
+    int uses_pack = 0;   /* a pack or unpack opcode was decoded: the preamble gets its helpers */
     out_puts(&o,
         "    float4 r[48]; float4 h[48];\n"
         /* Fully initialise both register files: RSX programs routinely read a
@@ -655,6 +660,18 @@ static int rsx_fp_decompile_internal(
         case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
         case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
+        /* Pack/unpack (RPCS3 FragmentProgramDecompiler PK/UP cases and the pkg/upg
+         * builtins): the packed word is a scalar that replicates. */
+        case OP_PK4UB: uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk4ub(%s))", a); break;
+        case OP_UP4UB: uses_pack = 1; snprintf(rhs, sizeof(rhs), "_rsx_up4ub((%s).x)", a); break;
+        case OP_PKG:   uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk4ub(_rsx_lin2srgb(%s)))", a); break;
+        case OP_UPG:   uses_pack = 1; snprintf(rhs, sizeof(rhs), "_rsx_srgb2lin(_rsx_up4ub((%s).x))", a); break;
+        case OP_PK4B:  uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk4b(%s))", a); break;
+        case OP_UP4B:  uses_pack = 1; snprintf(rhs, sizeof(rhs), "_rsx_up4b((%s).x)", a); break;
+        case OP_PK2US: uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk2us(%s))", a); break;
+        case OP_UP2US: uses_pack = 1; snprintf(rhs, sizeof(rhs), "_rsx_up2us((%s).x)", a); break;
+        case OP_PK2H:  uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk2h(%s))", a); break;
+        case OP_UP2H:  uses_pack = 1; snprintf(rhs, sizeof(rhs), "_rsx_up2h((%s).x)", a); break;
         /* Real RSX RSQ ignores the input's sign — 1/sqrt(|x|), not 1/sqrt(x)
          * (oracle: RPCS3 FragmentProgramDecompiler.cpp, "RSQ ignores the sign
          * of the inputs (Metro Last Light, GTA4)"). The strict form NaN'd the
@@ -760,11 +777,16 @@ static int rsx_fp_decompile_internal(
             }
             handled = 0;   /* no destination write */
             break;
-        default:
-            out_puts(&o, "    /* TODO: unhandled FP opcode ");
-            out_puts(&o, rsx_fp_opcode_name(opcode));
-            out_puts(&o, " */\n");
+        default: {
+            /* The number and the raw words, so an opcode outside the table
+             * can be identified from the dumped shader alone. */
+            char todo[160];
+            snprintf(todo, sizeof todo,
+                     "    /* TODO: unhandled FP opcode 0x%02X (%s) words %08X %08X %08X %08X */\n",
+                     opcode, rsx_fp_opcode_name(opcode), w0, w1, w2, w3);
+            out_puts(&o, todo);
             handled = 0;
+            break; }
             break;
         }
 
@@ -907,7 +929,7 @@ static int rsx_fp_decompile_internal(
     /* Preamble: PSInput matches the backend's placeholder layout; temp/half
      * register files; texture+sampler banks for TEX. Built here, in front of
      * the body, now that the return type is known. */
-    char preamble[2048];
+    char preamble[4096];   /* the pack/unpack helpers alone are ~1.6 KB */
     Out p = { preamble, sizeof(preamble), 0, 1 };
     preamble[0] = '\0';
     out_puts(&p,
@@ -945,6 +967,24 @@ static int rsx_fp_decompile_internal(
             buffered_constant_count ? buffered_constant_count : 1u);
         out_puts(&p, constants_decl);
     }
+    /* NV40 pack/unpack. A packed word travels on in a float's bits, so the
+     * packs bitcast and the unpacks bitcast back; the sRGB forms follow
+     * RPCS3's _builtin_pkg/_builtin_upg (linear_to_srgb, srgb_to_linear).
+     * These were the opcodes inFAMOUS 2's character materials used and the
+     * decompiler skipped, leaving the destination with whatever it held.
+     * Only for a program that uses one, so every other program's text is
+     * unchanged. */
+    if (uses_pack) out_puts(&p,
+        "uint   _rsx_pk4ub(float4 v) { uint4 b = (uint4)round(saturate(v) * 255.0); return b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }\n"
+        "float4 _rsx_up4ub(float v) { uint u = asuint(v); return float4(u & 255u, (u >> 8) & 255u, (u >> 16) & 255u, (u >> 24) & 255u) / 255.0; }\n"
+        "uint   _rsx_pk4b(float4 v) { uint4 b = (uint4)((int4)round(clamp(v, -1.0, 1.0) * 127.0)) & 255u; return b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }\n"
+        "float4 _rsx_up4b(float v) { uint u = asuint(v); int4 b = int4(u & 255u, (u >> 8) & 255u, (u >> 16) & 255u, (u >> 24) & 255u); b = (b << 24) >> 24; return clamp((float4)b / 127.0, -1.0, 1.0); }\n"
+        "uint   _rsx_pk2us(float4 v) { uint2 b = (uint2)round(saturate(v.xy) * 65535.0); return b.x | (b.y << 16); }\n"
+        "float4 _rsx_up2us(float v) { uint u = asuint(v); return float4(u & 65535u, u >> 16, u & 65535u, u >> 16) / 65535.0; }\n"
+        "uint   _rsx_pk2h(float4 v) { return f32tof16(v.x) | (f32tof16(v.y) << 16); }\n"
+        "float4 _rsx_up2h(float v) { uint u = asuint(v); return float4(f16tof32(u & 65535u), f16tof32(u >> 16), f16tof32(u & 65535u), f16tof32(u >> 16)); }\n"
+        "float4 _rsx_lin2srgb(float4 cl) { cl = saturate(cl); float4 low = cl * 12.92; float4 high = 1.055 * pow(cl, 1.0 / 2.4) - 0.055; return saturate((cl < 0.0031308) ? low : high); }\n"
+        "float4 _rsx_srgb2lin(float4 cs) { float4 a = cs / 12.92; float4 b = pow(max(cs + 0.055, 0.0) / 1.055, 2.4); return (cs > 0.04045) ? b : a; }\n");
     if (targets == 1) {
         out_puts(&p, "float4 main(PSInput input) : SV_TARGET {\n");
     } else {
