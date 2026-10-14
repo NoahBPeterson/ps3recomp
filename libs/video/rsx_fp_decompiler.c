@@ -777,11 +777,16 @@ static int rsx_fp_decompile_internal(
             }
             handled = 0;   /* no destination write */
             break;
-        default:
-            out_puts(&o, "    /* TODO: unhandled FP opcode ");
-            out_puts(&o, rsx_fp_opcode_name(opcode));
-            out_puts(&o, " */\n");
+        default: {
+            /* The number and the raw words, so an opcode outside the table
+             * can be identified from the dumped shader alone. */
+            char todo[160];
+            snprintf(todo, sizeof todo,
+                     "    /* TODO: unhandled FP opcode 0x%02X (%s) words %08X %08X %08X %08X */\n",
+                     opcode, rsx_fp_opcode_name(opcode), w0, w1, w2, w3);
+            out_puts(&o, todo);
             handled = 0;
+            break; }
             break;
         }
 
