@@ -319,8 +319,21 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
      * inFamous's fog/DOF pass reads its 256x256 B8 lookup through B and drew
      * the whole scene black. */
     static const u8 lanes_b8[4]   = {3, 0, 0, 0};
+    /* X16, X32_FLOAT and the DEPTH16/DEPTH24 formats are one real channel
+     * too, uploaded as R16/R32F, and the sampler presents it on every lane
+     * (RPCS3's {R,R,R,R} for X32_FLOAT and DEPTH*), so a crossbar may read it
+     * through any of A,R,G,B. inFAMOUS 2 binds its 1024x8 X16 lighting ramp
+     * with 0xAAEE -- R from B -- and reads .x: through the ARGB table that is
+     * the empty B component of an R16 resource, zero, and every light in the
+     * main menu was multiplied by it, leaving Cole a black silhouette. (RPCS3
+     * lists X16 as {R,ONE,R,ONE}; that title's crossbar only makes sense with
+     * the value reachable from B, which both readings give for R.) */
+    static const u8 lanes_x[4]    = {0, 0, 0, 0};
     const u32 base = rsx_fmt & 0x9Fu;
-    const u8* src2res = base == 0x8Bu ? lanes_g8b8 : base == 0x81u ? lanes_b8 : lanes_argb;
+    const int one_channel = base == 0x90u || base == 0x91u || base == 0x92u ||
+                            base == 0x93u || base == 0x94u || base == 0x9Cu;
+    const u8* src2res = base == 0x8Bu ? lanes_g8b8 : base == 0x81u ? lanes_b8
+                      : one_channel   ? lanes_x    : lanes_argb;
 
     if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;   /* unset -> identity */
 

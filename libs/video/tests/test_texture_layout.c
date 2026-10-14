@@ -666,6 +666,32 @@ static void test_remap_g8b8_lanes(void)
 /* Compressed formats decode to RGBA, so they use the same lanes as A8R8G8B8 --
  * NOT a bent table cancelling a reversed crossbar, which is how the old bug
  * hid on DXT while breaking everything else. */
+/* X16, X32_FLOAT and the DEPTH formats are one real channel, uploaded as
+ * R16/R32F and presented on every lane, so a crossbar that reads B gets the
+ * value and not an empty component. inFAMOUS 2 binds its X16 lighting ramp
+ * with 0xAAEE (R from B); through the ARGB table that read zero and nothing
+ * in the main menu was lit. */
+static void test_remap_one_channel_lanes(void)
+{
+    u8 m[4];
+    rsx_texture_component_remap(0xAAEEu, FMT_X16, m);
+    CHECK_EQ(m[R_], 0); CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], 0); CHECK_EQ(m[A_], 0);
+    rsx_texture_component_remap(0xAAE4u, FMT_X16 | FMT_LN, m);
+    for (int i = 0; i < 4; i++) CHECK_EQ(m[i], 0);
+    rsx_texture_component_remap(0xAAE4u, FMT_X32F, m);
+    for (int i = 0; i < 4; i++) CHECK_EQ(m[i], 0);
+    rsx_texture_component_remap(0xAAE4u, FMT_DEPTH16, m);
+    for (int i = 0; i < 4; i++) CHECK_EQ(m[i], 0);
+    rsx_texture_component_remap(0xAAE4u, FMT_DEPTH24, m);
+    for (int i = 0; i < 4; i++) CHECK_EQ(m[i], 0);
+    /* A forced constant still wins over the crossbar. */
+    rsx_texture_component_remap(0xA9EEu, FMT_X16, m);     /* op for A = 1 */
+    CHECK_EQ(m[A_], RSX_REMAP_ONE); CHECK_EQ(m[R_], 0);
+    /* Two-channel and four-channel formats keep their own tables. */
+    rsx_texture_component_remap(0xAAEEu, FMT_A8R8G8B8, m);
+    CHECK_EQ(m[R_], 2);                                    /* R from B = comp 2 */
+}
+
 static void test_remap_dxt_matches_argb(void)
 {
     u8 a[4], d[4];
@@ -705,6 +731,7 @@ int main(void)
     test_remap_field_order_is_not_reversed();
     test_remap_force_zero_and_one();
     test_remap_g8b8_lanes();
+    test_remap_one_channel_lanes();
     test_remap_dxt_matches_argb();
     test_remap_rejects_null();
 
