@@ -730,9 +730,12 @@ skip_inject: ;
      * field before CROSS means anything. Masks are CELL_PAD_CTRL_* packed as
      * (DIGITAL2 << 8) | DIGITAL1: START 0x0008, UP 0x0010, DOWN 0x0040,
      * LEFT 0x0080, RIGHT 0x0020, CROSS 0x4000, CIRCLE 0x2000, TRIANGLE 0x1000.
+     * An optional third field, "<sec>:<mask>:<hold>", keeps the button down
+     * for <hold> seconds of wall clock instead of one press: inFAMOUS 2's
+     * "Hold L1 to aim" wants L1 down while the R1 presses after it happen.
      * Legit input simulation on the same footing as PAD_AUTOPRESS/PAD_STICK. */
     { static int s_sc = -1;
-      static struct { double t; unsigned mask; } ev[32]; static int n_ev = 0;
+      static struct { double t; unsigned mask; double hold; } ev[32]; static int n_ev = 0;
       static unsigned long long t0 = 0;   /* not ULONGLONG: this builds on POSIX too */
       if (s_sc < 0) {
           s_sc = 0;
@@ -744,7 +747,9 @@ skip_inject: ;
                   double t = strtod(p, (char**)&p);
                   if (*p == ':') p++;
                   unsigned m = (unsigned)strtoul(p, (char**)&p, 0);
-                  ev[n_ev].t = t; ev[n_ev].mask = m; n_ev++;
+                  double h = 0;
+                  if (*p == ':') { p++; h = strtod(p, (char**)&p); }
+                  ev[n_ev].t = t; ev[n_ev].mask = m; ev[n_ev].hold = h; n_ev++;
                   while (*p == ',' || *p == ' ') p++;
               }
               printf("[cellPad] PAD_SCRIPT: %d event(s)\n", n_ev);
@@ -761,13 +766,18 @@ skip_inject: ;
           static int fired[32], held[32];
           for (int i = 0; i < n_ev; i++) {
               if (!fired[i] && now >= ev[i].t) { fired[i] = 1; held[i] = 40; }
-              if (held[i] > 0) {
-                  held[i]--;
+              const int down = held[i] > 0 ||
+                  (ev[i].hold > 0 && now >= ev[i].t && now < ev[i].t + ev[i].hold);
+              if (held[i] > 0) held[i]--;
+              if (down) {
                   data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(ev[i].mask & 0xFF);
                   data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((ev[i].mask >> 8) & 0xFF);
                   static int said[32];
                   if (!said[i]) { said[i] = 1;
-                      printf("[cellPad] PAD_SCRIPT t=%.1fs press 0x%04X\n", ev[i].t, ev[i].mask); }
+                      if (ev[i].hold > 0)
+                          printf("[cellPad] PAD_SCRIPT t=%.1fs hold 0x%04X for %.0fs\n", ev[i].t, ev[i].mask, ev[i].hold);
+                      else
+                          printf("[cellPad] PAD_SCRIPT t=%.1fs press 0x%04X\n", ev[i].t, ev[i].mask); }
               }
           }
       } }
@@ -817,20 +827,32 @@ skip_inject: ;
      * started -- which can leave the subject of the demo off-screen or too far
      * away to make out. Legit input simulation, same footing as YDKJ_INJECT_PAD. */
     { static int s_st = -1;
-      static unsigned char s_v[4] = {128,128,128,128};
       /* Optional 5th/6th fields: the seconds the hold starts and ends, so the menus
-       * before gameplay are not driven by it (PAD_STICK="128,0,128,128,300,320"). */
-      static double s_from = 0, s_until = 1e30; static unsigned long long s_t0 = 0;
+       * before gameplay are not driven by it (PAD_STICK="128,0,128,128,300,320").
+       * Several holds, separated by ';', drive a tutorial that asks for one
+       * stick after another in a single run ("...;128,128,128,0,450,456"). */
+      enum { STICK_MAX = 16 };
+      static unsigned char s_v[STICK_MAX][4];
+      static double s_from[STICK_MAX], s_until[STICK_MAX]; static int s_n = 0;
+      static unsigned long long s_t0 = 0;
       if (!s_t0) s_t0 = GetTickCount64();
       if (s_st < 0) { const char* e = getenv("PAD_STICK");
         s_st = e ? 1 : 0;
-        if (e) { int a=128,b=128,c=128,d=128;
-                 sscanf(e, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&s_from,&s_until);
-                 s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
-                 s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
-      if (s_st && (double)(GetTickCount64() - s_t0) / 1000.0 >= s_from && (double)(GetTickCount64() - s_t0) / 1000.0 < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
-                  hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
-                  hs->connected = 1; }
+        for (const char* q = e; q && *q && s_n < STICK_MAX; ) {
+            int a=128,b=128,c=128,d=128; double f = 0, u = 1e30;
+            if (sscanf(q, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&f,&u) < 4) break;
+            s_v[s_n][0]=(unsigned char)a; s_v[s_n][1]=(unsigned char)b;
+            s_v[s_n][2]=(unsigned char)c; s_v[s_n][3]=(unsigned char)d;
+            s_from[s_n] = f; s_until[s_n] = u; s_n++;
+            q = strchr(q, ';'); if (q) q++;
+        }
+        if (s_n) printf("[cellPad] PAD_STICK: %d hold(s)\n", s_n); }
+      if (s_st) { const double now = (double)(GetTickCount64() - s_t0) / 1000.0;
+        for (int i = 0; i < s_n; i++)
+            if (now >= s_from[i] && now < s_until[i]) {
+                hs->analog_lx = s_v[i][0]; hs->analog_ly = s_v[i][1];
+                hs->analog_rx = s_v[i][2]; hs->analog_ry = s_v[i][3];
+                hs->connected = 1; break; } }
       /* PAD_SWEEP=<seconds per step>: walk the sticks through a fixed set of
        * deflections instead of holding one. Guessing a single stick position and
        * re-running costs ~5 minutes a try; a sweep answers "can input move the
