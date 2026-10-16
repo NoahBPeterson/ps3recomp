@@ -294,11 +294,16 @@ static void sysutil_locale_code(const char* loc, char* out, size_t n)
     }
     if (!strcmp(ll, "c") || !strcmp(ll, "pos")) { out[0] = 0; return; }   /* C.UTF-8, POSIX */
     if (!strcmp(ll, "zh")) {
-        snprintf(out, n, "%s", (!strcmp(cc, "tw") || !strcmp(cc, "hk") || !strcmp(cc, "mo")) ? "zh-t" : "zh-s");
+        const int hant = strstr(loc, "Hant") || strstr(loc, "hant");
+        snprintf(out, n, "%s", (hant || !strcmp(cc, "tw") || !strcmp(cc, "hk") || !strcmp(cc, "mo")) ? "zh-t" : "zh-s");
     } else if (!strcmp(ll, "nb") || !strcmp(ll, "nn")) {
         snprintf(out, n, "no");
-    } else if ((!strcmp(ll, "pt") && !strcmp(cc, "br")) || (!strcmp(ll, "en") && !strcmp(cc, "gb"))) {
-        snprintf(out, n, "%s-%s", ll, cc);
+    } else if (!strcmp(ll, "pt") && !strcmp(cc, "br")) {
+        snprintf(out, n, "pt-br");
+    } else if (!strcmp(ll, "en") && (!strcmp(cc, "gb") || !strcmp(cc, "au") || !strcmp(cc, "nz") ||
+                                     !strcmp(cc, "ie") || !strcmp(cc, "za") || !strcmp(cc, "in"))) {
+        /* the regions that got the UK English release */
+        snprintf(out, n, "en-gb");
     } else {
         snprintf(out, n, "%s", ll);
     }
@@ -319,9 +324,13 @@ static void sysutil_host_language(char* out, size_t n)
     };
     for (unsigned i = 0; i < sizeof w / sizeof w[0]; i++)
         if (w[i].prim == prim) { snprintf(out, n, "%s", w[i].code); break; }
-    if (prim == 0x09 && sub == 0x02) snprintf(out, n, "en-gb");          /* English (UK) */
+    /* UK, Australia, New Zealand, Ireland, South Africa, India: the regions
+     * that got the UK English release */
+    if (prim == 0x09 && (sub == 0x02 || sub == 0x03 || sub == 0x05 || sub == 0x06 ||
+                         sub == 0x07 || sub == 0x10)) snprintf(out, n, "en-gb");
     if (prim == 0x16 && sub == 0x01) snprintf(out, n, "pt-br");          /* Portuguese (Brazil) */
-    if (prim == 0x04) snprintf(out, n, (sub == 0x01 || sub == 0x03 || sub == 0x05) ? "zh-t" : "zh-s");
+    /* Traditional: Taiwan, Hong Kong, Macao and the neutral zh-Hant (0x7C04) */
+    if (prim == 0x04) snprintf(out, n, (sub == 0x01 || sub == 0x03 || sub == 0x05 || sub == 0x1F) ? "zh-t" : "zh-s");
 #else
     const char* vars[] = { "LC_ALL", "LC_MESSAGES", "LANG" };
     for (unsigned i = 0; i < 3 && !out[0]; i++) sysutil_locale_code(getenv(vars[i]), out, n);
