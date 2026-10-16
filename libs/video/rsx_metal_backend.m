@@ -61,6 +61,7 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_msl.h"
 #include "rsx_texture_layout.h"
+#include "../../include/ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: encode / GPU wait / readback spans */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2360,9 +2361,11 @@ static void eng_shutdown(void* user)
     s_eng_active = 0;
 }
 
+static u32 s_ft_flush_reason;   /* PS3_FTRACE: why the commit in progress was asked for */
 static void eng_submit_and_wait(void* user, u32 reason)
 {
-    (void)user; (void)reason;
+    (void)user;
+    s_ft_flush_reason = reason;
     eng_encode_and_commit(nil);
 }
 
@@ -3205,15 +3208,18 @@ static int eng_record_targets_are(const EngRecord* r, const u32* rt, u32 nrt)
  * clears immediately ahead of it folded into its load actions. A clear whose
  * targets the following draw does not share becomes a pass of its own, which
  * is what keeps a mid-frame clear ordered against the draws around it. */
+static u32 s_ft_passes, s_ft_resolves, s_ft_copies;   /* PS3_FTRACE: per command buffer */
 static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
 {
     u32 i = 0;
+    s_ft_passes = s_ft_resolves = s_ft_copies = 0;
     while (i < s_eng_rec_count) {
         if (s_eng_rec[i].kind == ENG_REC_COLOR_COPY) {
             const EngRecord* r = &s_eng_rec[i++];
             id<MTLTexture> src = eng_obj(r->rt[0]);
             id<MTLTexture> dst = eng_obj(r->resolve_dst);
             if (!src || !dst) continue;
+            s_ft_copies++;
             id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
             [b copyFromTexture:src toTexture:dst];
             [b endEncoding];
@@ -3231,6 +3237,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
             id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
             if (!e) continue;
+            s_ft_resolves++;
             [e setRenderPipelineState:pso];
             [e setFragmentTexture:src atIndex:0];
             [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
@@ -3364,6 +3371,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             continue;
         }
         eng_bound_reset();
+        s_ft_passes++;
         while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
                eng_record_targets_are(&s_eng_rec[i], rt, nrt) &&
                (s_eng_rec[i].depth == depth ||
@@ -3450,7 +3458,10 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         const int windowed_present = (present_dst && !s_headless);
         u64 pt = eng_pt_now(), pt1;
         if (windowed_present) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
-        pt1 = eng_pt_now(); if (windowed_present) s_pt_ns[0] += pt1 - pt; pt = pt1;
+        pt1 = eng_pt_now(); if (windowed_present) s_pt_ns[0] += pt1 - pt;
+        if (windowed_present && PS3_FT_ON() && pt1 - pt >= ps3_ft_min_ns())
+            ps3_ft_span(PS3_FT_GPU_WAIT, 0, 2, 0, pt, pt1);
+        pt = pt1;
         if (present_dst) {
             if (s_headless) {
                 dst = s_offscreen;
@@ -3500,10 +3511,12 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
             }
         }
         pt = eng_pt_now();
+        const u32 ft_nrec = s_eng_rec_count;
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         eng_encode_records(cb, stage);
         if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
         if (drawable) [cb presentDrawable:drawable];
+        if (PS3_FT_ON()) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, pt, eng_pt_now());
         if (windowed_present) { pt1 = eng_pt_now(); s_pt_ns[2] += pt1 - pt; pt = pt1; }
         if (windowed_present) {
             dispatch_semaphore_t sem = s_inflight;
@@ -3519,8 +3532,18 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
             s_pt_n++;
             eng_pt_report();
         } else {
+            const u64 ft_w0 = PS3_FT_ON() ? eng_pt_now() : 0;
             [cb commit];
             [cb waitUntilCompleted];
+            if (ft_w0) {
+                const u64 w1 = eng_pt_now();
+                ps3_ft_span(PS3_FT_GPU_WAIT, 0, present_dst ? 1u : 0u,
+                            present_dst ? 0u : s_ft_flush_reason, ft_w0, w1);
+                const double gpu_s = [cb GPUEndTime] - [cb GPUStartTime];
+                if (gpu_s > 0)
+                    ps3_ft_span(PS3_FT_GPU_EXEC, s_ft_passes, s_ft_resolves | (s_ft_copies << 16),
+                                present_dst ? 1u : 0u, w1 - (u64)(gpu_s * 1e9), w1);
+            }
         }
 
 
@@ -3675,6 +3698,8 @@ static void eng_present(void* user, u32 surface)
     if (nrec > 1000) eng_dump_surfaces();   /* world frames only */
 }
 
+static void eng_readback_body(id<MTLTexture> t, u32 x, u32 y, u32 w, u32 h,
+                              void* out, u32 out_pitch);
 static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
                          void* out, u32 out_pitch)
 {
@@ -3682,6 +3707,14 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
     id<MTLTexture> t = eng_obj(surface);
     if (!t || !out || !out_pitch || !w || !h) return;
     if (x + w > [t width] || y + h > [t height]) return;
+    const u64 ft_t0 = PS3_FT_ON() ? eng_pt_now() : 0;
+    eng_readback_body(t, x, y, w, h, out, out_pitch);
+    if (ft_t0) ps3_ft_span(PS3_FT_READBACK, 0, w, h, ft_t0, eng_pt_now());
+}
+
+static void eng_readback_body(id<MTLTexture> t, u32 x, u32 y, u32 w, u32 h,
+                              void* out, u32 out_pitch)
+{
     if ([t storageMode] != MTLStorageModePrivate) {
         [t getBytes:out bytesPerRow:out_pitch
          fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
@@ -3932,7 +3965,12 @@ void rsx_metal_backend_present(void)
     /* Under the draw engine the frame belongs to it: a host that drives the
      * flip itself (the harness, the boot smoke title) calls here, and a title
      * whose FIFO carries 0xE944 presents through the engine's own sink. */
-    if (s_eng_active) { rsx_draw_engine_present(); return; }
+    if (s_eng_active) {
+        const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+        rsx_draw_engine_present();
+        if (ft_t0) ps3_ft_span(PS3_FT_PRESENT, 0, 0, 0, ft_t0, ps3_ft_now());
+        return;
+    }
     /* Block only when MTL_MAX_INFLIGHT frames are already queued. */
     if (!s_headless) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
     @autoreleasepool {
