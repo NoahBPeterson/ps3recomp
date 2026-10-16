@@ -773,15 +773,24 @@ unsigned long long ps3_ms_now(void)
 #ifdef _WIN32
     return (unsigned long long)GetTickCount64();
 #else
-    return 0;
+    /* Returned 0, which silently disabled every timeout built on it
+     * (GCM_PARK_GRACE_MS, GCM_SEMA_ACQUIRE_MS) and the rate logs. */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
 #endif
 }
 
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
+static int s_sema_blocked_pass = 0;   /* this drain stopped on a semaphore acquire */
+static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park */
 /* Backlog past which the drain stops honouring one-flip-per-tick and
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
 #define GCM_FIFO_CATCHUP_BYTES 0x10000u
+/* How long a self-JUMP park may stand with `put` somewhere else before the
+ * drain gives up on it being patched and follows `put` instead. */
+#define GCM_PARK_GRACE_MS 50ull
 /* How close `current` must get to `end` before the runtime will recycle a ring
  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
  * title that is merely near the end from being touched. */
@@ -1332,8 +1341,12 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 
 static void gcm_fifo_dump_around(u32 getoff)
 {
+    /* Only ever called on a recovery (bad branch, stuck get), and capped, so
+     * it no longer hides behind GCM_RECDBG: the words the walker stopped on
+     * are the one thing a run that wedged once in three can still tell us,
+     * and GCM_RECDBG is far too loud to leave on for a 15-minute run. */
     static int d = 0;
-    if (!getenv("GCM_RECDBG") || d++ >= 3) return;
+    if (d++ >= 3) return;
     for (u32 t = 0; t < GCM_TRACE_N; t++) {
         u32 k = (s_tr_i + t) % GCM_TRACE_N;
         if (!s_tr_w[k]) continue;
@@ -1690,8 +1703,33 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    * park standing -- it only patches a park when it reuses that
                    * block. Waiting for a patch that will not come freezes the
                    * FIFO for the rest of the run, so follow the write head. */
-                  if (put != s_fifo_getoff) { gcm_fifo_dump_around(s_fifo_getoff);
-                                              gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put); }
+                  /* ...but not at once. A title that links its segments by
+                   * patching the park moves `put` first and patches second:
+                   * inFAMOUS 2 ends each of its main-memory command blocks in
+                   * a park, writes the next commands at the ring start, sets
+                   * put, and only then rewrites the park as a JUMP to them. A
+                   * drain that lands between the two saw put elsewhere, went
+                   * straight to it, and dropped everything from the ring
+                   * start to put -- the frame's fence with it, so the title
+                   * waited on that label for the rest of the run. Give the
+                   * patch time to arrive, and resync only for a park that
+                   * has stood with the same put for longer than any title
+                   * takes between the two stores. */
+                  if (put != s_fifo_getoff) {
+                      extern unsigned long long ps3_ms_now(void);
+                      static u32 park_off, park_put;
+                      static unsigned long long park_since;
+                      const unsigned long long now = ps3_ms_now();
+                      if (park_off != s_fifo_getoff || park_put != put) {
+                          park_off = s_fifo_getoff; park_put = put; park_since = now;
+                      } else if (now - park_since >= GCM_PARK_GRACE_MS) {
+                          park_off = 0;
+                          gcm_fifo_dump_around(s_fifo_getoff);
+                          gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
+                      }
+                  }
+                  why = "parked";
+                  s_park_pass = 1;
                   break;
               }
               s_fifo_getoff = tgt; }
@@ -1763,12 +1801,29 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * the hardware does. Off by default: a title whose label nothing
              * ever writes would wedge the drain permanently, and RELEASE on
              * its own is the half that unblocks a waiting guest. */
-            static int blk = -1;
-            if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0; }
-            if (blk) { sem_blocked = 1; break; }
+            static int blk = -1; static unsigned blk_ms;
+            if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0;
+                           const char* t = getenv("GCM_SEMA_ACQUIRE_MS"); blk_ms = t ? (unsigned)atoi(t) : 0; }
+            if (blk) {
+                /* GCM_SEMA_ACQUIRE_MS=<ms>: a bounded wait. The hardware waits
+                 * for ever; an emulated producer that never comes (a boot-time
+                 * label nobody services yet) would wedge the drain, so after
+                 * <ms> on the same acquire it is consumed and said so. inFAMOUS 2
+                 * acquires a label its SPU lighting writes each frame: waiting
+                 * here is what orders the RSX's sampling after that write. */
+                static u32 b_off, b_val; static unsigned long long b_t0;
+                extern unsigned long long ps3_ms_now(void);
+                const unsigned long long now = ps3_ms_now();
+                if (!b_t0 || b_off != s_sema_offset || b_val != v) { b_off = s_sema_offset; b_val = v; b_t0 = now; }
+                if (!blk_ms || now - b_t0 < blk_ms) { sem_blocked = 1; break; }
+                { static int tn; if (tn++ < 12)
+                    fprintf(stderr, "[SEMA] acquire off=0x%X == 0x%08X gave up after %u ms (label 0x%08X)\n",
+                            s_sema_offset, v, blk_ms, vm_read32(la)); }
+                b_t0 = 0;
+            }
         }
                 }
-                if (sem_blocked) break;
+                if (sem_blocked) { s_sema_blocked_pass = 1; break; }
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
@@ -1964,8 +2019,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
           }
       } else burned = 0; }
 
+    /* A drain stopped on a semaphore acquire (GCM_SEMA_ACQUIRE) holds `get`
+     * on purpose: that is the wait, not a stuck walker, and the acquire's own
+     * bound (GCM_SEMA_ACQUIRE_MS) is what ends it. So is a self-JUMP park,
+     * which GCM_PARK_GRACE_MS ends. This counter counts drain passes, not
+     * time: both stop every pass at the same `get`, so it fired a few
+     * milliseconds in and resynced to put. For a park that is before the
+     * title has patched it into a JUMP to the commands it just wrote at the
+     * ring start, and the resync dropped them: inFAMOUS 2 stopped presenting
+     * for good that way in about one New Marais run in five ("stuck-get" at a
+     * self-jump with no "jump-park" before it). */
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
-      if (s_fifo_getoff == last && s_fifo_getoff != put) {
+      if (s_sema_blocked_pass || s_park_pass) {
+          stuck = 0; last = s_fifo_getoff; s_sema_blocked_pass = 0; s_park_pass = 0; }
+      else if (s_fifo_getoff == last && s_fifo_getoff != put) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
       } else { stuck = 0; last = s_fifo_getoff; } }
