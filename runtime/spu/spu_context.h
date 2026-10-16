@@ -182,6 +182,10 @@ typedef struct spu_channel {
 /* ---------------------------------------------------------------------------
  * SPU execution context
  * -----------------------------------------------------------------------*/
+/* Independently streamed code buffers resident at once (a job batch can stage
+ * eight or nine relocatable modules beside the policy module). */
+#define SPU_RESIDENT_CODE_SLOTS 16
+
 typedef struct spu_context {
     /* 128 general-purpose 128-bit registers */
     SPU_ALIGN16 u128 gpr[128];
@@ -322,10 +326,18 @@ typedef struct spu_context {
     void (*tramp_fn)(struct spu_context*);
     /* Independently streamed code buffers can coexist with the policy overlay.
      * Each mapping records which translated image owns that local-store span. */
+    /* reloc: the image was lifted at LS 0 (spu_overlay_register_region_reloc)
+     * and runs wherever the GET put it; dispatch looks its functions up at
+     * pc - lsa and sets code_base = lsa for the lifted code. */
     struct {
         uint32_t lsa, size, source_ea;
         int image_id;
-    } resident_code[4];
+        uint32_t reloc;
+    } resident_code[SPU_RESIDENT_CODE_SLOTS];
+    /* Load address of the relocatable lift now running (see resident_code).
+     * Code lifted with spu_lifter.py --relocatable adds it to every LS
+     * address it derives from its own position. */
+    uint32_t code_base;
 
     /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
      * for co-resident tasks. A taskset may hold several tasks that all lift at the

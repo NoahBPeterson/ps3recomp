@@ -60,15 +60,18 @@ void spu_indirect_branch_mt(spu_context* ctx)
          * stale bytes and must lose. */
         spu_dispatch_fn fn = 0;
         int owned = 0;
-        for (unsigned slot = 0; slot < 4; ++slot)
+        for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
             if (ctx->resident_code[slot].image_id &&
                 pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
-                fn = spu_lookup(pc, ctx->resident_code[slot].image_id); owned = 1; break;
+                if (!ctx->resident_code[slot].reloc) fn = spu_lookup(pc, ctx->resident_code[slot].image_id);
+                else if ((fn = spu_lookup(pc - ctx->resident_code[slot].lsa, ctx->resident_code[slot].image_id)))
+                    ctx->code_base = ctx->resident_code[slot].lsa;
+                owned = 1; break;
             }
         if (!owned && ctx->resident_ovl) fn = spu_lookup(pc, ctx->resident_ovl);
         if (!owned && !fn) fn = spu_lookup(pc, ctx->image_id);
-        for (unsigned slot = 0; slot < 4 && !fn; ++slot)   /* resident module code outside its image */
-            if (ctx->resident_code[slot].image_id) fn = spu_lookup(pc, ctx->resident_code[slot].image_id);
+        for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS && !fn; ++slot)   /* resident module code outside its image */
+            if (ctx->resident_code[slot].image_id && !ctx->resident_code[slot].reloc) fn = spu_lookup(pc, ctx->resident_code[slot].image_id);
         if (fn) {
             ctx->pc = pc;
             __attribute__((musttail)) return fn(ctx);

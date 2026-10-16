@@ -458,15 +458,18 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             uint32_t pc = ctx->pc & SPU_LS_MASK;
             spu_drain_fn fn = 0;
             int owned = 0;
-            for (unsigned slot = 0; slot < 4; ++slot)
+            for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
                 if (ctx->resident_code[slot].image_id &&
                     pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
-                    fn = spu_lookup(pc, ctx->resident_code[slot].image_id); owned = 1; break;
+                    if (!ctx->resident_code[slot].reloc) fn = spu_lookup(pc, ctx->resident_code[slot].image_id);
+                    else if ((fn = spu_lookup(pc - ctx->resident_code[slot].lsa, ctx->resident_code[slot].image_id)))
+                        ctx->code_base = ctx->resident_code[slot].lsa;
+                    owned = 1; break;
                 }
             if (!owned && ctx->resident_ovl) fn = spu_lookup(pc, ctx->resident_ovl);
             if (!owned && !fn) fn = spu_lookup(pc, ctx->image_id);
-            for (unsigned slot = 0; slot < 4 && !fn; ++slot)   /* resident module code outside its image */
-                if (ctx->resident_code[slot].image_id) fn = spu_lookup(pc, ctx->resident_code[slot].image_id);
+            for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS && !fn; ++slot)   /* resident module code outside its image */
+                if (ctx->resident_code[slot].image_id && !ctx->resident_code[slot].reloc) fn = spu_lookup(pc, ctx->resident_code[slot].image_id);
             if (fn) {
                 { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8)
                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
