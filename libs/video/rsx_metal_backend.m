@@ -2181,9 +2181,12 @@ static NSString* const kEngHelperMSL = @
 "}\n"
 "fragment float4 eng_depth_rgba8_fs(BOut i [[stage_in]],\n"
 "                                   depth2d<float> src [[texture(0)]],\n"
+"                                   texture2d<uint> st [[texture(1)]],\n"
 "                                   sampler s [[sampler(0)]]) {\n"
 "    uint v = uint(clamp(src.sample(s, i.uv), 0.0, 1.0) * 16777215.0);\n"
-"    return float4(float((v >> 8) & 255u), float(v & 255u), 0.0, float((v >> 16) & 255u)) / 255.0;\n"
+"    /* Z24S8 as A8R8G8B8: A = Z[23:16], R = Z[15:8], G = Z[7:0], B = stencil. */\n"
+"    uint sv = st.read(uint2(i.pos.xy)).x;\n"
+"    return float4(float((v >> 8) & 255u), float(v & 255u), float(sv & 255u), float((v >> 16) & 255u)) / 255.0;\n"
 "}\n";
 
 static u32 eng_obj_add(id<MTLTexture> t)
@@ -2465,8 +2468,10 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
                                                            width:w height:h
                                                        mipmapped:NO];
     /* ShaderRead as well as RenderTarget: depth-as-texture resolves through a
-     * pass that samples this as a depth2d, so it cannot be write-only. */
-    td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+     * pass that samples this as a depth2d, so it cannot be write-only.
+     * PixelFormatView: the same resolve reads the stencil through an
+     * X32_Stencil8 view of it. */
+    td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
     td.storageMode = MTLStorageModePrivate;
     return eng_obj_add([s_dev newTextureWithDescriptor:td]);
 }
@@ -3233,6 +3238,17 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             if (!e) continue;
             [e setRenderPipelineState:pso];
             [e setFragmentTexture:src atIndex:0];
+            if (r->clear_flags) {
+                /* The stencil half of the same target, one view per depth texture. */
+                static struct { u32 depth; id<MTLTexture> view; } sv[32]; static u32 nsv;
+                id<MTLTexture> view = nil;
+                for (u32 k = 0; k < nsv; k++) if (sv[k].depth == r->depth && eng_obj(sv[k].depth) == src) { view = sv[k].view; break; }
+                if (!view) {
+                    view = [src newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
+                    if (view) { const u32 k = nsv < 32 ? nsv++ : (r->depth % 32); sv[k].depth = r->depth; sv[k].view = view; }
+                }
+                [e setFragmentTexture:(view ? view : src) atIndex:1];
+            }
             [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             [e endEncoding];

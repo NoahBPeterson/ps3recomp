@@ -2126,8 +2126,17 @@ static void sink_end(void* user, const rsx_dispatch* r)
         ds.ns_rest += eng_ds_now() - ds_t0;
     }
 
-    if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write)
+    if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
         g.zdepths[zslot].had_write = 1;
+        /* A published depth image is only good until the next depth write,
+         * as after a clear: a reader later in the stream resolves again.
+         * Kept across writes, inFAMOUS 2's occlusion volumes (drawn after its
+         * G-buffer) sampled a snapshot an earlier reader had frozen and
+         * reconstructed positions from the wrong depth: flat dark boxes
+         * round props and characters. */
+        g.zdepths[zslot].snapshot_valid = 0;
+        g.zdepths[zslot].snapshot_rgba_valid = 0;
+    }
 }
 
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
