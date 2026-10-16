@@ -257,6 +257,57 @@ s32 cellSysutilCheckCallback(void)
  * near the guest's variable, and nothing on the way says a word.
  *
  * A u32 cannot be passed a host pointer by accident. */
+/* PS3_LANG: the console language the title is told (dub, subtitles, menus).
+ * A CELL_SYSUTIL_LANG_* number or a code: en, en-gb, ja, fr, es, de, it, nl,
+ * pt (Portugal), pt-br, ru, ko, zh-t, zh-s, fi, sv, da, no, pl, tr. Unset or
+ * unknown: English (US), the old fixed answer. A title only switches if its
+ * data carries that language. */
+static int sysutil_ieq(const char* a, const char* b)
+{
+    for (; *a && *b; a++, b++) {
+        char x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = (char)(y - 'A' + 'a');
+        if (x != y) return 0;
+    }
+    return *a == *b;
+}
+
+static s32 sysutil_language(void)
+{
+    static s32 lang = -1;
+    if (lang >= 0) return lang;
+    static const struct { const char* code; s32 id; } k[] = {
+        {"ja", CELL_SYSUTIL_LANG_JAPANESE}, {"en", CELL_SYSUTIL_LANG_ENGLISH_US},
+        {"en-us", CELL_SYSUTIL_LANG_ENGLISH_US}, {"fr", CELL_SYSUTIL_LANG_FRENCH},
+        {"es", CELL_SYSUTIL_LANG_SPANISH}, {"de", CELL_SYSUTIL_LANG_GERMAN},
+        {"it", CELL_SYSUTIL_LANG_ITALIAN}, {"nl", CELL_SYSUTIL_LANG_DUTCH},
+        {"pt", CELL_SYSUTIL_LANG_PORTUGUESE_PT}, {"pt-pt", CELL_SYSUTIL_LANG_PORTUGUESE_PT},
+        {"ru", CELL_SYSUTIL_LANG_RUSSIAN}, {"ko", CELL_SYSUTIL_LANG_KOREAN},
+        {"zh-t", CELL_SYSUTIL_LANG_CHINESE_T}, {"zh-s", CELL_SYSUTIL_LANG_CHINESE_S},
+        {"fi", CELL_SYSUTIL_LANG_FINNISH}, {"sv", CELL_SYSUTIL_LANG_SWEDISH},
+        {"da", CELL_SYSUTIL_LANG_DANISH}, {"no", CELL_SYSUTIL_LANG_NORWEGIAN},
+        {"pl", CELL_SYSUTIL_LANG_POLISH}, {"pt-br", CELL_SYSUTIL_LANG_PORTUGUESE_BR},
+        {"en-gb", CELL_SYSUTIL_LANG_ENGLISH_GB}, {"tr", CELL_SYSUTIL_LANG_TURKISH},
+    };
+    lang = CELL_SYSUTIL_LANG_ENGLISH_US;
+    const char* e = getenv("PS3_LANG");
+    if (e && *e) {
+        char* end = NULL;
+        long n = strtol(e, &end, 10);
+        if (end && *end == '\0' && n >= 0 && n <= CELL_SYSUTIL_LANG_TURKISH) lang = (s32)n;
+        else {
+            unsigned i;
+            for (i = 0; i < sizeof k / sizeof k[0]; i++)
+                if (sysutil_ieq(e, k[i].code)) { lang = k[i].id; break; }
+            if (i == sizeof k / sizeof k[0])
+                printf("[cellSysutil] PS3_LANG=%s not recognised, using English\n", e);
+        }
+    }
+    printf("[cellSysutil] system language %d\n", (int)lang);
+    return lang;
+}
+
 s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
 {
     if (!value_ea)
@@ -265,7 +316,7 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
     s32 v = 0;
     switch (id) {
     case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:
-        v = CELL_SYSUTIL_LANG_ENGLISH_US;
+        v = sysutil_language();
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
         v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
