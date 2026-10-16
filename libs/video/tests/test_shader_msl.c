@@ -48,6 +48,18 @@ static void check(const char* what, const char* text, const char* needle)
     }
 }
 
+static void check_absent(const char* what, const char* text, const char* needle)
+{
+    if (text && !strstr(text, needle)) {
+        printf("[PASS] %s -- no \"%s\"\n", what, needle);
+        g_pass++;
+    } else {
+        printf("[FAIL] %s -- unexpected \"%s\"\n", what, needle);
+        if (!g_verbose && text) printf("----\n%s\n----\n", text);
+        g_fail++;
+    }
+}
+
 static void check_count(const char* what, int got, int want)
 {
     if (got == want) { printf("[PASS] %s: %d instruction(s)\n", what, got); g_pass++; }
@@ -233,6 +245,24 @@ int main(int argc, char** argv)
             check("cube TEX FP MSL", g_msl, "texturecube");
             check("cube TEX FP MSL", g_msl, "[[texture(0)]]");
             check("cube TEX FP MSL", g_msl, "[[sampler(0)]]");
+        }
+    }
+
+    /* ---- fragment program: TEX r0, TC0 with perspective_corr --------------
+     * SRC2 bit 31 scales the texcoord by 1/w. Through glslang SV_POSITION.w
+     * becomes FragCoord.w, which is already 1/w, so the helper must resolve
+     * to the bare .w here (RSX_FRAGCOORD_W_IS_RCP) -- a division would undo
+     * the correction and inFAMOUS 2's river would sample outside its copy. */
+    {
+        u8 fp[16];
+        rsx_test_fp_tex_r0_tc0(fp, 0);
+        rsx_test_fp_put_word(fp + 12, 1u << 31);
+        check_count("persp TEX FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                                 g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("persp TEX FP HLSL", g_hlsl, "(input.tc0 * _rsx_inv_w(input.position))");
+        if (translate("persp TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("persp TEX FP MSL", g_msl, "gl_FragCoord.w");
+            check_absent("persp TEX FP MSL", g_msl, "1.0 / gl_FragCoord.w");
         }
     }
 
