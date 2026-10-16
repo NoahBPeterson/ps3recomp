@@ -1742,6 +1742,14 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
 /* Texture units the current guest fragment program samples: a unit can stay
  * enabled with a stale binding (a shadow pass keeps its own map bound), and a
  * snapshot is only worth taking for one the program reads. */
+/* PS3RECOMP_ENG_BIND_UNREAD=1 binds every enabled unit again, read or not (A/B). */
+static int eng_bind_unread(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("PS3RECOMP_ENG_BIND_UNREAD") ? 1 : 0;
+    return on;
+}
+
 static u32 eng_fp_tex_mask(void)
 {
     const eng_fp_memo* fp = NULL;
@@ -1755,10 +1763,16 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES])
 {
     u32 mask = 0;
+    const u32 fp_reads = eng_bind_unread() ? 0xFFFFu : eng_fp_tex_mask();
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
-        if (!t.enabled) continue;
+        /* A unit left enabled by an earlier draw but not sampled by this
+         * program is skipped, as upstream's sink_bind_textures does: binding
+         * it costs a cache check and a hash or an upload, and a unit left on
+         * the depth buffer a depth resolve -- a render-pass break and a
+         * full-screen decode. */
+        if (!t.enabled || !(fp_reads >> u & 1u)) continue;
         mask |= 1u << u;
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
 
