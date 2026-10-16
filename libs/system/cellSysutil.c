@@ -11,6 +11,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>   /* the host UI language */
+#endif
 
 /* Guest-memory stores — out-params from the recompiled title are guest VM
  * addresses, not host pointers. */
@@ -257,11 +260,12 @@ s32 cellSysutilCheckCallback(void)
  * near the guest's variable, and nothing on the way says a word.
  *
  * A u32 cannot be passed a host pointer by accident. */
-/* PS3_LANG: the console language the title is told (dub, subtitles, menus).
- * A CELL_SYSUTIL_LANG_* number or a code: en, en-gb, ja, fr, es, de, it, nl,
- * pt (Portugal), pt-br, ru, ko, zh-t, zh-s, fi, sv, da, no, pl, tr. Unset or
- * unknown: English (US), the old fixed answer. A title only switches if its
- * data carries that language. */
+/* The console language the title is told (dub, subtitles, menus), in order:
+ * PS3_LANG if set -- a CELL_SYSUTIL_LANG_* number or a code: en, en-gb, ja,
+ * fr, es, de, it, nl, pt (Portugal), pt-br, ru, ko, zh-t, zh-s, fi, sv, da,
+ * no, pl, tr; else the host's UI language (Windows: the user's UI LANGID;
+ * elsewhere LC_ALL, LC_MESSAGES, LANG); else English (US), the old fixed
+ * answer. A title only switches if its data carries that language. */
 static int sysutil_ieq(const char* a, const char* b)
 {
     for (; *a && *b; a++, b++) {
@@ -271,6 +275,76 @@ static int sysutil_ieq(const char* a, const char* b)
         if (x != y) return 0;
     }
     return *a == *b;
+}
+
+/* "pt_BR.UTF-8" -> "pt-br", "zh_TW" -> "zh-t", "nb_NO" -> "no", "fr_FR" -> "fr";
+ * "C"/"POSIX"/empty -> "" (no preference). */
+static void sysutil_locale_code(const char* loc, char* out, size_t n)
+{
+    out[0] = 0;
+    if (!loc || !*loc || !strcmp(loc, "C") || !strcmp(loc, "POSIX") || n < 6) return;
+    char ll[4] = {0}, cc[4] = {0};
+    size_t i = 0;
+    for (; i < 3 && loc[i] && loc[i] != '_' && loc[i] != '-' && loc[i] != '.' && loc[i] != '@'; i++)
+        ll[i] = (char)((loc[i] >= 'A' && loc[i] <= 'Z') ? loc[i] - 'A' + 'a' : loc[i]);
+    if (loc[i] == '_' || loc[i] == '-') {
+        size_t j = 0;
+        for (i++; j < 3 && loc[i] && loc[i] != '.' && loc[i] != '@'; i++, j++)
+            cc[j] = (char)((loc[i] >= 'A' && loc[i] <= 'Z') ? loc[i] - 'A' + 'a' : loc[i]);
+    }
+    if (!strcmp(ll, "c") || !strcmp(ll, "pos")) { out[0] = 0; return; }   /* C.UTF-8, POSIX */
+    if (!strcmp(ll, "zh")) {
+        snprintf(out, n, "%s", (!strcmp(cc, "tw") || !strcmp(cc, "hk") || !strcmp(cc, "mo")) ? "zh-t" : "zh-s");
+    } else if (!strcmp(ll, "nb") || !strcmp(ll, "nn")) {
+        snprintf(out, n, "no");
+    } else if ((!strcmp(ll, "pt") && !strcmp(cc, "br")) || (!strcmp(ll, "en") && !strcmp(cc, "gb"))) {
+        snprintf(out, n, "%s-%s", ll, cc);
+    } else {
+        snprintf(out, n, "%s", ll);
+    }
+}
+
+/* The host's UI language as a PS3_LANG code, or "" when it has none. */
+static void sysutil_host_language(char* out, size_t n)
+{
+    out[0] = 0;
+#ifdef _WIN32
+    const LANGID id = GetUserDefaultUILanguage();
+    const unsigned prim = id & 0x3FFu, sub = (unsigned)id >> 10;
+    static const struct { unsigned prim; const char* code; } w[] = {
+        {0x11, "ja"}, {0x09, "en"}, {0x0C, "fr"}, {0x0A, "es"}, {0x07, "de"},
+        {0x10, "it"}, {0x13, "nl"}, {0x16, "pt"}, {0x19, "ru"}, {0x12, "ko"},
+        {0x04, "zh"}, {0x0B, "fi"}, {0x1D, "sv"}, {0x06, "da"}, {0x14, "no"},
+        {0x15, "pl"}, {0x1F, "tr"},
+    };
+    for (unsigned i = 0; i < sizeof w / sizeof w[0]; i++)
+        if (w[i].prim == prim) { snprintf(out, n, "%s", w[i].code); break; }
+    if (prim == 0x09 && sub == 0x02) snprintf(out, n, "en-gb");          /* English (UK) */
+    if (prim == 0x16 && sub == 0x01) snprintf(out, n, "pt-br");          /* Portuguese (Brazil) */
+    if (prim == 0x04) snprintf(out, n, (sub == 0x01 || sub == 0x03 || sub == 0x05) ? "zh-t" : "zh-s");
+#else
+    const char* vars[] = { "LC_ALL", "LC_MESSAGES", "LANG" };
+    for (unsigned i = 0; i < 3 && !out[0]; i++) sysutil_locale_code(getenv(vars[i]), out, n);
+#ifdef __APPLE__
+    /* An app started from the Finder has no LANG: ask for the user's first
+     * preferred language ("pt-BR", "en-GB", "zh-Hant-TW"...). */
+    if (!out[0]) {
+        CFArrayRef langs = CFLocaleCopyPreferredLanguages();
+        if (langs) {
+            if (CFArrayGetCount(langs) > 0) {
+                char buf[32];
+                CFStringRef l = (CFStringRef)CFArrayGetValueAtIndex(langs, 0);
+                if (CFStringGetCString(l, buf, sizeof buf, kCFStringEncodingUTF8)) {
+                    if (!strncmp(buf, "zh-Hant", 7)) snprintf(out, n, "zh-t");
+                    else if (!strncmp(buf, "zh-Hans", 7)) snprintf(out, n, "zh-s");
+                    else sysutil_locale_code(buf, out, n);
+                }
+            }
+            CFRelease(langs);
+        }
+    }
+#endif
+#endif
 }
 
 static s32 sysutil_language(void)
@@ -292,19 +366,25 @@ static s32 sysutil_language(void)
     };
     lang = CELL_SYSUTIL_LANG_ENGLISH_US;
     const char* e = getenv("PS3_LANG");
+    const char* from = "default";
     if (e && *e) {
         char* end = NULL;
         long n = strtol(e, &end, 10);
-        if (end && *end == '\0' && n >= 0 && n <= CELL_SYSUTIL_LANG_TURKISH) lang = (s32)n;
+        if (end && *end == '\0' && n >= 0 && n <= CELL_SYSUTIL_LANG_TURKISH) { lang = (s32)n; from = "PS3_LANG"; }
         else {
             unsigned i;
             for (i = 0; i < sizeof k / sizeof k[0]; i++)
-                if (sysutil_ieq(e, k[i].code)) { lang = k[i].id; break; }
+                if (sysutil_ieq(e, k[i].code)) { lang = k[i].id; from = "PS3_LANG"; break; }
             if (i == sizeof k / sizeof k[0])
                 printf("[cellSysutil] PS3_LANG=%s not recognised, using English\n", e);
         }
+    } else {
+        char host[8];
+        sysutil_host_language(host, sizeof host);
+        for (unsigned i = 0; host[0] && i < sizeof k / sizeof k[0]; i++)
+            if (sysutil_ieq(host, k[i].code)) { lang = k[i].id; from = "host"; break; }
     }
-    printf("[cellSysutil] system language %d\n", (int)lang);
+    printf("[cellSysutil] system language %d (%s)\n", (int)lang, from);
     return lang;
 }
 
