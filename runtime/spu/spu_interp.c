@@ -495,7 +495,7 @@ static void spu_xfer_log(const spu_context* ctx, const char* kind, uint32_t from
     if (s_left < 0) { const char* e = getenv("SPU_INTERP_XFER_LOG"); s_left = e ? atol(e) : 0; }
     if (s_left <= 0 || s_left-- <= 0) return;
     int owner = ctx->image_id, slot_hit = -1;
-    for (unsigned k = 0; k < 4; ++k)
+    for (unsigned k = 0; k < SPU_RESIDENT_CODE_SLOTS; ++k)
         if (ctx->resident_code[k].image_id && to - ctx->resident_code[k].lsa < ctx->resident_code[k].size) {
             owner = ctx->resident_code[k].image_id; slot_hit = (int)k; break; }
     uint32_t w = ((uint32_t)ctx->ls[to] << 24) | ((uint32_t)ctx->ls[to+1] << 16) |

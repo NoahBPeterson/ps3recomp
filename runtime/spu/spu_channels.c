@@ -1644,6 +1644,14 @@ static void spu_report_cross_image(uint32_t addr, int want, int got)
             "issue #59.\n", addr, want, got);
 }
 
+/* Images lifted relative to their load address (spu_overlay_register_region_reloc):
+ * their registry addresses are offsets, so they answer only for their own id. */
+static unsigned char s_reloc_img[4096];
+static int spu_image_is_reloc(int image_id)
+{
+    return image_id > 0 && image_id < 4096 && s_reloc_img[image_id];
+}
+
 spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-path dispatch (spu_dispatch_mt.c) needs it */
 {
     /* Match the context's active image; image_id 0 (context or entry) matches
@@ -1651,7 +1659,8 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
     for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
         const spu_reg_entry* e = &s_registry[n - 1];
         if (e->addr == addr &&
-            (image_id == 0 || e->image_id == 0 || e->image_id == image_id)) {
+            (image_id == 0 || e->image_id == 0 || e->image_id == image_id) &&
+            (e->image_id == image_id || !spu_image_is_reloc(e->image_id))) {
             /* One compare on the return path; the report itself is rare. */
             if (e->image_id != image_id)
                 spu_report_cross_image(addr, image_id, e->image_id);
@@ -1672,7 +1681,7 @@ int spu_image_of_function(uint32_t addr)
 {
     for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
         const spu_reg_entry* e = &s_registry[n - 1];
-        if (e->addr == addr) return e->image_id;
+        if (e->addr == addr && !spu_image_is_reloc(e->image_id)) return e->image_id;
     }
     return -1;
 }
@@ -1694,16 +1703,20 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
      * spu_indirect_branch): the interpreter hands back to its lift as soon as
      * it reaches a lifted entry, instead of interpreting the whole job. */
     if (ctx) {
-        for (unsigned slot = 0; slot < 4; ++slot) {
+        for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
             int img = ctx->resident_code[slot].image_id;
-            if (img && lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
-                return (spu_lifted_fn)spu_lookup(lsa, img);
+            if (img && lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
+                if (!ctx->resident_code[slot].reloc) return (spu_lifted_fn)spu_lookup(lsa, img);
+                spu_lifted_fn rf = (spu_lifted_fn)spu_lookup(lsa - ctx->resident_code[slot].lsa, img);
+                if (rf) ((spu_context*)ctx)->code_base = ctx->resident_code[slot].lsa;
+                return rf;
+            }
         }
     }
     spu_lifted_fn f = (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
     if (ctx)   /* a resident module's code outside its image (see spu_indirect_branch) */
-        for (unsigned slot = 0; slot < 4 && !f; ++slot)
-            if (ctx->resident_code[slot].image_id)
+        for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS && !f; ++slot)
+            if (ctx->resident_code[slot].image_id && !ctx->resident_code[slot].reloc)
                 f = (spu_lifted_fn)spu_lookup(lsa, ctx->resident_code[slot].image_id);
     return f;
 }
@@ -1713,7 +1726,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
  * the image id its lifted functions were registered under. The MFC GET path
  * marks that overlay resident in the streaming context; dispatch retries a
  * primary-image miss against the resident overlay's registry. */
-typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span; uint32_t lift_lsa; } spu_ovl_src;
+typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span; uint32_t lift_lsa; int reloc; } spu_ovl_src;
 /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
  * the same job code buffer at LS 0x4000, dispatched by content signature). */
 #define SPU_OVL_SRC_MAX 128
@@ -1726,6 +1739,8 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         s_ovl_src[s_ovl_src_count].has_sig = 0;
+        s_ovl_src[s_ovl_src_count].lift_lsa = 0;
+        s_ovl_src[s_ovl_src_count].reloc = 0;
         s_ovl_src_count++;
     }
 }
@@ -1753,6 +1768,23 @@ void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t 
     if (s_ovl_src_count && s_ovl_src[s_ovl_src_count - 1].image_id == image_id &&
         s_ovl_src[s_ovl_src_count - 1].src_ea == content_ea)
         s_ovl_src[s_ovl_src_count - 1].lift_lsa = lsa;
+}
+
+/* A position-independent code region, lifted at LS 0 with spu_lifter.py
+ * --relocatable. A GET from content_ea makes it resident at whatever local-store
+ * address the GET targets; dispatch then resolves its functions at pc - lsa and
+ * hands the lift that address in spu_context.code_base. inFAMOUS 2's New Marais
+ * jobs stream such modules from the EBOOT to a different address on every run,
+ * which no fixed-address lift could ever match: they ran fully interpreted. */
+void spu_overlay_register_region_reloc(uint32_t content_ea, uint32_t span, int image_id)
+{
+    if (image_id <= 0 || image_id >= 4096) return;
+    spu_overlay_register_region(content_ea, span, image_id);
+    if (s_ovl_src_count && s_ovl_src[s_ovl_src_count - 1].image_id == image_id &&
+        s_ovl_src[s_ovl_src_count - 1].src_ea == content_ea) {
+        s_ovl_src[s_ovl_src_count - 1].reloc = 1;
+        s_reloc_img[image_id] = 1;
+    }
 }
 
 /* Register one-way runtime entries that replace the guest call stack.
@@ -1924,7 +1956,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
               fprintf(stderr, "[spu-get] img=%d pc=0x%05X ea=0x%08X -> LS 0x%05X size=0x%X\n",
                       ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ea, lsa, size); } } }
     spu_ovl_dump(ctx, ea, lsa, ls, size);
-    for (unsigned slot = 0; slot < 4; ++slot) {
+    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
         uint32_t end = base + ctx->resident_code[slot].size;
@@ -1966,7 +1998,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
             }
             if (!hit) continue;
             int have = 0;
-            for (unsigned slot = 0; slot < 4; ++slot)
+            for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
                 if (ctx->resident_code[slot].image_id == o->image_id &&
                     ctx->resident_code[slot].lsa == o->lift_lsa) have = 1;
             if (have) continue;
@@ -1975,13 +2007,14 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         if (hit) {
             if (o->span) {
                 if (lsa + o->span > SPU_LS_SIZE) return;
-                for (unsigned slot = 0; slot < 4; ++slot) {
+                for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
                         continue;
                     ctx->resident_code[slot].lsa = lsa;
                     ctx->resident_code[slot].size = o->span;
                     ctx->resident_code[slot].source_ea = ea;
                     ctx->resident_code[slot].image_id = o->image_id;
+                    ctx->resident_code[slot].reloc = (uint32_t)o->reloc;
                     { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 4)
                         fprintf(stderr, "[spu-ovl] img=%d code span src=0x%08X -> LS 0x%05X+0x%X resident as image %d (slot %u)\n",
                                 ctx->image_id, ea, lsa, o->span, o->image_id, slot); }
@@ -2212,7 +2245,7 @@ static int spu_smc_microstep(spu_context* ctx)
       if (s_dbg > 0 && pc >= 0x4000 && pc < 0x3F000) { s_dbg--;
         fprintf(stderr, "[micro-dbg] img=%d pc=0x%05X lr=0x%05X slots", ctx->image_id, pc,
                 ctx->gpr[0]._u32[0] & SPU_LS_MASK);
-        for (unsigned k = 0; k < 4; ++k)
+        for (unsigned k = 0; k < SPU_RESIDENT_CODE_SLOTS; ++k)
             fprintf(stderr, " {%d 0x%05X+0x%X}", ctx->resident_code[k].image_id,
                     ctx->resident_code[k].lsa, ctx->resident_code[k].size);
         fprintf(stderr, " ovl=%d lookup10=%p lookup11=%p\n", ctx->resident_ovl,
@@ -2448,7 +2481,7 @@ static __attribute__((noinline)) void spu_indirect_branch_slow(spu_context* ctx)
         int lifted = spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->image_id) ||
             (ctx->resident_task && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_task)) ||
             (ctx->resident_ovl  && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_ovl));
-        for (unsigned slot = 0; slot < 4 && !lifted; ++slot)
+        for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS && !lifted; ++slot)
             if (ctx->resident_code[slot].image_id &&
                 SPURS_TASKSET_PM_SYSCALL_LS - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
                 lifted = 1;
@@ -2555,11 +2588,13 @@ static __attribute__((noinline)) void spu_indirect_branch_slow(spu_context* ctx)
      * is 0 outside the region, so this only ever fires for genuine task code.) */
     spu_fn fn = NULL;
     int code_owner = 0;
-    for (unsigned slot = 0; slot < 4; ++slot) {
+    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
         if (ctx->resident_code[slot].image_id && ctx->pc >= ctx->resident_code[slot].lsa &&
             ctx->pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
             code_owner = ctx->resident_code[slot].image_id;
-            fn = spu_lookup(ctx->pc, code_owner);
+            if (!ctx->resident_code[slot].reloc) fn = spu_lookup(ctx->pc, code_owner);
+            else if ((fn = spu_lookup(ctx->pc - ctx->resident_code[slot].lsa, code_owner)))
+                ctx->code_base = ctx->resident_code[slot].lsa;
             break;
         }
     }
@@ -2573,8 +2608,8 @@ static __attribute__((noinline)) void spu_indirect_branch_slow(spu_context* ctx)
     /* A resident module's code outside its own image: the save/restore stub the
      * WWS policy module writes at the top of local store (LS 0x3FEC0) and calls
      * from its interrupt path. Its lift belongs to the module's image. */
-    for (unsigned slot = 0; slot < 4 && !fn; ++slot)
-        if (ctx->resident_code[slot].image_id)
+    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS && !fn; ++slot)
+        if (ctx->resident_code[slot].image_id && !ctx->resident_code[slot].reloc)
             fn = spu_lookup(ctx->pc, ctx->resident_code[slot].image_id);
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
@@ -3127,19 +3162,21 @@ void spu_indirect_branch(spu_context* ctx)
         }
         spu_fn fn = NULL;
         int code_owner = 0;
-        for (unsigned slot = 0; slot < 4; ++slot) {
+        for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
             if (ctx->resident_code[slot].image_id && pc >= ctx->resident_code[slot].lsa &&
                 pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
                 code_owner = ctx->resident_code[slot].image_id;
-                fn = spu_lookup(pc, code_owner);
+                if (!ctx->resident_code[slot].reloc) fn = spu_lookup(pc, code_owner);
+                else if ((fn = spu_lookup(pc - ctx->resident_code[slot].lsa, code_owner)))
+                    ctx->code_base = ctx->resident_code[slot].lsa;
                 break;
             }
         }
         if (!code_owner && rt) fn = spu_lookup(pc, rt);
         if (!code_owner && !fn && ctx->resident_ovl) fn = spu_lookup(pc, ctx->resident_ovl);
         if (!code_owner && !fn) fn = spu_lookup(pc, ctx->image_id);
-        for (unsigned slot = 0; slot < 4 && !fn; ++slot)
-            if (ctx->resident_code[slot].image_id)
+        for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS && !fn; ++slot)
+            if (ctx->resident_code[slot].image_id && !ctx->resident_code[slot].reloc)
                 fn = spu_lookup(pc, ctx->resident_code[slot].image_id);
         if (!fn) goto slow;
         ctx->pc = pc;
