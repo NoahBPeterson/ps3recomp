@@ -296,6 +296,8 @@ static void pad_poll_sdl2(void)
             /* Try to open newly connected controllers */
             if (SDL_IsGameController(i)) {
                 s_sdl_controllers[i] = SDL_GameControllerOpen(i);
+                fprintf(stderr, "[cellPad] SDL controller %d connected: %s\n", i,
+                        s_sdl_controllers[i] ? SDL_GameControllerName(s_sdl_controllers[i]) : "(open failed)");
             }
         }
 
@@ -372,6 +374,9 @@ static void pad_init_backend(void)
     /* Open any controllers already connected */
     int num = SDL_NumJoysticks();
     for (int i = 0; i < num && i < PAD_MAX_HOST_PORTS; i++) {
+        fprintf(stderr, "[cellPad] SDL joystick %d: %s (game controller: %s)\n", i,
+                SDL_JoystickNameForIndex(i) ? SDL_JoystickNameForIndex(i) : "?",
+                SDL_IsGameController(i) ? "yes" : "no");
         if (SDL_IsGameController(i)) {
             s_sdl_controllers[i] = SDL_GameControllerOpen(i);
         }
@@ -497,7 +502,68 @@ static void pad_poll_file(u16* out_btns, int* out_lx, int* out_ly, int* out_rx, 
  *   L1 U  R1 O  L2 Y  R2 P  L3 G  R3 H              START Return/Enter  SELECT Tab */
 volatile uint32_t g_pad_host_keys[4];
 static int pad_key(unsigned vk) { return (g_pad_host_keys[(vk >> 5) & 3] >> (vk & 31)) & 1; }
-static void pad_poll_keys(void)
+
+/* Mouse camera (macOS window). The window adds motion in 1/16 px to
+ * g_pad_mouse_dx/dy and keeps button bits in g_pad_mouse_buttons (1 left,
+ * 2 right, 4 middle). A stick is a rate, a mouse a displacement, so the right
+ * stick deflects in proportion to the mouse's speed since the last poll, with
+ * a light smoothing so a frame without motion events does not snap it home,
+ * and starts past the title's own dead zone so slow moves still turn.
+ *   PS3_MOUSE=0              off (keys I/J/K/L only)
+ *   PS3_MOUSE_SENS=<f>       speed multiplier (default 1.0)
+ *   PS3_MOUSE_INVERT_Y=1     moving the mouse up looks down
+ *   PS3_MOUSE_DEADZONE=<n>   first stick step past centre, 0-120 (default 30)
+ * Left button = R1 (bolt), right = R2 (grenade), middle = L1 (aim). */
+volatile int32_t  g_pad_mouse_dx, g_pad_mouse_dy;
+volatile uint32_t g_pad_mouse_buttons;
+static int pad_mouse_axis(float v, int dz)
+{
+    if (v > -0.5f && v < 0.5f) return 128;
+    float m = (v < 0 ? -v : v) + (float)dz;
+    if (m > 127.0f) m = 127.0f;
+    return v < 0 ? 128 - (int)(m + 0.5f) - (m >= 127.0f ? 1 : 0) : 128 + (int)(m + 0.5f);
+}
+static void pad_poll_mouse(u16* btns, int* rx, int* ry)
+{
+    static int on = -1, invert, dz; static float sens, sx, sy; static unsigned long long last;
+    if (on < 0) {
+        const char* e = getenv("PS3_MOUSE");        on = e ? atoi(e) != 0 : 1;
+        e = getenv("PS3_MOUSE_SENS");               sens = e ? (float)atof(e) : 1.0f;
+        if (!(sens > 0.0f)) sens = 1.0f;
+        e = getenv("PS3_MOUSE_INVERT_Y");           invert = e ? atoi(e) != 0 : 0;
+        e = getenv("PS3_MOUSE_DEADZONE");           dz = e ? atoi(e) : 30;
+        if (dz < 0) dz = 0; if (dz > 120) dz = 120;
+    }
+    if (!on) return;
+    const uint32_t b = g_pad_mouse_buttons;
+    if (b & 1u) *btns |= CELL_PAD_CTRL_R1;
+    if (b & 2u) *btns |= CELL_PAD_CTRL_R2;
+    if (b & 4u) *btns |= CELL_PAD_CTRL_L1;
+    const int32_t dx = __atomic_exchange_n(&g_pad_mouse_dx, 0, __ATOMIC_RELAXED);
+    const int32_t dy = __atomic_exchange_n(&g_pad_mouse_dy, 0, __ATOMIC_RELAXED);
+    const unsigned long long now = pad_now_ms();
+    unsigned long long dt = last ? now - last : 16;
+    last = now;
+    if (dt < 1) dt = 1;
+    if (dt > 100) dt = 100;                 /* a long gap is not one slow move */
+    /* px per ms; 1.5 px/ms (a brisk flick) reaches full deflection at SENS 1. */
+    const float k = 127.0f / 1.5f * sens;
+    const float vx = (float)dx / 16.0f / (float)dt * k;
+    const float vy = (float)dy / 16.0f / (float)dt * k * (invert ? -1.0f : 1.0f);
+    sx = sx * 0.35f + vx * 0.65f;
+    sy = sy * 0.35f + vy * 0.65f;
+    if (sx > -0.5f && sx < 0.5f) sx = 0.0f;
+    if (sy > -0.5f && sy < 0.5f) sy = 0.0f;
+    if (sx != 0.0f) *rx = pad_mouse_axis(sx, dz);
+    if (sy != 0.0f) *ry = pad_mouse_axis(sy, dz);   /* NSEvent deltaY > 0 = down, as the stick */
+    { static int logged; static int lrx = 128, lry = 128;
+      static uint32_t lb;
+      if (getenv("PS3_MOUSE_LOG") && logged < 400 && (*rx != lrx || *ry != lry || b != lb)) {
+          logged++; lrx = *rx; lry = *ry; lb = b;
+          printf("[cellPad] mouse: d=(%d,%d)/16 px in %llu ms -> rx=%d ry=%d buttons=0x%X\n",
+                 dx, dy, dt, *rx, *ry, b); fflush(stdout); } }
+}
+static void pad_poll_keys(int merge)
 {
     static const struct { unsigned vk; u16 btn; } map[] = {
         {0x7E, CELL_PAD_CTRL_UP}, {0x7D, CELL_PAD_CTRL_DOWN},
@@ -518,6 +584,7 @@ static void pad_poll_keys(void)
     int ly = 128 + (pad_key(0x01) ? 127 : 0) - (pad_key(0x0D) ? 128 : 0);   /* S, W */
     int rx = 128 + (pad_key(0x25) ? 127 : 0) - (pad_key(0x26) ? 128 : 0);   /* L, J */
     int ry = 128 + (pad_key(0x28) ? 127 : 0) - (pad_key(0x22) ? 128 : 0);   /* K, I */
+    pad_poll_mouse(&btns, &rx, &ry);   /* mouse motion wins over I/J/K/L while it moves */
     /* PS3_PAD_FILE: its buttons are held in addition to the keys; an
      * off-centre file axis wins over the keyboard's. */
     { u16 fb; int flx, fly, frx, fry;
@@ -528,6 +595,22 @@ static void pad_poll_keys(void)
       if (frx != 128) rx = frx;
       if (fry != 128) ry = fry; }
     PadHostState* hs = &s_host_state[0];
+    /* With a real pad on port 0 (SDL filled hs this poll), the keyboard and
+     * mouse add to it instead of being switched off: buttons are OR-ed, and
+     * an axis the keys or mouse move wins over the pad's. A paired DualSense
+     * that nobody was holding used to make every key do nothing. */
+    if (merge) {
+        btns |= hs->buttons;
+        if (lx == 128) lx = hs->analog_lx;
+        if (ly == 128) ly = hs->analog_ly;
+        if (rx == 128) rx = hs->analog_rx;
+        if (ry == 128) ry = hs->analog_ry;
+        const u8 l2 = hs->trigger_l2, r2 = hs->trigger_r2;
+        pad_apply(hs, btns, lx, ly, rx, ry);
+        if (l2 > hs->trigger_l2) hs->trigger_l2 = l2;   /* keep an analog trigger's own value */
+        if (r2 > hs->trigger_r2) hs->trigger_r2 = r2;
+        return;
+    }
     if (btns != hs->buttons) { printf("[cellPad] keyboard: buttons 0x%04X\n", btns); fflush(stdout); }
     pad_apply(hs, btns, lx, ly, rx, ry);
 }
@@ -553,9 +636,9 @@ static void pad_poll_backend(void)
 #ifdef _WIN32
     if (!s_host_state[0].connected) pad_poll_keyboard();
 #endif
-    { static int real0 = 0;
-      if (s_host_state[0].connected && !getenv("PS3_PAD_FILE")) real0 = 1;
-      if (!real0) pad_poll_keys(); }   /* keyboard, plus PS3_PAD_FILE if set */
+    /* Keyboard, mouse and PS3_PAD_FILE always count; with a real pad on port 0
+     * they are merged into it (pad_poll_keys). */
+    pad_poll_keys(s_host_state[0].connected);
 }
 
 /* ---------------------------------------------------------------------------

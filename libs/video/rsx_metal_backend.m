@@ -475,6 +475,8 @@ static int create_window_impl(const char* title)
     if (!s_window) return -1;
 
     [s_window setTitle:[NSString stringWithUTF8String:(title ? title : "ps3recomp")]];
+    /* Mouse-moved events are off by default; the mouse camera (cellPad.c) needs them. */
+    [s_window setAcceptsMouseMovedEvents:YES];
     [s_window center];
 
     s_layer = [CAMetalLayer layer];
@@ -3886,6 +3888,38 @@ static int pump_messages_impl(void)
                                                 inMode:NSDefaultRunLoopMode
                                                dequeue:YES];
             if (!ev) break;
+            /* The mouse drives the right stick and R1/R2 (cellPad.c). Motion
+             * accumulates as deltas in 1/16 px, which cellPad drains on each
+             * poll; buttons count only inside the game view, so dragging the
+             * title bar does not fire a bolt. The events still go to AppKit,
+             * which is what focuses the window on a click. */
+            {   extern volatile int32_t  g_pad_mouse_dx, g_pad_mouse_dy;
+                extern volatile uint32_t g_pad_mouse_buttons;
+                const NSEventType t = [ev type];
+                const int motion = (t == NSEventTypeMouseMoved || t == NSEventTypeLeftMouseDragged ||
+                                    t == NSEventTypeRightMouseDragged || t == NSEventTypeOtherMouseDragged);
+                /* Motion counts whenever the game window is key: a moved event
+                 * carries no window once the cursor leaves it, and the camera
+                 * should keep turning then. */
+                if (motion && s_window && [s_window isKeyWindow]) {
+                    __atomic_add_fetch(&g_pad_mouse_dx, (int32_t)lround([ev deltaX] * 16.0), __ATOMIC_RELAXED);
+                    __atomic_add_fetch(&g_pad_mouse_dy, (int32_t)lround([ev deltaY] * 16.0), __ATOMIC_RELAXED);
+                }
+                if (!motion && s_window && [ev window] == s_window && [s_window isKeyWindow]) {
+                    const NSPoint at = [ev locationInWindow];
+                    const int inside = NSPointInRect(at, [[s_window contentView] frame]);
+                    uint32_t bit = 0;
+                    if (t == NSEventTypeLeftMouseDown  || t == NSEventTypeLeftMouseUp)  bit = 1u;
+                    if (t == NSEventTypeRightMouseDown || t == NSEventTypeRightMouseUp) bit = 2u;
+                    if (t == NSEventTypeOtherMouseDown || t == NSEventTypeOtherMouseUp) bit = 4u;
+                    if (bit) {
+                        const int down = (t == NSEventTypeLeftMouseDown || t == NSEventTypeRightMouseDown ||
+                                          t == NSEventTypeOtherMouseDown);
+                        if (down && inside) __atomic_or_fetch(&g_pad_mouse_buttons, bit, __ATOMIC_RELAXED);
+                        if (!down)          __atomic_and_fetch(&g_pad_mouse_buttons, ~bit, __ATOMIC_RELAXED);
+                    }
+                }
+            }
             /* Keys drive the keyboard pad (cellPad.c): record and swallow
              * them -- unhandled, AppKit beeps on every press. */
             if ([ev type] == NSEventTypeKeyDown || [ev type] == NSEventTypeKeyUp) {
@@ -3903,6 +3937,8 @@ static int pump_messages_impl(void)
         if (![NSApp isActive]) {
             extern volatile uint32_t g_pad_host_keys[4];
             for (int i = 0; i < 4; i++) g_pad_host_keys[i] = 0;
+            extern volatile uint32_t g_pad_mouse_buttons;
+            g_pad_mouse_buttons = 0;
         }
         if (s_window && ![s_window isVisible]) s_closed = 1;
     }
