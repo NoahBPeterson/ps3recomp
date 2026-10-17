@@ -1592,6 +1592,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     /* Only a topology this engine rebuilds through an index buffer may share
      * repeated references. A line strip or a point list is drawn in the order
      * it arrived, so collapsing duplicates would reorder it. */
+    int consecutive = 0;   /* refs = one run of vertex ids (the ranged remap) */
     if (allow_remap && dc.n_refs > 1) {
         u32 unique = dc.n_refs;
         /* Drawstats: how dense each draw's index range is -- the span from its
@@ -1616,6 +1617,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         if (!dedup && rsx_vertex_remap_build_range(&dc.ref_remap, dc.refs, dc.n_refs, &ranged)) {
             dc.refs_remapped = 1;
             dc.n_refs = ranged;
+            consecutive = 1;
         } else if (rsx_vertex_remap_build(&dc.ref_remap, dc.refs, dc.n_refs, &unique)) {
             if (dso && span_same_base) {
                 const u64 span = (u64)span_hi - span_lo + 1u;
@@ -1632,7 +1634,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     dc.layout = *layout;
     rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
-    rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
+    rsx_vertex_fetch_plan_prepare_ex(&dc.fetch_plan, dc.refs, dc.n_refs, consecutive);
     if (dso) { t1 = eng_ds_now(); ds.ns_plan += t1 - t0; t0 = t1; }
     if (!dc_reserve_verts((u64)dc.n_refs * layout->stride)) {
         dc.fetch_ok = 0;
