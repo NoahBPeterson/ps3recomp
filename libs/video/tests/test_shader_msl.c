@@ -48,6 +48,17 @@ static void check(const char* what, const char* text, const char* needle)
     }
 }
 
+static void check_absent(const char* what, const char* text, const char* needle)
+{
+    if (text && !strstr(text, needle)) {
+        printf("[PASS] %s -- no \"%s\"\n", what, needle);
+        g_pass++;
+    } else {
+        printf("[FAIL] %s -- found \"%s\"\n", what, needle);
+        g_fail++;
+    }
+}
+
 static void check_count(const char* what, int got, int want)
 {
     if (got == want) { printf("[PASS] %s: %d instruction(s)\n", what, got); g_pass++; }
@@ -261,6 +272,24 @@ int main(int argc, char** argv)
             check("MRT FP MSL", g_msl, "fragment ");
             check("MRT FP MSL", g_msl, "[[color(0)]]");
             check("MRT FP MSL", g_msl, "[[color(1)]]");
+        }
+    }
+
+    /* ---- max/min/clamp/normalize come out as precise:: math ------------- *
+     * spirv-cross writes them as fast::, whose NaN results Metal leaves
+     * undefined; D3D's max/min return the number when one side is NaN, and
+     * the guest programs rely on it. rsx_hlsl_to_msl respells them precise::
+     * unless PS3RECOMP_MSL_FAST is set. */
+    if (!getenv("PS3RECOMP_MSL_FAST")) {
+        snprintf(g_hlsl, sizeof g_hlsl,
+                 "float4 main(float4 c : COLOR0) : SV_TARGET0 {\n"
+                 "    float3 n = normalize(c.xyz);\n"
+                 "    return float4(max(n, c.www), min(c.w, 0.5)) * clamp(c.x, 0.1, 0.9);\n"
+                 "}\n");
+        if (translate("precise math FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("precise math FP MSL", g_msl, "precise::max");
+            check("precise math FP MSL", g_msl, "precise::normalize");
+            check_absent("precise math FP MSL", g_msl, "fast::");
         }
     }
 
